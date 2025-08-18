@@ -25,19 +25,9 @@ def generate_launch_description():
             description='Maximum detection distance in meters'
         ),
         DeclareLaunchArgument(
-            'sam_checkpoint',
-            default_value='/home/navin/ros2_ws/src/linorobot2_sam/assets/sam_vit_b_01ec64.pth',
-            description='Path to SAM checkpoint file'
-        ),
-        DeclareLaunchArgument(
             'yolo_model',
             default_value='yolov8l-world.pt',
             description='YOLO model to use'
-        ),
-        DeclareLaunchArgument(
-            'sam_model_type',
-            default_value='vit_b',
-            description='SAM model type'
         ),
         DeclareLaunchArgument(
             'yolo_imgsz',
@@ -90,9 +80,7 @@ def generate_launch_description():
                 'min_confidence': LaunchConfiguration('min_confidence'),
                 'min_detection_distance': LaunchConfiguration('min_detection_distance'),
                 'max_detection_distance': LaunchConfiguration('max_detection_distance'),
-                'sam_checkpoint': LaunchConfiguration('sam_checkpoint'),
                 'yolo_model': LaunchConfiguration('yolo_model'),
-                'sam_model_type': LaunchConfiguration('sam_model_type'),
                 'yolo_imgsz': LaunchConfiguration('yolo_imgsz'),
                 'flip_y_axis': LaunchConfiguration('flip_y_axis'),
                 'use_tf': LaunchConfiguration('use_tf'),

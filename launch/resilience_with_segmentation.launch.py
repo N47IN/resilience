@@ -65,7 +65,7 @@ def generate_launch_description():
         description='Enable NARadio visualization'
     )
     
-    # YOLO-SAM parameters
+    # YOLO parameters
     min_confidence_arg = DeclareLaunchArgument(
         'min_confidence',
         default_value='0.05',
@@ -128,7 +128,7 @@ def generate_launch_description():
             'radio_input_resolution': LaunchConfiguration('radio_input_resolution'),
             'enable_naradio_visualization': LaunchConfiguration('enable_naradio_visualization'),
             
-            # YOLO-SAM parameters
+            # YOLO parameters
             'min_confidence': LaunchConfiguration('min_confidence'),
             'min_detection_distance': LaunchConfiguration('min_detection_distance'),
             'max_detection_distance': LaunchConfiguration('max_detection_distance'),

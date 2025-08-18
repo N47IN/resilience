@@ -115,11 +115,11 @@ class GaussKernelAttn(nn.Module):
       self.addition_cache[n_patches] = addition
 
     # kk.T vs kq.T has the most impact
-    attn_weights = torch.bmm(k, k.transpose(1, 2)) * scale
+    attn_weights = torch.bmm(k, q.transpose(1, 2)) * scale
     omega = addition
 
     # Gaussian attention seems to have minimal impact
-    attn_weights += omega
+    # attn_weights += omega
     attn_weights = F.softmax(attn_weights, dim=-1)
 
     attn_output = torch.bmm(attn_weights, v)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-YOLO-SAM Detector Module
+YOLO Detector Module
 
-Handles YOLO-World and SAM object detection and segmentation.
+Handles YOLO-World object detection.
 """
 
 import torch
@@ -12,23 +12,18 @@ import os
 import contextlib
 from typing import List, Tuple, Optional
 from ultralytics import YOLOWorld
-from segment_anything import SamPredictor, sam_model_registry
 
 
-class YOLOSAMDetector:
-    """YOLO-World and SAM detector for object detection and segmentation."""
+class YOLODetector:
+    """YOLO-World detector for object detection."""
     
     def __init__(self, 
                  yolo_model: str = 'yolov8l-world.pt',
-                 sam_checkpoint: str = '/home/navin/ros2_ws/src/linorobot2_sam/assets/sam_vit_b_01ec64.pth',
-                 sam_model_type: str = 'vit_b',
                  yolo_imgsz: int = 480,
                  min_confidence: float = 0.05,
                  disable_yolo_printing: bool = True):
-        """Initialize YOLO-SAM detector."""
+        """Initialize YOLO detector."""
         self.yolo_model = yolo_model
-        self.sam_checkpoint = sam_checkpoint
-        self.sam_model_type = sam_model_type
         self.yolo_imgsz = yolo_imgsz
         self.min_confidence = min_confidence
         self.disable_yolo_printing = disable_yolo_printing
@@ -37,16 +32,14 @@ class YOLOSAMDetector:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Initialize models
-        self.segmenter_ready = False
+        self.detector_ready = False
         self.world_model = None
-        self.sam = None
-        self.predictor = None
         self.current_classes = []
         
         self.init_models()
     
     def init_models(self):
-        """Initialize YOLO-World and SAM models."""
+        """Initialize YOLO-World model."""
         try:
             # Clear CUDA cache
             if torch.cuda.is_available():
@@ -62,29 +55,16 @@ class YOLOSAMDetector:
             self.current_classes = ["dummy"]
             print(f"YOLO-World model initialized")
 
-            # Load SAM model
-            self.sam = sam_model_registry[self.sam_model_type](checkpoint=self.sam_checkpoint)
-            if torch.cuda.is_available():
-                self.sam = self.sam.cuda()
-            
-            self.sam.eval()
-            for param in self.sam.parameters():
-                param.requires_grad = False
-            
-            # Initialize SAM predictor
-            self.predictor = SamPredictor(self.sam)
-            print(f"SAM predictor initialized")
-            
-            # Verify all components are ready
-            if hasattr(self, 'world_model') and hasattr(self, 'predictor') and self.predictor is not None:
-                self.segmenter_ready = True
-                print("YOLO-World and SAM models loaded successfully")
+            # Verify model is ready
+            if hasattr(self, 'world_model') and self.world_model is not None:
+                self.detector_ready = True
+                print("YOLO-World model loaded successfully")
             else:
-                self.segmenter_ready = False
-                print("Warning: Some models failed to initialize properly")
+                self.detector_ready = False
+                print("Warning: YOLO model failed to initialize properly")
 
         except Exception as e:
-            self.segmenter_ready = False
+            self.detector_ready = False
             print(f"Error initializing models: {e}")
             import traceback
             traceback.print_exc()
@@ -184,51 +164,6 @@ class YOLOSAMDetector:
             print(f"Error in YOLO detection: {e}")
             return [], [], []
     
-    def segment_objects(self, image: np.ndarray, bbox_centers: List[List[int]]) -> Tuple[List, List]:
-        """Segment objects using SAM based on bbox centers."""
-        try:
-            if not self.segmenter_ready or not hasattr(self, 'predictor') or self.predictor is None:
-                print("SAM predictor not available, skipping SAM processing")
-                return [], []
-            
-            if len(bbox_centers) == 0:
-                return [], []
-            
-            # Set image for SAM predictor
-            with torch.no_grad():
-                self.predictor.set_image(image)
-
-            # Process detections with SAM
-            all_masks = []
-            all_scores = []
-            
-            point_prompts = np.array(bbox_centers)
-            point_labels = np.ones(len(point_prompts))
-            
-            with torch.no_grad():
-                masks, scores, logits = self.predictor.predict(
-                    point_coords=point_prompts,
-                    point_labels=point_labels,
-                    multimask_output=False
-                )
-            
-            # Extract individual masks
-            if len(masks) > 0:
-                if len(masks.shape) == 3 and masks.shape[0] == len(point_prompts):
-                    for i in range(len(point_prompts)):
-                        all_masks.append(masks[i])
-                        score = scores[i] if len(scores.shape) > 0 else scores
-                        all_scores.append(float(score))
-                else:
-                    all_masks.append(masks[0] if len(masks.shape) > 2 else masks)
-                    all_scores.append(float(scores[0]) if hasattr(scores, '__len__') else float(scores))
-            
-            return all_masks, all_scores
-            
-        except Exception as e:
-            print(f"SAM processing failed: {e}")
-            return [], []
-    
     def filter_detections_by_distance(self, bboxes: List, depth_image: np.ndarray, 
                                     min_distance: float = 0.5, max_distance: float = 2.0,
                                     camera_intrinsics: Optional[List] = None) -> Tuple[List, List]:
@@ -271,7 +206,7 @@ class YOLOSAMDetector:
     
     def is_ready(self) -> bool:
         """Check if detector is ready for use."""
-        return self.segmenter_ready
+        return self.detector_ready
     
     def get_current_classes(self) -> List[str]:
         """Get current detection classes."""

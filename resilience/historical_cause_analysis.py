@@ -69,13 +69,7 @@ class HistoricalCauseAnalyzer:
                     # Move model to device
                     self.historical_yolo.to(device)
                     print(f"[HistoricalAnalyzer] YOLOWorld model moved to {device}")
-                    
-                    # Test the model to ensure it's working
-                    if self.test_yolo_model():
-                        print("[HistoricalAnalyzer] YOLOWorld model test passed")
-                    else:
-                        print("[HistoricalAnalyzer] YOLOWorld model test failed")
-                        self.historical_yolo = None
+                   
                         
                 except Exception as e:
                     print(f"[HistoricalAnalyzer] Error moving model to device: {e}")
@@ -204,66 +198,7 @@ class HistoricalCauseAnalyzer:
             print(f"[HistoricalAnalyzer] Error in cause detection: {e}")
             return None
 
-    def test_yolo_model(self):
-        """Test if YOLOWorld model is working properly"""
-        try:
-            if self.historical_yolo is None:
-                return False
-                
-            # Create a dummy image
-            dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            
-            # Test with a simple class
-            self.historical_yolo.set_classes(['person'])
-            
-            # Try to predict
-            with torch.no_grad():
-                try:
-                    results = self.historical_yolo.predict(
-                        dummy_image,
-                        conf=0.1,
-                        verbose=False
-                    )
-                    return True
-                except RuntimeError as e:
-                    if "same device" in str(e).lower() or "cuda:0 and cpu" in str(e).lower():
-                        # Try CPU fallback
-                        try:
-                            self.historical_yolo.to('cpu')
-                            results = self.historical_yolo.predict(
-                                dummy_image,
-                                conf=0.1,
-                                verbose=False
-                            )
-                            return True
-                        except Exception as cpu_e:
-                            return False
-                    else:
-                        return False
-                
-        except Exception as e:
-            print(f"[HistoricalAnalyzer] YOLOWorld test failed: {e}")
-            return False
-
-    def ensure_device_consistency(self):
-        """Ensure YOLOWorld model is on the correct device"""
-        try:
-            if self.historical_yolo is None:
-                return False
-                
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            
-            # Check if model is on the correct device
-            try:
-                self.historical_yolo.to(device)
-                return True
-            except Exception as e:
-                print(f"[HistoricalAnalyzer] Error ensuring device consistency: {e}")
-                return False
-                
-        except Exception as e:
-            return False
-
+    
     def analyze_single_buffer(self, buffer) -> Dict:
         """
         Analyze a single buffer object for cause location

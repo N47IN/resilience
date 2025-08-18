@@ -43,20 +43,27 @@ class RiskBuffer:
         self.state = BufferState.ACTIVE
         self.cause = None
         self.cause_location = None  # [x, y, z] in meters, world coordinates
+        self.enhanced_cause_embedding = None  # Enhanced cause embedding tensor
         
         # Data storage
         self.images = []  # List of (timestamp, cv_image, ros_msg) tuples
         self.poses = []   # List of (timestamp, pose, drift) tuples  
         self.depth_msgs = {}  # Dict of timestamp -> depth_msg
         
+        # NEW: Narration image storage
+        self.narration_image = None  # Store the narration image for easy retrieval
+        self.narration_timestamp = None  # Timestamp when narration was generated
+        self.narration_text = None  # Store the narration text
+        
         print(f"[RiskBuffer] Created {self.buffer_id} (ACTIVE) at t={start_time:.2f}")
 
     def add_image(self, timestamp: float, cv_image, ros_msg) -> bool:
-        """Add image data to buffer"""
+        """Add image data to buffer - DISABLED to reduce I/O bottleneck"""
         if self.state != BufferState.ACTIVE:
             return False
         
-        self.images.append((timestamp, cv_image, ros_msg))
+        # DISABLED: Image collection to reduce memory usage and I/O bottleneck
+        # self.images.append((timestamp, cv_image, ros_msg))
         return True
     
     def add_pose(self, timestamp: float, pose, drift: float) -> bool:
@@ -68,11 +75,12 @@ class RiskBuffer:
         return True
     
     def add_depth_msg(self, timestamp: float, depth_msg) -> bool:
-        """Add depth message to buffer"""
+        """Add depth message to buffer - DISABLED to reduce I/O bottleneck"""
         if self.state != BufferState.ACTIVE:
             return False
 
-        self.depth_msgs[timestamp] = depth_msg
+        # DISABLED: Depth message collection to reduce memory usage and I/O bottleneck
+        # self.depth_msgs[timestamp] = depth_msg
         return True
 
     def assign_cause(self, cause: str) -> bool:
@@ -95,6 +103,40 @@ class RiskBuffer:
         self.cause_location = location
         print(f"[RiskBuffer] Assigned cause location {location} to {self.buffer_id}")
         return True
+
+    def assign_enhanced_cause_embedding(self, enhanced_embedding) -> bool:
+        """Assign enhanced cause embedding to this buffer"""
+        if not self.cause:
+            print(f"[RiskBuffer] Cannot assign enhanced embedding to {self.buffer_id} - no cause assigned")
+            return False
+        
+        self.enhanced_cause_embedding = enhanced_embedding
+        print(f"[RiskBuffer] Assigned enhanced cause embedding to {self.buffer_id} (shape: {enhanced_embedding.shape if enhanced_embedding is not None else 'None'})")
+        return True
+
+    def has_enhanced_embedding(self) -> bool:
+        """Check if buffer has enhanced cause embedding"""
+        return self.enhanced_cause_embedding is not None
+
+    def set_narration_data(self, narration_image, narration_text: str, timestamp: float) -> bool:
+        """Store narration image and related data in the buffer."""
+        try:
+            self.narration_image = narration_image.copy() if narration_image is not None else None
+            self.narration_text = narration_text
+            self.narration_timestamp = timestamp
+            print(f"[RiskBuffer] Stored narration data for {self.buffer_id} at t={timestamp:.2f}")
+            return True
+        except Exception as e:
+            print(f"[RiskBuffer] Error storing narration data for {self.buffer_id}: {e}")
+            return False
+    
+    def has_narration_image(self) -> bool:
+        """Check if buffer has narration image stored."""
+        return self.narration_image is not None
+    
+    def get_narration_image(self):
+        """Get the stored narration image."""
+        return self.narration_image
 
     def save_immediately_if_ready(self, directory: str) -> bool:
         """Save buffer immediately if it's frozen and has a cause"""
@@ -160,6 +202,8 @@ class RiskBuffer:
                 'state': self.state.value,
                 'cause': self.cause,
                 'cause_location': self.cause_location,
+                'has_enhanced_embedding': self.has_enhanced_embedding(),
+                'enhanced_embedding_shape': list(self.enhanced_cause_embedding.shape) if self.enhanced_cause_embedding is not None else None,
                 'data_counts': self.get_data_counts(),
                 'duration': self.get_duration()
             }
@@ -271,6 +315,23 @@ class RiskBufferManager:
                     added = True
             
             return added
+    
+    def store_narration_data(self, narration_image, narration_text: str, timestamp: float) -> bool:
+        """Store narration data in all active buffers."""
+        with self.lock:
+            if not self.active_buffers:
+                print("No active buffers to store narration data")
+                return False
+
+            stored = False
+            for buffer in self.active_buffers:
+                if buffer.set_narration_data(narration_image, narration_text, timestamp):
+                    stored = True
+            
+            if stored:
+                print(f"[RiskBufferManager] Stored narration data in {len(self.active_buffers)} active buffer(s)")
+            
+            return stored
     
     def assign_cause(self, cause: str) -> bool:
         """Intelligently assign cause to buffers - prioritize frozen buffers without causes, then active buffers"""
