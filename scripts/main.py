@@ -23,7 +23,7 @@ import warnings
 import os
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 warnings.filterwarnings('ignore')
 
 from resilience.drift_calculator import DriftCalculator
@@ -35,6 +35,13 @@ from resilience.simple_descriptive_narration import XYSpatialDescriptor, Traject
 import sensor_msgs_py.point_cloud2 as pc2
 from resilience.risk_buffer import RiskBufferManager
 from resilience.historical_cause_analysis import HistoricalCauseAnalyzer
+
+# Import semantic bridge
+try:
+    from resilience.semantic_info_bridge import SemanticHotspotPublisher
+    SEMANTIC_BRIDGE_AVAILABLE = True
+except ImportError:
+    SEMANTIC_BRIDGE_AVAILABLE = False
 
 
 class ResilienceNode(Node):
@@ -51,6 +58,9 @@ class ResilienceNode(Node):
         from ament_index_python.packages import get_package_share_directory
         package_dir = get_package_share_directory('resilience')
         self.nominal_traj_file = os.path.join(package_dir, 'assets', 'adjusted_nominal_spline.json')
+        
+        # Track recent VLM answers for smart semantic processing
+        self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
         self.declare_parameters('', [
             ('min_confidence', 0.05),
@@ -155,6 +165,7 @@ class ResilienceNode(Node):
         self.init_risk_buffer_manager()
         self.init_historical_analyzer()
         self.init_parallel_processing()
+        self.init_semantic_bridge()
         
         self.start_naradio_thread()
         self.start_historical_analysis_thread()
@@ -363,6 +374,23 @@ class ResilienceNode(Node):
         self.parallel_analysis_status = {}
         
         print("Parallel processing infrastructure initialized")
+    
+    def init_semantic_bridge(self):
+        """Initialize semantic hotspot bridge for communication with octomap."""
+        try:
+            if SEMANTIC_BRIDGE_AVAILABLE:
+                # Load semantic bridge config from segmentation config
+                segmentation_config = getattr(self.naradio_processor, 'segmentation_config', {})
+                
+                from resilience.semantic_info_bridge import SemanticHotspotPublisher
+                self.semantic_bridge = SemanticHotspotPublisher(self, segmentation_config)
+                print("✓ Semantic hotspot bridge initialized")
+            else:
+                self.semantic_bridge = None
+                print("✗ Semantic bridge not available")
+        except Exception as e:
+            print(f"Error initializing semantic bridge: {e}")
+            self.semantic_bridge = None
     
     def start_naradio_thread(self):
         """Start the parallel NARadio processing thread."""
@@ -953,6 +981,8 @@ class ResilienceNode(Node):
             import traceback
             traceback.print_exc()
 
+    # NOTE: Complex hotspot extraction removed - using clean semantic bridge instead
+
     def naradio_processing_loop(self):
         """Parallel NARadio processing loop with robust error handling."""
         print(f"NARadio processing loop started")
@@ -1005,47 +1035,65 @@ class ResilienceNode(Node):
                         reuse_features=True
                     )
                     
+                    # CLEAN SEMANTIC: Process similarity hotspots for recent VLM answers only
+                    if (self.enable_combined_segmentation and 
+                        self.naradio_processor.is_segmentation_ready() and
+                        self.naradio_processor.dynamic_objects and
+                        feat_map_np is not None and
+                        self.semantic_bridge):
+                        
+                        try:
+                            # Only process similarity for very recent VLM answers
+                            recent_vlm_answers = self._get_recent_vlm_answers(max_age_seconds=5.0)
+                            
+                            for vlm_answer in recent_vlm_answers:
+                                if vlm_answer in self.naradio_processor.dynamic_objects:
+                                    # Compute similarity map
+                                    similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
+                                        rgb_image, vlm_answer, feat_map_np)
+                                    
+                                    if similarity_result and similarity_result.get('similarity_map') is not None:
+                                        # Send similarity map + original image to bridge for binary thresholding
+                                        timestamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+                                        
+                                        if self.latest_pose is not None:
+                                            # Get depth image if available
+                                            depth_image = None
+                                            if self.latest_depth_msg is not None:
+                                                try:
+                                                    depth_image = self.bridge.imgmsg_to_cv2(self.latest_depth_msg, desired_encoding='passthrough')
+                                                    # Convert to meters if needed
+                                                    if depth_image.dtype == np.uint16:
+                                                        depth_image = depth_image.astype(np.float32) / 1000.0
+                                                except Exception as e:
+                                                    print(f"Could not process depth image: {e}")
+                                            
+                                            self.semantic_bridge.publish_similarity_hotspots(
+                                                vlm_answer=vlm_answer,
+                                                similarity_map=similarity_result['similarity_map'],
+                                                pose=self.latest_pose,
+                                                timestamp=timestamp,
+                                                original_image=rgb_image,  # Pass original image for overlay visualization
+                                                depth_image=depth_image   # Pass depth image for accurate 3D mapping
+                                            )
+                                        
+                                        # Save to buffer for analysis
+                                        if (self.risk_buffer_manager and 
+                                            len(self.risk_buffer_manager.active_buffers) > 0 and 
+                                            self.current_breach_active):
+                                            
+                                            self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
+                                
+                        except Exception as seg_e:
+                            pass  # Silent error handling
+                    
                     # SPEED OPTIMIZATION: Skip NARadio image publishing to reduce overhead
                     # if naradio_vis is not None:
                     #     naradio_msg = self.bridge.cv2_to_imgmsg(naradio_vis, encoding='rgb8')
                     #     naradio_msg.header = rgb_msg.header
                     #     self.naradio_image_pub.publish(naradio_msg)
                     
-                    if (self.enable_combined_segmentation and 
-                        self.naradio_processor.is_segmentation_ready() and
-                        self.naradio_processor.dynamic_objects and
-                        feat_map_np is not None):
-                        
-                        try:
-                            # Process all dynamic objects using adaptive similarity (config-controlled)
-                            for vlm_answer in self.naradio_processor.dynamic_objects:
-                                
-                                # Use adaptive method that chooses enhanced vs VLM based on config
-                                similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
-                                    rgb_image, vlm_answer, feat_map_np)
-                                
-                                if similarity_result:
-                                    if similarity_result['colored_similarity'] is not None:
-                                        similarity_msg = self.bridge.cv2_to_imgmsg(
-                                            similarity_result['colored_similarity'], 
-                                            encoding='rgb8'
-                                        )
-                                        similarity_msg.header = rgb_msg.header
-                                        
-                                        if self.publish_original_mask:
-                                            self.original_mask_pub.publish(similarity_msg)
-                                        
-                                        if self.publish_refined_mask:
-                                            self.refined_mask_pub.publish(similarity_msg)
-                                    
-                                    if (self.risk_buffer_manager and 
-                                        len(self.risk_buffer_manager.active_buffers) > 0 and 
-                                        self.current_breach_active):
-                                        
-                                        self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
-                                
-                        except Exception as seg_e:
-                            pass  # SPEED OPTIMIZATION: Silent error handling
+                    # NOTE: Old continuous similarity processing removed - using smart semantic regions instead
                         
                 except torch.cuda.OutOfMemoryError:
                     self.naradio_processor.handle_cuda_out_of_memory()
@@ -1293,6 +1341,12 @@ class ResilienceNode(Node):
             
             print(f"VLM ANSWER RECEIVED: '{vlm_answer}'")
             
+            # Track this VLM answer as recent for smart semantic processing
+            self.recent_vlm_answers[vlm_answer] = time.time()
+            
+            # Clean up old VLM answers periodically
+            self._cleanup_old_vlm_answers(max_age_seconds=300.0)
+            
             if vlm_answer not in self.detection_prompts:
                 self.detection_prompts.append(vlm_answer)
                 self.current_detection_prompt = vlm_answer
@@ -1332,6 +1386,8 @@ class ResilienceNode(Node):
                     print(f"✗ Failed to add VLM object '{vlm_answer}' to object list")
             
             self.queue_historical_analysis('vlm_answer_received', vlm_answer=vlm_answer)
+            
+            # Note: Enhanced embedding handling moved to narration processing for efficiency
             
             # NEW: Process narration image from buffer directory AFTER historical analysis queuing
             try:
@@ -1443,6 +1499,34 @@ class ResilienceNode(Node):
                     
         except Exception as e:
             print(f"Error associating VLM answer with buffer: {e}")
+
+    def _cleanup_old_vlm_answers(self, max_age_seconds: float):
+        """Clean up old VLM answers to prevent memory buildup."""
+        try:
+            current_time = time.time()
+            self.recent_vlm_answers = {
+                vlm_answer: timestamp for vlm_answer, timestamp in self.recent_vlm_answers.items()
+                if current_time - timestamp <= max_age_seconds
+            }
+        except Exception as e:
+            print(f"Error cleaning up old VLM answers: {e}")
+
+    def _get_recent_vlm_answers(self, max_age_seconds: float) -> List[str]:
+        """
+        Get a list of VLM answers that were received recently.
+        
+        Args:
+            max_age_seconds: Maximum age in seconds for VLM answers to be considered recent.
+            
+        Returns:
+            List of VLM answers that were received within the last max_age_seconds.
+        """
+        current_time = time.time()
+        recent_vlm_answers = [
+            vlm_answer for vlm_answer, timestamp in self.recent_vlm_answers.items()
+            if current_time - timestamp <= max_age_seconds
+        ]
+        return recent_vlm_answers
 
 
 def main():

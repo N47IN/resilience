@@ -84,4 +84,31 @@ debug:
   enable_timing: true
   print_memory_usage: true
   verbose_processing: false
-  log_similarity_scores: false 
+  log_similarity_scores: false
+
+# Semantic Bridge Configuration for Voxel Mapping
+semantic_bridge:
+  # Enable semantic voxel mapping
+  enable_semantic_mapping: true
+  
+  # Hotspot detection thresholds
+  hotspot_similarity_threshold: 0.6  # Minimum similarity to consider as hotspot
+  min_hotspot_area: 100  # Minimum pixel area for hotspot regions
+  
+  # Communication settings
+  publish_rate_limit: 2.0  # Max Hz for semantic region publishing
+  max_regions_per_message: 10  # Limit regions to avoid large messages
+  
+  # VLM answer tracking
+  recent_vlm_window_seconds: 5.0  # Only process VLM answers from last N seconds
+  cleanup_interval_seconds: 60.0  # Clean old data every N seconds
+  
+  # Pose association
+  max_pose_age_seconds: 1.0  # Maximum age of pose to use with similarity data
+  
+  # Camera and depth settings
+  camera_intrinsics: [186.24, 186.24, 238.66, 141.63]  # [fx, fy, cx, cy]
+  estimated_hotspot_depth: 1.5  # meters - depth assumption for 2D->3D projection
+  
+  # Performance settings
+  enable_visualization_images: true  # Publish mask and overlay images for RViz 
