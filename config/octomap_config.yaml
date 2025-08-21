@@ -1,0 +1,100 @@
+# OctoMap Voxel Mapper Configuration
+# This file contains default parameters for the OctoMap-based 3D mapping system
+
+# Basic mapping parameters
+voxel_resolution: 0.1          # Voxel size in meters (smaller = higher resolution, more memory)
+max_range: 10.0                # Maximum sensor range in meters
+min_range: 0.1                 # Minimum sensor range in meters
+
+# OctoMap probability parameters
+probability_hit: 0.7           # Probability for occupied voxels (0.5-1.0)
+probability_miss: 0.4          # Probability for free voxels (0.0-0.5)
+occupancy_threshold: 0.5       # Threshold for occupied voxels (0.0-1.0)
+clamping_thres_min: 0.12      # Minimum clamping threshold
+clamping_thres_max: 0.97      # Maximum clamping threshold
+
+# Topic configuration - adjust these to match your robot setup
+point_cloud_topic: "/robot_1/sensors/front_stereo/depth/points"
+pose_topic: "/robot_1/sensors/front_stereo/pose"
+rgb_topic: "/robot_1/sensors/front_stereo/right/image"
+
+# Frame configuration
+map_frame: "map"
+sensor_frame: "camera_link"
+
+# Visualization settings
+publish_markers: true          # Publish 3D markers for RViz
+publish_grid: true            # Publish 2D occupancy grid
+publish_colored_cloud: true   # Publish colored point cloud
+
+# Processing options
+filter_outliers: true         # Enable statistical outlier removal
+downsample_voxels: true       # Enable voxel downsampling for performance
+
+# Performance tuning
+update_frequency: 2.0         # Map update frequency in Hz
+visualization_frequency: 1.0  # Visualization publishing frequency in Hz
+
+# Storage settings
+save_maps_enabled: true
+map_save_directory: "/home/navin/ros2_ws/src/buffers/octomaps"
+
+# Alternative configurations for different use cases
+
+# High resolution mapping (use with caution - memory intensive)
+high_resolution:
+  voxel_resolution: 0.05
+  update_frequency: 1.0
+  visualization_frequency: 0.5
+  filter_outliers: true
+  downsample_voxels: true
+  max_range: 8.0
+
+# Fast mapping for real-time applications
+fast_mapping:
+  voxel_resolution: 0.2
+  update_frequency: 5.0
+  visualization_frequency: 2.0
+  filter_outliers: false
+  downsample_voxels: true
+  max_range: 6.0
+
+# Memory efficient for resource-constrained systems
+memory_efficient:
+  voxel_resolution: 0.15
+  max_range: 5.0
+  update_frequency: 1.0
+  visualization_frequency: 0.5
+  publish_markers: false
+  publish_colored_cloud: false
+  downsample_voxels: true
+
+# Indoor mapping optimized parameters
+indoor_mapping:
+  voxel_resolution: 0.08
+  max_range: 5.0
+  min_range: 0.2
+  probability_hit: 0.75
+  probability_miss: 0.35
+  filter_outliers: true
+  downsample_voxels: true
+
+# Outdoor mapping optimized parameters
+outdoor_mapping:
+  voxel_resolution: 0.2
+  max_range: 15.0
+  min_range: 0.5
+  probability_hit: 0.65
+  probability_miss: 0.45
+  filter_outliers: true
+  downsample_voxels: true
+
+# Debug configuration with detailed logging
+debug_config:
+  voxel_resolution: 0.1
+  update_frequency: 1.0
+  visualization_frequency: 1.0
+  publish_markers: true
+  publish_grid: true
+  publish_colored_cloud: true
+  save_maps_enabled: true 

@@ -609,6 +609,8 @@ class NARadioProcessor:
             'segmentation': {
                 'apply_softmax': True,
                 'normalize_features': True,
+                'prefer_enhanced_embeddings': True,
+                'enhanced_similarity_threshold': 0.5,
                 'enable_dbscan': True,
                 'dbscan_eps': 0.3,
                 'dbscan_min_samples': 5,
@@ -759,7 +761,7 @@ class NARadioProcessor:
             print(f"Removed enhanced embedding for '{vlm_answer}'")
             return True
         return False
-
+    
     def generate_color_for_object(self, object_index: int) -> List[int]:
         """Generate a color for an object based on its index."""
         # Use a predefined color palette
@@ -1314,22 +1316,22 @@ class NARadioProcessor:
             for c in range(num_chunks):
                 chunk_features = feat_map_flat[c*chunk_size:(c+1)*chunk_size]
                 
-                # Compute cosine similarity: enhanced_embedding (1xC) vs chunk_features (NxC)
-                enhanced_norm = enhanced_embedding_tensor / (torch.norm(enhanced_embedding_tensor, dim=-1, keepdim=True) + 1e-8)
-                chunk_norm = chunk_features / (torch.norm(chunk_features, dim=-1, keepdim=True) + 1e-8)
-                
-                # Cosine similarity: (1xC) @ (NxC).T = (1xN)
-                chunk_similarity = torch.mm(enhanced_norm, chunk_norm.t())  # (1, N)
+                # Use same compute_cos_sim method as VLM text for consistency
+                chunk_similarity = self.compute_cos_sim(enhanced_embedding_tensor, chunk_features, softmax=use_softmax)
                 similarity_chunks.append(chunk_similarity.squeeze(0))  # (N,)
                 
-                del chunk_features, chunk_norm
+                del chunk_features
             
             # Concatenate all similarity chunks
             similarity_flat = torch.cat(similarity_chunks, dim=0)  # (H*W,)
             enhanced_similarity_map = similarity_flat.reshape(H, W)  # (H, W)
             
-            # Apply normalization (enhanced embeddings work better without softmax)
+            # Apply same normalization as original VLM similarity
             if not use_softmax:
+                enhanced_similarity_map = self.norm_img_01(enhanced_similarity_map.unsqueeze(0).unsqueeze(0))
+                enhanced_similarity_map = enhanced_similarity_map.squeeze(0).squeeze(0)
+            else:
+                # For softmax consistency with original, normalize to [0,1] range
                 enhanced_similarity_map = self.norm_img_01(enhanced_similarity_map.unsqueeze(0).unsqueeze(0))
                 enhanced_similarity_map = enhanced_similarity_map.squeeze(0).squeeze(0)
             
@@ -1495,9 +1497,9 @@ class NARadioProcessor:
         try:
             start_time = time.time()
             
-            # Use enhanced embedding similarity computation with no softmax (better for visual similarity)
+            # Use enhanced embedding similarity computation with same settings as original
             similarity_map = self.compute_enhanced_similarity_map_optimized(
-                rgb_image, vlm_answer, feat_map_np, use_softmax=False, chunk_size=4000)
+                rgb_image, vlm_answer, feat_map_np, use_softmax=True, chunk_size=4000)
             
             if similarity_map is None:
                 return None
@@ -1509,8 +1511,8 @@ class NARadioProcessor:
             similarity_resized = cv2.resize(similarity_map, (original_width, original_height), 
                                           interpolation=cv2.INTER_LINEAR)
             
-            # Use a more vibrant colormap for enhanced embeddings (plasma for better risk visualization)
-            colored_similarity = self.apply_colormap(similarity_resized, cmap_name='plasma')
+            # Use same colormap as original visualization for consistency
+            colored_similarity = self.apply_colormap(similarity_resized, cmap_name='viridis')
             
             # Processing metadata
             processing_time = time.time() - start_time
@@ -1538,7 +1540,7 @@ class NARadioProcessor:
             return None
 
     def process_vlm_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
-                                                       feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
+                                                     feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
         """
         OPTIMIZED: Process VLM similarity map and create colored visualization, reusing features if provided.
         
@@ -1594,10 +1596,41 @@ class NARadioProcessor:
         except Exception as e:
             return None
 
+    def get_similarity_method_info(self, vlm_answer: str) -> Dict[str, any]:
+        """
+        Get information about which similarity method would be used for a VLM answer.
+        
+        Args:
+            vlm_answer: The VLM answer to check
+            
+        Returns:
+            dict: Information about similarity method selection
+        """
+        prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
+        has_enhanced = self.has_enhanced_embedding(vlm_answer)
+        
+        if prefer_enhanced and has_enhanced:
+            method = "enhanced_embedding"
+            reason = "config prefers enhanced and enhanced embedding available"
+        elif prefer_enhanced and not has_enhanced:
+            method = "vlm_text"
+            reason = "config prefers enhanced but no enhanced embedding available"
+        else:
+            method = "vlm_text"
+            reason = "config prefers VLM text embedding"
+        
+        return {
+            'vlm_answer': vlm_answer,
+            'method': method,
+            'reason': reason,
+            'config_prefer_enhanced': prefer_enhanced,
+            'has_enhanced_embedding': has_enhanced
+        }
+
     def process_vlm_similarity_visualization(self, rgb_image: np.ndarray, vlm_answer: str) -> Optional[Dict]:
         """Legacy method - redirects to optimized version without pre-computed features."""
         return self.process_vlm_similarity_visualization_optimized(rgb_image, vlm_answer, None)
-    
+
     def is_segmentation_ready(self) -> bool:
         """Check if combined segmentation is ready."""
         return self.segmentation_ready and self.naradio_ready
@@ -1663,20 +1696,37 @@ class NARadioProcessor:
             # Convert similarity map to tensor weights
             weights = torch.from_numpy(similarity_map).to(device).float()  # H x W
             
+            # ENHANCED FIX: Only consider pixels with high similarity to avoid garbage features
+            similarity_threshold = self.segmentation_config['segmentation'].get('enhanced_similarity_threshold', 0.5)
+            high_sim_mask = weights > similarity_threshold
+            
+            # Zero out low-similarity pixels to focus only on the actual cause/hotspots
+            weights = weights * high_sim_mask.float()
+            
+            # Check if we have enough high-similarity pixels
+            num_high_sim_pixels = torch.sum(high_sim_mask).item()
+            total_pixels = H * W
+            
+            if num_high_sim_pixels == 0:
+                print(f"Warning: No pixels above similarity threshold {similarity_threshold}, using all pixels")
+                weights = torch.from_numpy(similarity_map).to(device).float()
+            else:
+                print(f"Enhanced embedding using {num_high_sim_pixels}/{total_pixels} high-similarity pixels (>{similarity_threshold})")
+            
             # Normalize weights to sum to 1 for proper weighted averaging
             total_weight = torch.sum(weights)
             if total_weight > 1e-8:
                 weights = weights / total_weight
             else:
-                print(f"Warning: similarity weights sum to near zero, using uniform weights")
-                weights = torch.ones_like(weights) / (H * W)
+                print(f"Warning: similarity weights sum to near zero after thresholding")
+                return None
             
             # Flatten spatial dimensions for weighted averaging
             feat_map_flat = feat_map_aligned.reshape(-1, C)  # (H*W) x C
             weights_flat = weights.reshape(-1)  # (H*W)
             
-            # Compute weighted average of features using similarity as weights
-            # This gives us an enhanced embedding that represents the "cause" more accurately
+            # Compute weighted average of features using only high-similarity pixels
+            # This gives us a much cleaner enhanced embedding focused on the actual cause
             enhanced_embedding = torch.sum(feat_map_flat * weights_flat.unsqueeze(1), dim=0)  # C
             
             # Normalize the enhanced embedding
@@ -1803,7 +1853,7 @@ class NARadioProcessor:
             print(f"Error saving enhanced embedding: {e}")
             import traceback
             traceback.print_exc()
-
+    
     def _save_narration_similarity_result_simple(self, vlm_answer: str, buffer_id: str, 
                                                 buffer_dir: str, similarity_result: Dict):
         """Save narration similarity results to buffer directory."""
@@ -1842,3 +1892,40 @@ class NARadioProcessor:
             print(f"Error saving narration similarity result: {e}")
             import traceback
             traceback.print_exc() 
+
+    def process_adaptive_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
+                                                           feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
+        """
+        ADAPTIVE: Choose between enhanced embedding and VLM text similarity based on config and availability.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to compute similarity for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            
+        Returns:
+            dict: Contains similarity_map, colored_similarity, metadata, and processing_info
+        """
+        if not self.segmentation_ready or not self.naradio_ready:
+            return None
+        
+        try:
+            # Check config preference and availability
+            prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
+            has_enhanced = self.has_enhanced_embedding(vlm_answer)
+            
+            # Decision logic based on config and availability
+            if prefer_enhanced and has_enhanced:
+                # Use enhanced embedding similarity
+                return self.process_enhanced_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np)
+            else:
+                # Use VLM text similarity (either by preference or fallback)
+                return self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np)
+                
+        except Exception as e:
+            print(f"Error in adaptive similarity processing: {e}")
+            # Fallback to VLM text similarity on error
+            return self.process_vlm_similarity_visualization_optimized(
+                rgb_image, vlm_answer, feat_map_np)

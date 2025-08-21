@@ -25,6 +25,10 @@ segmentation:
   apply_softmax: true  # Apply softmax across words for better segmentation
   normalize_features: true  # Normalize features for cosine similarity
   
+  # Enhanced embedding preference
+  prefer_enhanced_embeddings: true  # Use enhanced embeddings when available, fallback to VLM text embeddings
+  enhanced_similarity_threshold: 0.1  # Only use pixels with similarity > threshold for enhanced embeddings
+  
   # DBSCAN clustering for refinement
   enable_dbscan: true
   dbscan_eps: 0.3

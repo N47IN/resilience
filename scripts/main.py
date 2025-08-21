@@ -215,7 +215,26 @@ class ResilienceNode(Node):
             dynamic_objects = self.naradio_processor.dynamic_objects
             print(f"  - Base objects: {len(self.naradio_processor.word_list)}")
             print(f"  - Total objects: {len(all_objects)}")
+            
+            # Print embedding method configuration
+            self.print_embedding_method_config()
+            
             self.publish_vlm_objects_legend()
+
+    def print_embedding_method_config(self):
+        """Print information about embedding method configuration and availability."""
+        try:
+            if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
+                return
+            
+            # Get config preference
+            config = self.naradio_processor.segmentation_config
+            prefer_enhanced = config['segmentation'].get('prefer_enhanced_embeddings', True)
+            
+            print(f"SIMILARITY METHOD: {'ENHANCED EMBEDDINGS' if prefer_enhanced else 'VLM TEXT EMBEDDINGS'}")
+            
+        except Exception as e:
+            print(f"Error printing embedding method config: {e}")
 
     def publish_vlm_objects_legend(self):
         """Publish VLM objects legend."""
@@ -998,39 +1017,11 @@ class ResilienceNode(Node):
                         feat_map_np is not None):
                         
                         try:
-                            # Get all objects that need similarity processing (prioritize enhanced embeddings)
-                            enhanced_objects = self.naradio_processor.get_all_enhanced_objects()
-                            text_objects = [obj for obj in self.naradio_processor.dynamic_objects 
-                                          if obj not in enhanced_objects]
-                            
-                            # Process enhanced embeddings first (more accurate risk detection)
-                            for vlm_answer in enhanced_objects:
-                                similarity_result = self.naradio_processor.process_enhanced_similarity_visualization_optimized(
-                                    rgb_image, vlm_answer, feat_map_np)
+                            # Process all dynamic objects using adaptive similarity (config-controlled)
+                            for vlm_answer in self.naradio_processor.dynamic_objects:
                                 
-                                if similarity_result:
-                                    if similarity_result['colored_similarity'] is not None:
-                                        similarity_msg = self.bridge.cv2_to_imgmsg(
-                                            similarity_result['colored_similarity'], 
-                                            encoding='rgb8'
-                                        )
-                                        similarity_msg.header = rgb_msg.header
-                                        
-                                        if self.publish_original_mask:
-                                            self.original_mask_pub.publish(similarity_msg)
-                                        
-                                        if self.publish_refined_mask:
-                                            self.refined_mask_pub.publish(similarity_msg)
-                                    
-                                    if (self.risk_buffer_manager and 
-                                        len(self.risk_buffer_manager.active_buffers) > 0 and 
-                                        self.current_breach_active):
-                                        
-                                        self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
-                            
-                            # Process remaining text-based objects (fallback for objects without enhanced embeddings)
-                            for vlm_answer in text_objects:
-                                similarity_result = self.naradio_processor.process_vlm_similarity_visualization_optimized(
+                                # Use adaptive method that chooses enhanced vs VLM based on config
+                                similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
                                     rgb_image, vlm_answer, feat_map_np)
                                 
                                 if similarity_result:

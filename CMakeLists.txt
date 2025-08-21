@@ -22,6 +22,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/main.py
   scripts/narration_display_node.py
+  scripts/depth_octomap_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
