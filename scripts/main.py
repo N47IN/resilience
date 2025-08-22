@@ -62,6 +62,16 @@ class ResilienceNode(Node):
         # Track recent VLM answers for smart semantic processing
         self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
+        # NEW: Synchronized data storage for semantic bridge
+        self.synchronized_data = {
+            'rgb_image': None,
+            'depth_image': None, 
+            'pose': None,
+            'timestamp': None,
+            'rgb_msg_header': None
+        }
+        self.sync_data_lock = threading.Lock()
+        
         self.declare_parameters('', [
             ('min_confidence', 0.05),
             ('min_detection_distance', 0.5),
@@ -422,6 +432,10 @@ class ResilienceNode(Node):
             if self.latest_pose is not None:
                 self.detection_pose = self.latest_pose.copy()
                 self.detection_pose_time = self.latest_pose_time
+                
+                # NEW: Update synchronized data when we have all three (RGB, depth, pose)
+                if self.latest_depth_msg is not None:
+                    self.update_synchronized_data(msg, self.latest_depth_msg, self.latest_pose)
             
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         
@@ -983,6 +997,42 @@ class ResilienceNode(Node):
 
     # NOTE: Complex hotspot extraction removed - using clean semantic bridge instead
 
+    def update_synchronized_data(self, rgb_msg, depth_msg, pose):
+        """Update synchronized data for semantic bridge processing."""
+        try:
+            with self.sync_data_lock:
+                # Convert RGB image
+                rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
+                
+                # Convert depth image
+                depth_image = None
+                if depth_msg is not None:
+                    try:
+                        depth_np = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+                        # normalize to meters if necessary
+                        if depth_np.dtype == np.uint16:
+                            depth_np = depth_np.astype(np.float32) / 1000.0
+                        depth_image = depth_np
+                    except Exception:
+                        depth_image = None
+                
+                # Store synchronized data
+                self.synchronized_data = {
+                    'rgb_image': rgb_image,
+                    'depth_image': depth_image,
+                    'pose': pose.copy() if pose is not None else None,
+                    'timestamp': time.time(),
+                    'rgb_msg_header': rgb_msg.header
+                }
+                
+        except Exception as e:
+            print(f"Error updating synchronized data: {e}")
+    
+    def get_synchronized_data(self):
+        """Get synchronized data for semantic bridge processing."""
+        with self.sync_data_lock:
+            return self.synchronized_data.copy()
+
     def naradio_processing_loop(self):
         """Parallel NARadio processing loop with robust error handling."""
         print(f"NARadio processing loop started")
@@ -1020,6 +1070,11 @@ class ResilienceNode(Node):
                         continue
                     
                     rgb_msg = self.latest_rgb_msg
+                    depth_msg = self.latest_depth_msg
+                    pose_for_semantic = self.latest_pose.copy() if self.latest_pose is not None else None
+                
+                # NEW: Update synchronized data for semantic bridge
+                self.update_synchronized_data(rgb_msg, depth_msg, pose_for_semantic)
                 
                 try:
                     rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
@@ -1035,57 +1090,63 @@ class ResilienceNode(Node):
                         reuse_features=True
                     )
                     
-                    # CLEAN SEMANTIC: Process similarity hotspots for recent VLM answers only
+                    # OLD WORKING LOGIC: Process similarity for ALL VLM objects continuously
                     if (self.enable_combined_segmentation and 
                         self.naradio_processor.is_segmentation_ready() and
                         self.naradio_processor.dynamic_objects and
-                        feat_map_np is not None and
-                        self.semantic_bridge):
+                        feat_map_np is not None):
                         
                         try:
-                            # Only process similarity for very recent VLM answers
-                            recent_vlm_answers = self._get_recent_vlm_answers(max_age_seconds=5.0)
-                            
-                            for vlm_answer in recent_vlm_answers:
-                                if vlm_answer in self.naradio_processor.dynamic_objects:
-                                    # Compute similarity map
-                                    similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
-                                        rgb_image, vlm_answer, feat_map_np)
+                            # Process all dynamic objects using adaptive similarity (config-controlled)
+                            for vlm_answer in self.naradio_processor.dynamic_objects:
+                                
+                                # Use adaptive method that chooses enhanced vs VLM based on config
+                                similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
+                                    rgb_image, vlm_answer, feat_map_np)
+                                
+                                if similarity_result:
+                                    if similarity_result['colored_similarity'] is not None:
+                                        similarity_msg = self.bridge.cv2_to_imgmsg(
+                                            similarity_result['colored_similarity'], 
+                                            encoding='rgb8'
+                                        )
+                                        similarity_msg.header = rgb_msg.header
+                                        
+                                        if self.publish_original_mask:
+                                            self.original_mask_pub.publish(similarity_msg)
+                                        
+                                        if self.publish_refined_mask:
+                                            self.refined_mask_pub.publish(similarity_msg)
                                     
-                                    if similarity_result and similarity_result.get('similarity_map') is not None:
-                                        # Send similarity map + original image to bridge for binary thresholding
-                                        timestamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+                                    # NEW: Publish binary hotspots with depth and pose to semantic bridge
+                                    if (hasattr(self, 'semantic_bridge') and self.semantic_bridge and 
+                                        similarity_result.get('similarity_map') is not None):
                                         
-                                        if self.latest_pose is not None:
-                                            # Get depth image if available
-                                            depth_image = None
-                                            if self.latest_depth_msg is not None:
-                                                try:
-                                                    depth_image = self.bridge.imgmsg_to_cv2(self.latest_depth_msg, desired_encoding='passthrough')
-                                                    # Convert to meters if needed
-                                                    if depth_image.dtype == np.uint16:
-                                                        depth_image = depth_image.astype(np.float32) / 1000.0
-                                                except Exception as e:
-                                                    print(f"Could not process depth image: {e}")
-                                            
-                                            self.semantic_bridge.publish_similarity_hotspots(
-                                                vlm_answer=vlm_answer,
-                                                similarity_map=similarity_result['similarity_map'],
-                                                pose=self.latest_pose,
-                                                timestamp=timestamp,
-                                                original_image=rgb_image,  # Pass original image for overlay visualization
-                                                depth_image=depth_image   # Pass depth image for accurate 3D mapping
-                                            )
+                                        # Use perfectly synchronized data for semantic bridge
+                                        sync_data = self.get_synchronized_data()
+                                        if sync_data['pose'] is not None:
+                                            try:
+                                                self.semantic_bridge.publish_similarity_hotspots(
+                                                    vlm_answer=vlm_answer,
+                                                    similarity_map=similarity_result['similarity_map'],
+                                                    pose=sync_data['pose'],
+                                                    timestamp=sync_data['timestamp'],
+                                                    original_image=sync_data['rgb_image'],
+                                                    depth_image=sync_data['depth_image']
+                                                )
+                                            except Exception as e:
+                                                print(f"Error publishing to semantic bridge: {e}")
+                                        else:
+                                            print(f"Skipping semantic bridge - no synchronized pose available")
+                                    
+                                    if (self.risk_buffer_manager and 
+                                        len(self.risk_buffer_manager.active_buffers) > 0 and 
+                                        self.current_breach_active):
                                         
-                                        # Save to buffer for analysis
-                                        if (self.risk_buffer_manager and 
-                                            len(self.risk_buffer_manager.active_buffers) > 0 and 
-                                            self.current_breach_active):
-                                            
-                                            self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
+                                        self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
                                 
                         except Exception as seg_e:
-                            pass  # Silent error handling
+                            pass  # SPEED OPTIMIZATION: Silent error handling
                     
                     # SPEED OPTIMIZATION: Skip NARadio image publishing to reduce overhead
                     # if naradio_vis is not None:

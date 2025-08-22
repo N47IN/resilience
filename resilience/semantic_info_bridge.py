@@ -46,7 +46,7 @@ class SemanticHotspotPublisher:
                                    original_image: Optional[np.ndarray] = None,
                                    depth_image: Optional[np.ndarray] = None) -> bool:
         """
-        Apply binary threshold to similarity map and publish hotspots + visualization.
+        Enhanced version that properly handles depth data for 3D mapping.
         
         Args:
             vlm_answer: VLM answer being processed
@@ -88,6 +88,26 @@ class SemanticHotspotPublisher:
             if hotspot_count == 0:
                 return False  # No significant hotspots
             
+            # NEW: Extract depth values for hotspot regions
+            hotspot_depth_data = None
+            if depth_image is not None:
+                # Get depth values only for hotspot pixels
+                hotspot_pixels = filtered_mask > 0
+                hotspot_depth_values = depth_image[hotspot_pixels]
+                
+                if len(hotspot_depth_values) > 0:
+                    # Create depth mask with same dimensions
+                    depth_mask = np.zeros_like(depth_image, dtype=np.float32)
+                    depth_mask[hotspot_pixels] = hotspot_depth_values
+                    
+                    # Compress depth data for efficient transmission
+                    hotspot_depth_data = {
+                        'depth_mask': depth_mask.tolist(),  # Full depth mask
+                        'hotspot_depths': hotspot_depth_values.tolist(),  # Just hotspot depths
+                        'depth_shape': depth_mask.shape,
+                        'depth_units': 'meters'
+                    }
+            
             # Compute statistics
             hotspot_pixels = np.sum(filtered_mask > 0)
             hotspot_similarity_values = similarity_map[hotspot_mask]
@@ -113,7 +133,7 @@ class SemanticHotspotPublisher:
                 'mask_data': filtered_mask.flatten().tolist(),  # Binary mask as list
                 'threshold_used': self.hotspot_threshold,
                 'has_depth_data': depth_image is not None,
-                'depth_shape': depth_image.shape if depth_image is not None else None,
+                'depth_data': hotspot_depth_data,  # NEW: Full depth data
                 'stats': {
                     'hotspot_count': hotspot_count,
                     'hotspot_pixels': int(hotspot_pixels),
@@ -123,27 +143,6 @@ class SemanticHotspotPublisher:
                 }
             }
             
-            # If we have depth data, include it for accurate 3D mapping
-            if depth_image is not None:
-                # Extract depth values only for hotspot regions to reduce data size
-                hotspot_depth_values = depth_image[filtered_mask > 0]
-                if len(hotspot_depth_values) > 0:
-                    # Send depth statistics and sample values
-                    hotspot_data['depth_stats'] = {
-                        'min_depth': float(np.min(hotspot_depth_values)),
-                        'max_depth': float(np.max(hotspot_depth_values)),
-                        'mean_depth': float(np.mean(hotspot_depth_values)),
-                        'depth_units': 'meters'
-                    }
-                    
-                    # For very large depth images, we could downsample or send key depth values
-                    # For now, just send the depth image dimensions and availability flag
-                    hotspot_data['depth_available'] = True
-                else:
-                    hotspot_data['depth_available'] = False
-            else:
-                hotspot_data['depth_available'] = False
-            
             # Publish structured data
             msg = String(data=json.dumps(hotspot_data))
             self.hotspot_data_pub.publish(msg)
@@ -151,7 +150,7 @@ class SemanticHotspotPublisher:
             self.last_publish_time = current_time
             
             if hasattr(self.node, 'get_logger'):
-                depth_info = f" + depth" if depth_image is not None else ""
+                depth_info = f" + depth({len(hotspot_depth_values) if hotspot_depth_data else 0} values)" if depth_image is not None else ""
                 self.node.get_logger().info(f"Published {hotspot_count} hotspots for '{vlm_answer}' (>{self.hotspot_threshold}){depth_info}")
             
             return True
@@ -257,8 +256,14 @@ class SemanticHotspotSubscriber:
             # Reconstruct binary mask
             mask = np.array(mask_data, dtype=np.uint8).reshape(mask_shape)
             
+            # Store depth data (if provided) for use in voxel mapping
+            try:
+                self._last_depth_data = data.get('depth_data', None)
+            except Exception:
+                self._last_depth_data = None
+            
             # Apply semantic labeling to voxels
-            depth_available = data.get('depth_available', False)
+            depth_available = data.get('has_depth_data', False)
             self._apply_hotspot_to_voxels(vlm_answer, mask, pose, threshold_used, stats, depth_available)
             
         except Exception as e:
@@ -281,20 +286,23 @@ class SemanticHotspotSubscriber:
             if len(hotspot_coords[0]) == 0:
                 return
             
-            # Check if we have depth data available
-            has_depth = depth_available
+            # If depth data was provided, reconstruct depth mask
+            depth_mask = None
+            has_actual_depth = False
+            if depth_available:
+                try:
+                    depth_payload = getattr(self, '_last_depth_data', None)
+                    if depth_payload and 'depth_mask' in depth_payload and 'depth_shape' in depth_payload:
+                        depth_mask_list = depth_payload['depth_mask']
+                        depth_shape = tuple(depth_payload['depth_shape'])
+                        depth_mask = np.array(depth_mask_list, dtype=np.float32).reshape(depth_shape)
+                        has_actual_depth = True
+                except Exception:
+                    depth_mask = None
+                    has_actual_depth = False
             
-            if has_depth:
-                # TODO: Extract depth values from the message
-                # For now, we'll need to modify the message structure to include depth values
-                # This would require sending depth data along with the mask
-                print(f"Depth data available for '{vlm_answer}' - would use actual depth for 3D mapping")
-                # Fall back to estimated depth for now
-                estimated_depth = self.config.get('estimated_hotspot_depth', 1.5)
-            else:
-                # Use configured depth estimation as fallback
-                estimated_depth = self.config.get('estimated_hotspot_depth', 1.5)
-                print(f"No depth data available for '{vlm_answer}' - using estimated depth: {estimated_depth}m")
+            # Depth fallback estimate
+            estimated_depth = self.config.get('estimated_hotspot_depth', 1.5)
             
             # Camera intrinsics - could be passed via config or use reasonable defaults
             intrinsics = self.config.get('camera_intrinsics', [186.0, 186.0, mask.shape[1]//2, mask.shape[0]//2])
@@ -307,13 +315,20 @@ class SemanticHotspotSubscriber:
             for i in range(len(hotspot_coords[0])):
                 v, u = hotspot_coords[0][i], hotspot_coords[1][i]
                 
+                # Use depth if available, else fallback
+                if has_actual_depth and depth_mask is not None:
+                    depth = float(depth_mask[v, u])
+                    if not np.isfinite(depth) or depth <= 0.0:
+                        continue
+                else:
+                    depth = float(estimated_depth)
+                
                 # Pixel to camera coordinates
-                cam_x = (u - cx) * estimated_depth / fx
-                cam_y = (v - cy) * estimated_depth / fy
-                cam_z = estimated_depth
+                cam_x = (u - cx) * depth / fx
+                cam_y = (v - cy) * depth / fy
+                cam_z = depth
                 
                 # Simple world transformation (camera at robot position)
-                # TODO: Could be enhanced with proper camera-to-base transformation
                 world_point = robot_pos + np.array([cam_x, cam_y, cam_z])
                 
                 # Get voxel key
@@ -331,13 +346,13 @@ class SemanticHotspotSubscriber:
                         'similarity': similarity_score,
                         'threshold_used': threshold_used,
                         'detection_method': 'binary_threshold_hotspot',
-                        'depth_used': has_depth,
+                        'depth_used': bool(has_actual_depth),
                         'timestamp': time.time()
                     }
                     semantic_mapper.voxel_semantics[voxel_key] = semantic_info
             
             if hasattr(self.node, 'get_logger'):
-                depth_info = f" with depth" if has_depth else f" (estimated depth: {estimated_depth}m)"
+                depth_info = " with depth" if has_actual_depth else f" (estimated depth: {estimated_depth}m)"
                 self.node.get_logger().info(f"Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' (threshold: {threshold_used}){depth_info}")
             
         except Exception as e:

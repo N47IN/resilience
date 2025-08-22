@@ -27,7 +27,7 @@ from typing import Optional
 # Import helpers
 try:
 	from resilience.voxel_mapping_helper import VoxelMappingHelper
-	from resilience.semantic_info_bridge import SemanticHotspotSubscriber
+	from resilience.semantic_hotspot_helper import SemanticHotspotHelper
 	HELPERS_AVAILABLE = True
 except ImportError:
 	HELPERS_AVAILABLE = False
@@ -133,7 +133,18 @@ class SemanticDepthOctoMapNode(Node):
 			except Exception as e:
 				self.get_logger().warn(f"Could not load semantic config: {e}")
 		
-		self.semantic_bridge = SemanticHotspotSubscriber(self, self.voxel_helper, config)
+		# Add semantic bridge specific config if not present
+		if 'semantic_bridge' not in config:
+			config['semantic_bridge'] = {
+				'hotspot_similarity_threshold': 0.6,
+				'min_hotspot_area': 100,
+				'publish_rate_limit': 2.0,
+				'enable_semantic_mapping': True,
+				'estimated_hotspot_depth': 1.5,
+				'camera_intrinsics': [186.0, 186.0, 238.0, 141.0]
+			}
+		
+		self.semantic_bridge = SemanticHotspotHelper(self, self.voxel_helper, config)
 
 		# Precompute transforms
 		self.R_opt_to_base = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float32)
@@ -147,6 +158,9 @@ class SemanticDepthOctoMapNode(Node):
 		self.create_subscription(Image, self.depth_topic, self.depth_callback, sensor_qos)
 		self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
 		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
+		# Subscribe to semantic hotspots
+		if self.enable_semantic_mapping:
+			self.create_subscription(String, '/semantic_hotspots', self.semantic_hotspot_callback, 10)
 		# NOTE: No longer subscribing to pixel embeddings/confidence - using smart semantic regions instead
 
 		# Publishers
@@ -168,6 +182,16 @@ class SemanticDepthOctoMapNode(Node):
 
 	def pose_callback(self, msg: PoseStamped):
 		self.latest_pose = msg
+
+	def semantic_hotspot_callback(self, msg: String):
+		"""Process incoming semantic hotspot messages using the helper."""
+		if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
+			try:
+				success = self.semantic_bridge.process_hotspot_message(msg)
+				if success:
+					self.get_logger().info("Successfully processed semantic hotspot message")
+			except Exception as e:
+				self.get_logger().error(f"Error in semantic hotspot callback: {e}")
 
 	# NOTE: Embedding and confidence callbacks removed - using smart semantic regions instead
 
@@ -269,18 +293,60 @@ class SemanticDepthOctoMapNode(Node):
 		
 		if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
 			markers = self.voxel_helper.create_markers(int(self.max_markers), bool(self.use_cube_list_markers))
+			
+			# Fix timestamps for all markers
+			current_time = self.get_clock().now().to_msg()
+			for marker in markers.markers:
+				marker.header.stamp = current_time
+			
 			self.marker_pub.publish(markers)
 			marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
 			self.get_logger().info(f"Published {marker_count} voxel markers")
 			self.last_marker_pub = now
+		
+		# Process any pending semantic hotspots that were queued due to missing voxels
+		if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
+			# Process pending hotspots (those that arrived before voxels were created)
+			self.semantic_bridge.process_pending_hotspots()
+			
+			# Process comprehensive hotspot queue for maximum information coverage
+			# This ensures we process ALL hotspots, not just the latest ones
+			self.semantic_bridge.process_comprehensive_hotspots()
 
 		if self.cloud_pub:
-			cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
-			if cloud:
-				self.cloud_pub.publish(cloud)
+			# Try to create semantic colored cloud first
+			semantic_cloud = None
+			if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
+				try:
+					semantic_cloud = self.semantic_bridge.get_semantic_colored_cloud(int(self.max_markers))
+				except Exception as e:
+					self.get_logger().warn(f"Failed to create semantic colored cloud: {e}")
+			
+			# If semantic cloud creation failed, fall back to original method
+			if semantic_cloud is None:
+				try:
+					cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
+					if cloud:
+						self.cloud_pub.publish(cloud)
+				except Exception as e:
+					self.get_logger().warn(f"Failed to create original colored cloud: {e}")
+			else:
+				# Publish semantic colored cloud
+				self.cloud_pub.publish(semantic_cloud)
+				self.get_logger().info(f"Published semantic colored cloud with {len(semantic_cloud.data)//16} points")
 
 		if self.stats_pub and (now - self.last_stats_pub) >= float(self.stats_publish_rate):
+			# Get combined statistics from both voxel helper and semantic bridge
 			stats = self.voxel_helper.get_statistics()
+			
+			# Add semantic statistics if available
+			if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
+				try:
+					semantic_stats = self.semantic_bridge.get_semantic_stats()
+					stats['semantic_mapping'] = semantic_stats
+				except Exception as e:
+					stats['semantic_mapping'] = {'error': f'Failed to get semantic stats: {e}'}
+			
 			self.stats_pub.publish(String(data=json.dumps(stats)))
 			self.last_stats_pub = now
 

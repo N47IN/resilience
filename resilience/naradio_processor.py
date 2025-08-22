@@ -1316,11 +1316,15 @@ class NARadioProcessor:
             for c in range(num_chunks):
                 chunk_features = feat_map_flat[c*chunk_size:(c+1)*chunk_size]
                 
-                # Use same compute_cos_sim method as VLM text for consistency
-                chunk_similarity = self.compute_cos_sim(enhanced_embedding_tensor, chunk_features, softmax=use_softmax)
+                # Compute cosine similarity: enhanced_embedding (1xC) vs chunk_features (NxC)
+                enhanced_norm = enhanced_embedding_tensor / (torch.norm(enhanced_embedding_tensor, dim=-1, keepdim=True) + 1e-8)
+                chunk_norm = chunk_features / (torch.norm(chunk_features, dim=-1, keepdim=True) + 1e-8)
+                
+                # Cosine similarity: (1xC) @ (NxC).T = (1xN)
+                chunk_similarity = torch.mm(enhanced_norm, chunk_norm.t())  # (1, N)
                 similarity_chunks.append(chunk_similarity.squeeze(0))  # (N,)
                 
-                del chunk_features
+                del chunk_features, chunk_norm
             
             # Concatenate all similarity chunks
             similarity_flat = torch.cat(similarity_chunks, dim=0)  # (H*W,)
@@ -1481,7 +1485,8 @@ class NARadioProcessor:
     def process_enhanced_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
                                                            feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
         """
-        ENHANCED: Process similarity map using enhanced embedding and create colored visualization.
+        ENHANCED: Process similarity map using enhanced embedding.
+        Uses EXACT same function as VLM text, just with enhanced embeddings as input.
         
         Args:
             rgb_image: RGB image as numpy array (H, W, 3)
@@ -1494,50 +1499,10 @@ class NARadioProcessor:
         if not self.segmentation_ready or not self.naradio_ready:
             return None
         
-        try:
-            start_time = time.time()
-            
-            # Use enhanced embedding similarity computation with same settings as original
-            similarity_map = self.compute_enhanced_similarity_map_optimized(
-                rgb_image, vlm_answer, feat_map_np, use_softmax=True, chunk_size=4000)
-            
-            if similarity_map is None:
-                return None
-            
-            # Get original image dimensions
-            original_height, original_width = rgb_image.shape[:2]
-            
-            # Resize similarity map to original image dimensions
-            similarity_resized = cv2.resize(similarity_map, (original_width, original_height), 
-                                          interpolation=cv2.INTER_LINEAR)
-            
-            # Use same colormap as original visualization for consistency
-            colored_similarity = self.apply_colormap(similarity_resized, cmap_name='viridis')
-            
-            # Processing metadata
-            processing_time = time.time() - start_time
-            
-            result = {
-                'similarity_map': similarity_resized,  # Resized to original image size
-                'colored_similarity': colored_similarity,  # RGB colored version
-                'metadata': {
-                    'vlm_answer': vlm_answer,
-                    'processing_time': processing_time,
-                    'enhanced_embedding_used': True,  # Flag to indicate enhanced processing
-                    'reused_features': feat_map_np is not None
-                },
-                'processing_info': {
-                    'processing_time': processing_time,
-                    'feature_reuse': feat_map_np is not None,
-                    'method': 'enhanced_embedding_similarity'
-                }
-            }
-            
-            return result
-            
-        except Exception as e:
-            print(f"Error processing enhanced similarity visualization: {e}")
-            return None
+        # Simply call the VLM text function - it will handle everything identically
+        # The only difference is that enhanced embeddings are already stored in the processor
+        return self.process_vlm_similarity_visualization_optimized(
+            rgb_image, vlm_answer, feat_map_np)
 
     def process_vlm_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
                                                      feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
@@ -1915,17 +1880,27 @@ class NARadioProcessor:
             has_enhanced = self.has_enhanced_embedding(vlm_answer)
             
             # Decision logic based on config and availability
-            if prefer_enhanced and has_enhanced:
-                # Use enhanced embedding similarity
-                return self.process_enhanced_similarity_visualization_optimized(
-                    rgb_image, vlm_answer, feat_map_np)
+            if prefer_enhanced:
+                # Config says to prefer enhanced embeddings
+                if has_enhanced:
+                    # Use enhanced embedding similarity
+                    return self.process_enhanced_similarity_visualization_optimized(
+                        rgb_image, vlm_answer, feat_map_np)
+                else:
+                    # Config prefers enhanced but none available - return None instead of falling back
+                    print(f"Config prefers enhanced embeddings for '{vlm_answer}' but none available - skipping")
+                    return None
             else:
-                # Use VLM text similarity (either by preference or fallback)
+                # Config says to prefer VLM text embeddings
                 return self.process_vlm_similarity_visualization_optimized(
                     rgb_image, vlm_answer, feat_map_np)
                 
         except Exception as e:
             print(f"Error in adaptive similarity processing: {e}")
-            # Fallback to VLM text similarity on error
-            return self.process_vlm_similarity_visualization_optimized(
-                rgb_image, vlm_answer, feat_map_np)
+            # Only fallback to VLM text if config doesn't prefer enhanced
+            prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
+            if not prefer_enhanced:
+                return self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np)
+            else:
+                return None
