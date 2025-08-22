@@ -23,11 +23,12 @@ import time
 import json
 import math
 from typing import Optional
+import sensor_msgs_py.point_cloud2 as pc2
+import threading
 
 # Import helpers
 try:
 	from resilience.voxel_mapping_helper import VoxelMappingHelper
-	from resilience.semantic_hotspot_helper import SemanticHotspotHelper
 	HELPERS_AVAILABLE = True
 except ImportError:
 	HELPERS_AVAILABLE = False
@@ -44,8 +45,6 @@ class SemanticDepthOctoMapNode(Node):
 			('depth_topic', '/robot_1/sensors/front_stereo/depth/depth_registered'),
 			('camera_info_topic', '/robot_1/sensors/front_stereo/left/camera_info'),
 			('pose_topic', '/robot_1/sensors/front_stereo/pose'),
-			('embedding_topic', '/voxel_embeddings'),
-			('confidence_topic', '/voxel_confidences'),
 			('map_frame', 'map'),
 			('voxel_resolution', 0.1),
 			('max_range', 5.0),
@@ -68,36 +67,42 @@ class SemanticDepthOctoMapNode(Node):
 			('enable_semantic_mapping', True),
 			('semantic_similarity_threshold', 0.6),
 			('buffers_directory', '/home/navin/ros2_ws/src/buffers'),
-			('segmentation_config_path', ''),
+			('bridge_queue_max_size', 100),
+			('bridge_queue_process_interval', 0.1),
 		])
 
 		params = self.get_parameters([
-			'depth_topic', 'camera_info_topic', 'pose_topic', 'embedding_topic', 'confidence_topic',
+			'depth_topic', 'camera_info_topic', 'pose_topic',
 			'map_frame', 'voxel_resolution', 'max_range', 'min_range', 'probability_hit',
 			'probability_miss', 'occupancy_threshold', 'publish_markers', 'publish_stats',
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate',
 			'stats_publish_rate', 'pose_is_base_link', 'apply_optical_frame_rotation',
 			'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim', 'enable_semantic_mapping',
-			'semantic_similarity_threshold', 'buffers_directory', 'segmentation_config_path'
+			'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval'
 		])
 
 		# Extract parameter values
-		(self.depth_topic, self.camera_info_topic, self.pose_topic, self.embedding_topic, self.confidence_topic,
+		(self.depth_topic, self.camera_info_topic, self.pose_topic,
 		 self.map_frame, self.voxel_resolution, self.max_range, self.min_range, self.prob_hit,
 		 self.prob_miss, self.occ_thresh, self.publish_markers, self.publish_stats, self.publish_colored_cloud,
 		 self.use_cube_list_markers, self.max_markers, self.marker_publish_rate, self.stats_publish_rate,
 		 self.pose_is_base_link, self.apply_optical_frame_rotation, self.cam_to_base_rpy_deg, self.cam_to_base_xyz,
 		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
-		 self.buffers_directory, self.segmentation_config_path) = [p.value for p in params]
+		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval) = [p.value for p in params]
 
 		# State
 		self.bridge = CvBridge()
 		self.camera_intrinsics = None
 		self.latest_pose = None
-		self.latest_embeddings = None
-		self.latest_confidence = None
 		self.last_marker_pub = 0.0
 		self.last_stats_pub = 0.0
+
+		# Queue system for bridge messages
+		self.bridge_message_queue = []
+		self.bridge_queue_lock = threading.Lock()
+		self.max_queue_size = int(self.bridge_queue_max_size)  # Use configurable parameter
+		self.queue_processing_interval = float(self.bridge_queue_process_interval)  # Use configurable parameter
+		self.last_queue_process_time = 0.0
 
 		# Initialize voxel mapping helper
 		if not HELPERS_AVAILABLE:
@@ -122,30 +127,6 @@ class SemanticDepthOctoMapNode(Node):
 			if loaded > 0:
 				self.get_logger().info(f"Loaded {loaded} VLM embeddings from buffers")
 
-		# Initialize clean semantic hotspot subscriber
-		# Load config from naradio_processor if available
-		config = {}
-		if hasattr(self, 'segmentation_config_path') and self.segmentation_config_path:
-			try:
-				import yaml
-				with open(self.segmentation_config_path, 'r') as f:
-					config = yaml.safe_load(f)
-			except Exception as e:
-				self.get_logger().warn(f"Could not load semantic config: {e}")
-		
-		# Add semantic bridge specific config if not present
-		if 'semantic_bridge' not in config:
-			config['semantic_bridge'] = {
-				'hotspot_similarity_threshold': 0.6,
-				'min_hotspot_area': 100,
-				'publish_rate_limit': 2.0,
-				'enable_semantic_mapping': True,
-				'estimated_hotspot_depth': 1.5,
-				'camera_intrinsics': [186.0, 186.0, 238.0, 141.0]
-			}
-		
-		self.semantic_bridge = SemanticHotspotHelper(self, self.voxel_helper, config)
-
 		# Precompute transforms
 		self.R_opt_to_base = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float32)
 		self.R_cam_to_base_extra = self._rpy_deg_to_rot(self.cam_to_base_rpy_deg)
@@ -161,7 +142,6 @@ class SemanticDepthOctoMapNode(Node):
 		# Subscribe to semantic hotspots
 		if self.enable_semantic_mapping:
 			self.create_subscription(String, '/semantic_hotspots', self.semantic_hotspot_callback, 10)
-		# NOTE: No longer subscribing to pixel embeddings/confidence - using smart semantic regions instead
 
 		# Publishers
 		self.marker_pub = self.create_publisher(MarkerArray, '/semantic_octomap_markers', 10) if self.publish_markers else None
@@ -172,6 +152,9 @@ class SemanticDepthOctoMapNode(Node):
 			f"SemanticDepthOctoMapNode initialized:\n"
 			f"  - Voxel resolution: {self.voxel_resolution}m\n"
 			f"  - Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}\n"
+			f"  - Bridge queue: max_size={self.max_queue_size}, process_interval={self.queue_processing_interval}s\n"
+			f"  - Voxel helper ready: {hasattr(self, 'voxel_helper') and self.voxel_helper is not None}\n"
+			f"  - Semantic mapper ready: {hasattr(self.voxel_helper, 'semantic_mapper') and self.voxel_helper.semantic_mapper is not None}\n"
 			f"  - Topics: depth={self.depth_topic}, pose={self.pose_topic}"
 		)
 
@@ -184,14 +167,226 @@ class SemanticDepthOctoMapNode(Node):
 		self.latest_pose = msg
 
 	def semantic_hotspot_callback(self, msg: String):
-		"""Process incoming semantic hotspot messages using the helper."""
-		if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
-			try:
-				success = self.semantic_bridge.process_hotspot_message(msg)
-				if success:
-					self.get_logger().info("Successfully processed semantic hotspot message")
-			except Exception as e:
-				self.get_logger().error(f"Error in semantic hotspot callback: {e}")
+		"""Queue incoming semantic hotspot messages for batch processing."""
+		try:
+			if not self.enable_semantic_mapping:
+				return
+			
+			# Add message to queue with timestamp
+			with self.bridge_queue_lock:
+				# Prevent queue from growing too large
+				if len(self.bridge_message_queue) >= self.max_queue_size:
+					# Remove oldest message
+					self.bridge_message_queue.pop(0)
+					self.get_logger().warn(f"Bridge message queue full, dropped oldest message")
+				
+				# Add new message with timestamp
+				self.bridge_message_queue.append({
+					'msg_data': msg.data,
+					'received_time': time.time()
+				})
+				
+				queue_size = len(self.bridge_message_queue)
+			
+			self.get_logger().info(f"Queued hotspot message (queue size: {queue_size})")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error queuing semantic hotspot message: {e}")
+			import traceback
+			traceback.print_exc()
+	
+	def _process_bridge_message_queue(self):
+		"""Process all queued bridge messages in batch."""
+		try:
+			# Get all messages from queue
+			messages_to_process = []
+			with self.bridge_queue_lock:
+				if not self.bridge_message_queue:
+					return
+				
+				# Copy all messages and clear the queue
+				messages_to_process = self.bridge_message_queue.copy()
+				self.bridge_message_queue.clear()
+			
+			if not messages_to_process:
+				return
+			
+			self.get_logger().info(f"Processing {len(messages_to_process)} queued bridge messages")
+			
+			# Process each message
+			processed_count = 0
+			for msg_info in messages_to_process:
+				try:
+					success = self._process_single_bridge_message(msg_info['msg_data'])
+					if success:
+						processed_count += 1
+				except Exception as e:
+					self.get_logger().warn(f"Failed to process bridge message: {e}")
+			
+			self.get_logger().info(f"Successfully processed {processed_count}/{len(messages_to_process)} bridge messages")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error processing bridge message queue: {e}")
+			import traceback
+			traceback.print_exc()
+	
+	def _process_single_bridge_message(self, msg_data: str) -> bool:
+		"""Process a single bridge message and apply to voxel map."""
+		try:
+			# Parse the JSON message
+			data = json.loads(msg_data)
+			
+			if data.get('type') != 'similarity_hotspots':
+				return False
+			
+			vlm_answer = data.get('vlm_answer')
+			pose_data = data.get('pose', {})
+			mask_shape = data.get('mask_shape')
+			mask_data = data.get('mask_data')
+			threshold_used = data.get('threshold_used', 0.6)
+			has_depth_data = data.get('has_depth_data', False)
+			depth_data = data.get('depth_data', None)
+			stats = data.get('stats', {})
+			
+			if not vlm_answer or not mask_data or not mask_shape:
+				self.get_logger().warn(f"Incomplete hotspot data: vlm_answer={vlm_answer}, mask_shape={mask_shape}")
+				return False
+			
+			# Reconstruct binary mask
+			mask = np.array(mask_data, dtype=np.uint8).reshape(mask_shape)
+			
+			# Get robot pose from hotspot data
+			robot_pose = np.array([pose_data.get('x', 0), pose_data.get('y', 0), pose_data.get('z', 0)])
+			
+			# Create a PoseStamped message for the projection functions
+			hotspot_pose = PoseStamped()
+			hotspot_pose.header.frame_id = self.map_frame
+			hotspot_pose.header.stamp = self.get_clock().now().to_msg()
+			hotspot_pose.pose.position.x = float(robot_pose[0])
+			hotspot_pose.pose.position.y = float(robot_pose[1])
+			hotspot_pose.pose.position.z = float(robot_pose[2])
+			hotspot_pose.pose.orientation.w = 1.0  # Default orientation
+			
+			# Process the hotspot mask using the same projection functions as depth
+			self._process_hotspot_mask(mask, hotspot_pose, vlm_answer, depth_data, threshold_used, stats)
+			
+			self.get_logger().info(f"Processed hotspot for '{vlm_answer}' with {np.sum(mask > 0)} pixels")
+			return True
+			
+		except Exception as e:
+			self.get_logger().error(f"Error processing single bridge message: {e}")
+			return False
+
+	def _process_hotspot_mask(self, mask: np.ndarray, pose: PoseStamped, vlm_answer: str, 
+							  depth_data: dict, threshold: float, stats: dict):
+		"""Process hotspot mask using the same projection functions as depth callback."""
+		try:
+			if self.camera_intrinsics is None:
+				self.get_logger().warn("No camera intrinsics available for hotspot processing")
+				return
+			
+			# Get hotspot pixel coordinates
+			hotspot_coords = np.where(mask > 0)
+			if len(hotspot_coords[0]) == 0:
+				return
+			
+			# Get depth values for hotspot pixels
+			depth_values = None
+			if depth_data and 'depth_mask' in depth_data:
+				try:
+					depth_mask_list = depth_data['depth_mask']
+					depth_shape = tuple(depth_data['depth_shape'])
+					depth_mask = np.array(depth_mask_list, dtype=np.float32).reshape(depth_shape)
+					
+					# Extract depth values for hotspot pixels
+					depth_values = depth_mask[hotspot_coords]
+					
+					# Filter out invalid depths
+					valid_depth_mask = np.isfinite(depth_values) & (depth_values > 0.0)
+					if np.any(valid_depth_mask):
+						hotspot_coords = (hotspot_coords[0][valid_depth_mask], hotspot_coords[1][valid_depth_mask])
+						depth_values = depth_values[valid_depth_mask]
+					else:
+						depth_values = None
+						
+				except Exception as e:
+					self.get_logger().warn(f"Failed to process depth data: {e}")
+					depth_values = None
+			
+			# If no depth data, use estimated depth
+			if depth_values is None:
+				estimated_depth = 1.5  # meters
+				depth_values = np.full(len(hotspot_coords[0]), estimated_depth, dtype=np.float32)
+				self.get_logger().info(f"Using estimated depth {estimated_depth}m for {len(hotspot_coords[0])} hotspot pixels")
+			
+			# Create depth image from hotspot pixels
+			h, w = mask.shape
+			depth_image = np.zeros((h, w), dtype=np.float32)
+			depth_image[hotspot_coords] = depth_values
+			
+			# Use the same projection function as depth callback
+			points_world, u_indices, v_indices = self._depth_to_world_points(depth_image, self.camera_intrinsics, pose)
+			if points_world is None or len(points_world) == 0:
+				return
+			
+			# Range filter (same as depth callback)
+			origin = self._pose_position(pose)
+			dist = np.linalg.norm(points_world - origin, axis=1)
+			mask_range = (dist >= float(self.min_range)) & (dist <= float(self.max_range))
+			points_world = points_world[mask_range]
+			
+			if points_world.size == 0:
+				return
+			
+			# Update voxel map with hotspot points
+			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
+			
+			# Apply semantic labeling to the voxels
+			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
+			
+			self.get_logger().info(f"Applied {len(points_world)} hotspot points to voxel map for '{vlm_answer}'")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error processing hotspot mask: {e}")
+			import traceback
+			traceback.print_exc()
+	
+	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str, 
+										threshold: float, stats: dict):
+		"""Apply semantic labels to voxels based on hotspot points."""
+		try:
+			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
+				self.get_logger().warn("Semantic mapper not available")
+				return
+			
+			semantic_mapper = self.voxel_helper.semantic_mapper
+			
+			# Get voxel keys for the world points
+			voxel_keys = set()
+			for point in points_world:
+				if hasattr(self.voxel_helper, 'get_voxel_key_from_point'):
+					voxel_key = self.voxel_helper.get_voxel_key_from_point(point)
+					voxel_keys.add(voxel_key)
+			
+			# Mark voxels as semantic with high confidence since they passed binary threshold
+			similarity_score = stats.get('avg_similarity', threshold + 0.1)
+			
+			with semantic_mapper.voxel_semantics_lock:
+				for voxel_key in voxel_keys:
+					semantic_info = {
+						'vlm_answer': vlm_answer,
+						'similarity': similarity_score,
+						'threshold_used': threshold,
+						'detection_method': 'binary_threshold_hotspot',
+						'depth_used': True,
+						'timestamp': time.time()
+					}
+					semantic_mapper.voxel_semantics[voxel_key] = semantic_info
+			
+			self.get_logger().info(f"✓ Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' - these will appear RED in the colored cloud")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
 
 	# NOTE: Embedding and confidence callbacks removed - using smart semantic regions instead
 
@@ -234,11 +429,17 @@ class SemanticDepthOctoMapNode(Node):
 			if points_world.size == 0:
 				return
 
-			# SMART SEMANTIC: Regular voxel mapping without continuous embeddings
-			# Semantic labeling happens when semantic regions are received
+			# Update voxel map with depth points
 			if self._debug_counter % 30 == 1:  # Log every 30th frame
 				self.get_logger().info(f"Updating voxel map with {len(points_world)} points")
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
+
+			# Process bridge message queue after updating voxel map
+			# This ensures semantic data is applied to newly created voxels
+			current_time = time.time()
+			if (current_time - self.last_queue_process_time) >= self.queue_processing_interval:
+				self._process_bridge_message_queue()
+				self.last_queue_process_time = current_time
 
 			# Periodic publishing
 			self._periodic_publishing()
@@ -286,10 +487,152 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception:
 			return None, None, None
 
-	# NOTE: Pixel confidence/embedding extraction methods removed - using smart semantic regions instead
+	def _create_semantic_colored_cloud(self, max_points: int) -> Optional[PointCloud2]:
+		"""Create a colored point cloud that shows semantic voxels in red."""
+		try:
+			# Get all voxels from the helper using the correct attribute
+			all_voxels = list(self.voxel_helper.voxels.keys())
+			if not all_voxels:
+				return None
+			
+			# Limit the number of points
+			if len(all_voxels) > max_points:
+				all_voxels = all_voxels[:max_points]
+			
+			# Create point cloud data
+			points = []
+			colors = []
+			semantic_count = 0
+			regular_count = 0
+			
+			# Check if semantic mapper is available
+			has_semantic_mapper = (hasattr(self.voxel_helper, 'semantic_mapper') and 
+								  self.voxel_helper.semantic_mapper is not None)
+			
+			if has_semantic_mapper:
+				semantic_mapper = self.voxel_helper.semantic_mapper
+				with semantic_mapper.voxel_semantics_lock:
+					for voxel_key in all_voxels:
+						# Get voxel center position using the correct method
+						voxel_center = self._get_voxel_center_from_key(voxel_key)
+						if voxel_center is None:
+							continue
+						
+						# Check if this voxel has semantic information
+						if voxel_key in semantic_mapper.voxel_semantics:
+							# Semantic voxel - color it RED
+							color = [255, 0, 0]  # Red for semantic voxels
+							semantic_count += 1
+						else:
+							# Regular voxel - use default color (gray)
+							color = [128, 128, 128]  # Gray for regular voxels
+							regular_count += 1
+						
+						points.append(voxel_center)
+						colors.append(color)
+			else:
+				# No semantic mapper - just create regular colored voxels
+				for voxel_key in all_voxels:
+					# Get voxel center position using the correct method
+					voxel_center = self._get_voxel_center_from_key(voxel_key)
+					if voxel_center is None:
+						continue
+					
+					# Regular voxel - use default color (gray)
+					color = [128, 128, 128]  # Gray for all voxels
+					regular_count += 1
+					
+					points.append(voxel_center)
+					colors.append(color)
+			
+			if not points:
+				return None
+			
+			# Log the coloring information
+			if has_semantic_mapper and semantic_count > 0:
+				self.get_logger().info(f"Creating colored cloud: {semantic_count} semantic voxels (RED), {regular_count} regular voxels (GRAY)")
+			else:
+				self.get_logger().info(f"Creating colored cloud: {regular_count} regular voxels (GRAY)")
+			
+			# Convert to numpy arrays
+			points_array = np.array(points, dtype=np.float32)
+			colors_array = np.array(colors, dtype=np.uint8)
+			
+			# Create PointCloud2 message with proper structure
+			header = Header()
+			header.stamp = self.get_clock().now().to_msg()
+			header.frame_id = self.map_frame
+			
+			# Create structured array with XYZ + RGB
+			cloud_data_combined = np.empty(len(points), dtype=[
+				('x', np.float32), ('y', np.float32), ('z', np.float32), 
+				('rgb', np.float32)
+			])
+			
+			# Fill in the data
+			cloud_data_combined['x'] = points_array[:, 0]
+			cloud_data_combined['y'] = points_array[:, 1]
+			cloud_data_combined['z'] = points_array[:, 2]
+			
+			# Pack RGB values into float32 (this is the standard way)
+			rgb_packed = np.zeros(len(colors_array), dtype=np.uint32)
+			for i, c in enumerate(colors_array):
+				rgb_packed[i] = (c[0] << 16) | (c[1] << 8) | c[2]  # Pack RGB into uint32
+			cloud_data_combined['rgb'] = rgb_packed.view(np.float32)  # View as float32
+			
+			# Create PointCloud2 message with proper fields from the start
+			cloud_msg = PointCloud2()
+			cloud_msg.header = header
+			
+			# Define the fields properly
+			cloud_msg.fields = [
+				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='rgb', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
+			]
+			
+			# Set the message properties
+			cloud_msg.point_step = 16  # 4 bytes per float * 4 fields (x, y, z, rgb)
+			cloud_msg.width = len(points)  # Set correct width
+			cloud_msg.height = 1  # Set height to 1 for organized point cloud
+			cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
+			cloud_msg.is_dense = True
+			
+			# Set the data
+			cloud_msg.data = cloud_data_combined.tobytes()
+			
+			return cloud_msg
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating semantic colored cloud: {e}")
+			import traceback
+			traceback.print_exc()
+			return None
+	
+	def _get_voxel_center_from_key(self, voxel_key: tuple) -> Optional[np.ndarray]:
+		"""Get voxel center position from voxel key."""
+		try:
+			vx, vy, vz = voxel_key
+			
+			# Convert voxel coordinates to world coordinates
+			world_x = vx * self.voxel_resolution
+			world_y = vy * self.voxel_resolution
+			world_z = vz * self.voxel_resolution
+			
+			return np.array([world_x, world_y, world_z], dtype=np.float32)
+			
+		except Exception as e:
+			self.get_logger().warn(f"Error getting voxel center for key {voxel_key}: {e}")
+			return None
 
 	def _periodic_publishing(self):
 		now = time.time()
+		
+		# Process bridge message queue regularly
+		if (now - self.last_queue_process_time) >= self.queue_processing_interval:
+			self._process_bridge_message_queue()
+			self.last_queue_process_time = now
 		
 		if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
 			markers = self.voxel_helper.create_markers(int(self.max_markers), bool(self.use_cube_list_markers))
@@ -303,49 +646,56 @@ class SemanticDepthOctoMapNode(Node):
 			marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
 			self.get_logger().info(f"Published {marker_count} voxel markers")
 			self.last_marker_pub = now
-		
-		# Process any pending semantic hotspots that were queued due to missing voxels
-		if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
-			# Process pending hotspots (those that arrived before voxels were created)
-			self.semantic_bridge.process_pending_hotspots()
-			
-			# Process comprehensive hotspot queue for maximum information coverage
-			# This ensures we process ALL hotspots, not just the latest ones
-			self.semantic_bridge.process_comprehensive_hotspots()
 
 		if self.cloud_pub:
-			# Try to create semantic colored cloud first
-			semantic_cloud = None
-			if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
-				try:
-					semantic_cloud = self.semantic_bridge.get_semantic_colored_cloud(int(self.max_markers))
-				except Exception as e:
-					self.get_logger().warn(f"Failed to create semantic colored cloud: {e}")
-			
-			# If semantic cloud creation failed, fall back to original method
-			if semantic_cloud is None:
+			try:
+				# Try to create semantic-aware colored cloud first
+				semantic_cloud = self._create_semantic_colored_cloud(int(self.max_markers))
+				if semantic_cloud:
+					self.cloud_pub.publish(semantic_cloud)
+					self.get_logger().debug(f"Published semantic colored cloud with {len(semantic_cloud.data)//16} points")
+				else:
+					# Fallback to regular colored cloud
+					self.get_logger().debug("Semantic cloud creation returned None, falling back to regular colored cloud")
+					cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
+					if cloud:
+						self.cloud_pub.publish(cloud)
+						self.get_logger().debug("Published regular colored cloud")
+					else:
+						self.get_logger().warn("Both semantic and regular colored cloud creation returned None")
+			except Exception as e:
+				self.get_logger().warn(f"Failed to create semantic colored cloud: {e}")
+				# Try fallback to regular colored cloud even if semantic failed
 				try:
 					cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
 					if cloud:
 						self.cloud_pub.publish(cloud)
-				except Exception as e:
-					self.get_logger().warn(f"Failed to create original colored cloud: {e}")
-			else:
-				# Publish semantic colored cloud
-				self.cloud_pub.publish(semantic_cloud)
-				self.get_logger().info(f"Published semantic colored cloud with {len(semantic_cloud.data)//16} points")
+						self.get_logger().debug("Published regular colored cloud as fallback")
+				except Exception as fallback_e:
+					self.get_logger().error(f"Both semantic and regular colored cloud creation failed: {fallback_e}")
 
 		if self.stats_pub and (now - self.last_stats_pub) >= float(self.stats_publish_rate):
-			# Get combined statistics from both voxel helper and semantic bridge
+			# Get statistics from voxel helper
 			stats = self.voxel_helper.get_statistics()
 			
-			# Add semantic statistics if available
-			if hasattr(self, 'semantic_bridge') and self.semantic_bridge:
-				try:
-					semantic_stats = self.semantic_bridge.get_semantic_stats()
-					stats['semantic_mapping'] = semantic_stats
-				except Exception as e:
-					stats['semantic_mapping'] = {'error': f'Failed to get semantic stats: {e}'}
+			# Add semantic mapping status and counts
+			semantic_voxel_count = 0
+			queue_size = 0
+			if hasattr(self.voxel_helper, 'semantic_mapper') and self.voxel_helper.semantic_mapper:
+				with self.voxel_helper.semantic_mapper.voxel_semantics_lock:
+					semantic_voxel_count = len(self.voxel_helper.semantic_mapper.voxel_semantics)
+			
+			with self.bridge_queue_lock:
+				queue_size = len(self.bridge_message_queue)
+			
+			stats['semantic_mapping'] = {
+				'enabled': self.enable_semantic_mapping,
+				'status': 'active' if self.enable_semantic_mapping else 'disabled',
+				'semantic_voxel_count': semantic_voxel_count,
+				'total_voxel_count': stats.get('total_voxels', 0),
+				'bridge_queue_size': queue_size,
+				'queue_max_size': self.max_queue_size
+			}
 			
 			self.stats_pub.publish(String(data=json.dumps(stats)))
 			self.last_stats_pub = now

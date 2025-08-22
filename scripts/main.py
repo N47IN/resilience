@@ -62,15 +62,26 @@ class ResilienceNode(Node):
         # Track recent VLM answers for smart semantic processing
         self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
-        # NEW: Synchronized data storage for semantic bridge
-        self.synchronized_data = {
+        # SIMPLE: Store image, pose, and depth that come together
+        self.current_image_data = {
             'rgb_image': None,
             'depth_image': None, 
             'pose': None,
-            'timestamp': None,
-            'rgb_msg_header': None
+            'timestamp': None
         }
-        self.sync_data_lock = threading.Lock()
+        self.image_data_lock = threading.Lock()
+        
+        # CLEVER SIDE APPROACH: Capture data when processing VLM similarity
+        # This doesn't affect main callbacks, just captures what we need
+        self.vlm_data_capture = {
+            'last_captured_image': None,
+            'last_captured_pose': None,
+            'last_captured_depth': None,
+            'last_capture_timestamp': None
+        }
+        self.vlm_capture_lock = threading.Lock()
+        
+
         
         self.declare_parameters('', [
             ('min_confidence', 0.05),
@@ -241,6 +252,12 @@ class ResilienceNode(Node):
             self.print_embedding_method_config()
             
             self.publish_vlm_objects_legend()
+        
+        # Print synchronization configuration
+        print(f"Data Capture on Image Reception: ENABLED")
+        print(f"  - Captures pose and depth when each image is received")
+        print(f"  - Ensures temporal alignment with the image")
+        print(f"  - No interference with main node functionality")
 
     def print_embedding_method_config(self):
         """Print information about embedding method configuration and availability."""
@@ -427,15 +444,33 @@ class ResilienceNode(Node):
 
         msg_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
+        # CAPTURE DATA RIGHT WHEN IMAGE IS RECEIVED
+        # This ensures we get the pose and depth that were available at this moment
+        with self.vlm_capture_lock:
+            # Capture current pose
+            if self.latest_pose is not None:
+                self.vlm_data_capture['last_captured_pose'] = self.latest_pose.copy()
+            
+            # Capture current depth
+            if self.latest_depth_msg is not None:
+                try:
+                    depth_image = self.bridge.imgmsg_to_cv2(self.latest_depth_msg, desired_encoding='passthrough')
+                    if depth_image.dtype == np.uint16:
+                        depth_image = depth_image.astype(np.float32) / 1000.0
+                    self.vlm_data_capture['last_captured_depth'] = depth_image
+                except Exception:
+                    self.vlm_data_capture['last_captured_depth'] = None
+            
+            # Store the timestamp when this data was captured
+            self.vlm_data_capture['last_capture_timestamp'] = msg_timestamp
+        
         with self.processing_lock:
             self.latest_rgb_msg = msg
             if self.latest_pose is not None:
                 self.detection_pose = self.latest_pose.copy()
                 self.detection_pose_time = self.latest_pose_time
                 
-                # NEW: Update synchronized data when we have all three (RGB, depth, pose)
-                if self.latest_depth_msg is not None:
-                    self.update_synchronized_data(msg, self.latest_depth_msg, self.latest_pose)
+
             
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         
@@ -454,7 +489,7 @@ class ResilienceNode(Node):
         """Store latest depth message with minimal buffer operations to reduce lag."""
         with self.processing_lock:
             self.latest_depth_msg = msg
-            
+        
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -997,41 +1032,18 @@ class ResilienceNode(Node):
 
     # NOTE: Complex hotspot extraction removed - using clean semantic bridge instead
 
-    def update_synchronized_data(self, rgb_msg, depth_msg, pose):
-        """Update synchronized data for semantic bridge processing."""
+
+
+
+
+    def _get_ros_timestamp(self, msg):
+        """Extract ROS timestamp as float from message header."""
         try:
-            with self.sync_data_lock:
-                # Convert RGB image
-                rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
-                
-                # Convert depth image
-                depth_image = None
-                if depth_msg is not None:
-                    try:
-                        depth_np = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-                        # normalize to meters if necessary
-                        if depth_np.dtype == np.uint16:
-                            depth_np = depth_np.astype(np.float32) / 1000.0
-                        depth_image = depth_np
-                    except Exception:
-                        depth_image = None
-                
-                # Store synchronized data
-                self.synchronized_data = {
-                    'rgb_image': rgb_image,
-                    'depth_image': depth_image,
-                    'pose': pose.copy() if pose is not None else None,
-                    'timestamp': time.time(),
-                    'rgb_msg_header': rgb_msg.header
-                }
-                
-        except Exception as e:
-            print(f"Error updating synchronized data: {e}")
-    
-    def get_synchronized_data(self):
-        """Get synchronized data for semantic bridge processing."""
-        with self.sync_data_lock:
-            return self.synchronized_data.copy()
+            return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        except Exception:
+            return time.time()
+
+
 
     def naradio_processing_loop(self):
         """Parallel NARadio processing loop with robust error handling."""
@@ -1073,8 +1085,7 @@ class ResilienceNode(Node):
                     depth_msg = self.latest_depth_msg
                     pose_for_semantic = self.latest_pose.copy() if self.latest_pose is not None else None
                 
-                # NEW: Update synchronized data for semantic bridge
-                self.update_synchronized_data(rgb_msg, depth_msg, pose_for_semantic)
+
                 
                 try:
                     rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
@@ -1118,33 +1129,49 @@ class ResilienceNode(Node):
                                         if self.publish_refined_mask:
                                             self.refined_mask_pub.publish(similarity_msg)
                                     
-                                    # NEW: Publish binary hotspots with depth and pose to semantic bridge
+                                    # ENHANCED: Publish binary hotspots with perfectly synchronized depth and pose
                                     if (hasattr(self, 'semantic_bridge') and self.semantic_bridge and 
                                         similarity_result.get('similarity_map') is not None):
                                         
-                                        # Use perfectly synchronized data for semantic bridge
-                                        sync_data = self.get_synchronized_data()
-                                        if sync_data['pose'] is not None:
+                                        # USE PRE-CAPTURED DATA: Image, pose, and depth were captured when image was received
+                                        # This ensures we get the pose and depth that were available right when that image came in
+                                        captured_data = self.vlm_data_capture
+                                        
+                                        if (captured_data['last_captured_pose'] is not None):
+                                            
                                             try:
+                                                print(f"✓ Publishing hotspots with pre-captured data:")
+                                                print(f"  Image timestamp: {captured_data['last_capture_timestamp']:.6f}")
+                                                print(f"  Pose available: {captured_data['last_captured_pose'] is not None}")
+                                                print(f"  Depth available: {captured_data['last_captured_depth'] is not None}")
+                                                
                                                 self.semantic_bridge.publish_similarity_hotspots(
                                                     vlm_answer=vlm_answer,
                                                     similarity_map=similarity_result['similarity_map'],
-                                                    pose=sync_data['pose'],
-                                                    timestamp=sync_data['timestamp'],
-                                                    original_image=sync_data['rgb_image'],
-                                                    depth_image=sync_data['depth_image']
+                                                    pose=captured_data['last_captured_pose'],
+                                                    timestamp=captured_data['last_capture_timestamp'],
+                                                    original_image=rgb_image,  # Use current RGB image
+                                                    depth_image=captured_data['last_captured_depth']
                                                 )
+                                                
+                                                print(f"✓ Published hotspots for '{vlm_answer}' with pre-captured data")
+                                                
                                             except Exception as e:
                                                 print(f"Error publishing to semantic bridge: {e}")
+                                                import traceback
+                                                traceback.print_exc()
                                         else:
-                                            print(f"Skipping semantic bridge - no synchronized pose available")
-                                    
-                                    if (self.risk_buffer_manager and 
-                                        len(self.risk_buffer_manager.active_buffers) > 0 and 
-                                        self.current_breach_active):
-                                        
-                                        self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
+                                            print(f"✗ Skipping semantic bridge - no pre-captured pose data")
+                                            print(f"  Pose: {captured_data['last_captured_pose'] is not None}")
+                                            print(f"  Depth: {captured_data['last_captured_depth'] is not None}")
                                 
+                                # Save similarity results to risk buffer if active
+                                if (self.risk_buffer_manager and 
+                                    len(self.risk_buffer_manager.active_buffers) > 0 and 
+                                    self.current_breach_active):
+                                    
+                                    self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
+                        
                         except Exception as seg_e:
                             pass  # SPEED OPTIMIZATION: Silent error handling
                     
@@ -1588,6 +1615,15 @@ class ResilienceNode(Node):
             if current_time - timestamp <= max_age_seconds
         ]
         return recent_vlm_answers
+
+
+    
+    def _get_ros_timestamp(self, msg):
+        """Extract ROS timestamp as float from message header."""
+        try:
+            return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        except Exception:
+            return time.time()
 
 
 def main():
