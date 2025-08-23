@@ -69,6 +69,7 @@ class SemanticDepthOctoMapNode(Node):
 			('buffers_directory', '/home/navin/ros2_ws/src/buffers'),
 			('bridge_queue_max_size', 100),
 			('bridge_queue_process_interval', 0.1),
+			('enable_voxel_mapping', True),
 		])
 
 		params = self.get_parameters([
@@ -78,7 +79,8 @@ class SemanticDepthOctoMapNode(Node):
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate',
 			'stats_publish_rate', 'pose_is_base_link', 'apply_optical_frame_rotation',
 			'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim', 'enable_semantic_mapping',
-			'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval'
+			'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval',
+			'enable_voxel_mapping'
 		])
 
 		# Extract parameter values
@@ -88,7 +90,8 @@ class SemanticDepthOctoMapNode(Node):
 		 self.use_cube_list_markers, self.max_markers, self.marker_publish_rate, self.stats_publish_rate,
 		 self.pose_is_base_link, self.apply_optical_frame_rotation, self.cam_to_base_rpy_deg, self.cam_to_base_xyz,
 		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
-		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval) = [p.value for p in params]
+		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval,
+		 self.enable_voxel_mapping) = [p.value for p in params]
 
 		# State
 		self.bridge = CvBridge()
@@ -140,7 +143,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
 		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
 		# Subscribe to semantic hotspots
-		if self.enable_semantic_mapping:
+		if self.enable_semantic_mapping and self.enable_voxel_mapping:
 			self.create_subscription(String, '/semantic_hotspots', self.semantic_hotspot_callback, 10)
 
 		# Publishers
@@ -151,6 +154,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.get_logger().info(
 			f"SemanticDepthOctoMapNode initialized:\n"
 			f"  - Voxel resolution: {self.voxel_resolution}m\n"
+			f"  - Voxel mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}\n"
 			f"  - Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}\n"
 			f"  - Bridge queue: max_size={self.max_queue_size}, process_interval={self.queue_processing_interval}s\n"
 			f"  - Voxel helper ready: {hasattr(self, 'voxel_helper') and self.voxel_helper is not None}\n"
@@ -169,7 +173,7 @@ class SemanticDepthOctoMapNode(Node):
 	def semantic_hotspot_callback(self, msg: String):
 		"""Queue incoming semantic hotspot messages for batch processing."""
 		try:
-			if not self.enable_semantic_mapping:
+			if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
 				return
 			
 			# Add message to queue with timestamp
@@ -246,6 +250,7 @@ class SemanticDepthOctoMapNode(Node):
 			threshold_used = data.get('threshold_used', 0.6)
 			has_depth_data = data.get('has_depth_data', False)
 			depth_data = data.get('depth_data', None)
+			depth_quality = data.get('depth_quality', 'unknown')  # NEW: Get depth quality
 			stats = data.get('stats', {})
 			
 			if not vlm_answer or not mask_data or not mask_shape:
@@ -258,6 +263,15 @@ class SemanticDepthOctoMapNode(Node):
 			# Get robot pose from hotspot data
 			robot_pose = np.array([pose_data.get('x', 0), pose_data.get('y', 0), pose_data.get('z', 0)])
 			
+			# DEBUG: Show received data
+			self.get_logger().info(f"DEBUG - Received hotspot data:")
+			self.get_logger().info(f"  VLM answer: {vlm_answer}")
+			self.get_logger().info(f"  Pose data: {pose_data}")
+			self.get_logger().info(f"  Robot pose: {robot_pose}")
+			self.get_logger().info(f"  Mask shape: {mask_shape}")
+			self.get_logger().info(f"  Has depth: {has_depth_data}")
+			self.get_logger().info(f"  Depth quality: {depth_quality}")
+			
 			# Create a PoseStamped message for the projection functions
 			hotspot_pose = PoseStamped()
 			hotspot_pose.header.frame_id = self.map_frame
@@ -268,30 +282,42 @@ class SemanticDepthOctoMapNode(Node):
 			hotspot_pose.pose.orientation.w = 1.0  # Default orientation
 			
 			# Process the hotspot mask using the same projection functions as depth
-			self._process_hotspot_mask(mask, hotspot_pose, vlm_answer, depth_data, threshold_used, stats)
+			success = self._process_hotspot_mask(mask, hotspot_pose, vlm_answer, depth_data, threshold_used, stats, depth_quality)
 			
-			self.get_logger().info(f"Processed hotspot for '{vlm_answer}' with {np.sum(mask > 0)} pixels")
-			return True
+			if success:
+				self.get_logger().info(f"Processed hotspot for '{vlm_answer}' with {np.sum(mask > 0)} pixels (depth: {depth_quality})")
+			else:
+				self.get_logger().warn(f"Failed to process hotspot for '{vlm_answer}'")
+			
+			return success
 			
 		except Exception as e:
 			self.get_logger().error(f"Error processing single bridge message: {e}")
 			return False
 
 	def _process_hotspot_mask(self, mask: np.ndarray, pose: PoseStamped, vlm_answer: str, 
-							  depth_data: dict, threshold: float, stats: dict):
+							  depth_data: dict, threshold: float, stats: dict, depth_quality: str = 'unknown'):
 		"""Process hotspot mask using the same projection functions as depth callback."""
 		try:
 			if self.camera_intrinsics is None:
 				self.get_logger().warn("No camera intrinsics available for hotspot processing")
-				return
+				return False
+			
+			# DEBUG: Show camera intrinsics and processing details
+			self.get_logger().info(f"DEBUG - Processing hotspot mask:")
+			self.get_logger().info(f"  Camera intrinsics: {self.camera_intrinsics}")
+			self.get_logger().info(f"  Mask shape: {mask.shape}")
+			self.get_logger().info(f"  Pose: x={pose.pose.position.x:.3f}, y={pose.pose.position.y:.3f}, z={pose.pose.position.z:.3f}")
 			
 			# Get hotspot pixel coordinates
 			hotspot_coords = np.where(mask > 0)
 			if len(hotspot_coords[0]) == 0:
-				return
+				self.get_logger().warn("No hotspot pixels found in mask")
+				return False
 			
 			# Get depth values for hotspot pixels
 			depth_values = None
+			depth_source = "none"
 			if depth_data and 'depth_mask' in depth_data:
 				try:
 					depth_mask_list = depth_data['depth_mask']
@@ -306,17 +332,21 @@ class SemanticDepthOctoMapNode(Node):
 					if np.any(valid_depth_mask):
 						hotspot_coords = (hotspot_coords[0][valid_depth_mask], hotspot_coords[1][valid_depth_mask])
 						depth_values = depth_values[valid_depth_mask]
+						depth_source = f"actual({len(depth_values)} valid)"
 					else:
 						depth_values = None
+						depth_source = "no_valid_depths"
 						
 				except Exception as e:
 					self.get_logger().warn(f"Failed to process depth data: {e}")
 					depth_values = None
+					depth_source = f"error({str(e)[:20]})"
 			
 			# If no depth data, use estimated depth
 			if depth_values is None:
 				estimated_depth = 1.5  # meters
 				depth_values = np.full(len(hotspot_coords[0]), estimated_depth, dtype=np.float32)
+				depth_source = f"estimated({estimated_depth}m)"
 				self.get_logger().info(f"Using estimated depth {estimated_depth}m for {len(hotspot_coords[0])} hotspot pixels")
 			
 			# Create depth image from hotspot pixels
@@ -327,7 +357,8 @@ class SemanticDepthOctoMapNode(Node):
 			# Use the same projection function as depth callback
 			points_world, u_indices, v_indices = self._depth_to_world_points(depth_image, self.camera_intrinsics, pose)
 			if points_world is None or len(points_world) == 0:
-				return
+				self.get_logger().warn("Failed to project hotspot points to world coordinates")
+				return False
 			
 			# Range filter (same as depth callback)
 			origin = self._pose_position(pose)
@@ -336,20 +367,32 @@ class SemanticDepthOctoMapNode(Node):
 			points_world = points_world[mask_range]
 			
 			if points_world.size == 0:
-				return
+				self.get_logger().warn("All hotspot points filtered out by range constraints")
+				return False
 			
 			# Update voxel map with hotspot points
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
 			
+			# DEBUG: Show final world points and origin
+			self.get_logger().info(f"DEBUG - Voxel map update:")
+			self.get_logger().info(f"  Origin: {origin}")
+			self.get_logger().info(f"  Points world shape: {points_world.shape}")
+			if len(points_world) > 0:
+				self.get_logger().info(f"  First point: {points_world[0]}")
+				self.get_logger().info(f"  Last point: {points_world[-1]}")
+				self.get_logger().info(f"  Point range: X[{points_world[:, 0].min():.3f}, {points_world[:, 0].max():.3f}], Y[{points_world[:, 1].min():.3f}, {points_world[:, 1].max():.3f}], Z[{points_world[:, 2].min():.3f}, {points_world[:, 2].max():.3f}]")
+			
 			# Apply semantic labeling to the voxels
 			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
 			
-			self.get_logger().info(f"Applied {len(points_world)} hotspot points to voxel map for '{vlm_answer}'")
+			self.get_logger().info(f"Applied {len(points_world)} hotspot points to voxel map for '{vlm_answer}' (depth: {depth_source}, quality: {depth_quality})")
+			return True
 			
 		except Exception as e:
 			self.get_logger().error(f"Error processing hotspot mask: {e}")
 			import traceback
 			traceback.print_exc()
+			return False
 	
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str, 
 										threshold: float, stats: dict):

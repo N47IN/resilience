@@ -65,6 +65,17 @@ class SemanticHotspotPublisher:
             if current_time - self.last_publish_time < (1.0 / self.publish_rate_limit):
                 return False
             
+            # Validate input data
+            if similarity_map is None or similarity_map.size == 0:
+                if hasattr(self.node, 'get_logger'):
+                    self.node.get_logger().warn(f"Invalid similarity map for '{vlm_answer}'")
+                return False
+            
+            if pose is None or len(pose) != 3:
+                if hasattr(self.node, 'get_logger'):
+                    self.node.get_logger().warn(f"Invalid pose data for '{vlm_answer}': {pose}")
+                return False
+            
             # Apply binary threshold directly to similarity map
             hotspot_mask = similarity_map > self.hotspot_threshold
             
@@ -88,25 +99,47 @@ class SemanticHotspotPublisher:
             if hotspot_count == 0:
                 return False  # No significant hotspots
             
-            # NEW: Extract depth values for hotspot regions
+            # NEW: Enhanced depth data extraction with quality metrics
             hotspot_depth_data = None
+            depth_quality = "none"
             if depth_image is not None:
-                # Get depth values only for hotspot pixels
-                hotspot_pixels = filtered_mask > 0
-                hotspot_depth_values = depth_image[hotspot_pixels]
-                
-                if len(hotspot_depth_values) > 0:
-                    # Create depth mask with same dimensions
-                    depth_mask = np.zeros_like(depth_image, dtype=np.float32)
-                    depth_mask[hotspot_pixels] = hotspot_depth_values
-                    
-                    # Compress depth data for efficient transmission
-                    hotspot_depth_data = {
-                        'depth_mask': depth_mask.tolist(),  # Full depth mask
-                        'hotspot_depths': hotspot_depth_values.tolist(),  # Just hotspot depths
-                        'depth_shape': depth_mask.shape,
-                        'depth_units': 'meters'
-                    }
+                try:
+                    # Validate depth image
+                    if depth_image.size == 0 or not np.isfinite(depth_image).any():
+                        depth_quality = "invalid"
+                    else:
+                        # Get depth values only for hotspot pixels
+                        hotspot_pixels = filtered_mask > 0
+                        hotspot_depth_values = depth_image[hotspot_pixels]
+                        
+                        if len(hotspot_depth_values) > 0:
+                            # Filter out invalid depths
+                            valid_depths = hotspot_depth_values[np.isfinite(hotspot_depth_values) & (hotspot_depth_values > 0.0)]
+                            
+                            if len(valid_depths) > 0:
+                                # Create depth mask with same dimensions
+                                depth_mask = np.zeros_like(depth_image, dtype=np.float32)
+                                depth_mask[hotspot_pixels] = hotspot_depth_values
+                                
+                                # Compress depth data for efficient transmission
+                                hotspot_depth_data = {
+                                    'depth_mask': depth_mask.tolist(),  # Full depth mask
+                                    'hotspot_depths': valid_depths.tolist(),  # Just valid hotspot depths
+                                    'depth_shape': depth_mask.shape,
+                                    'depth_units': 'meters',
+                                    'valid_depth_count': len(valid_depths),
+                                    'total_depth_count': len(hotspot_depth_values)
+                                }
+                                
+                                depth_quality = f"good({len(valid_depths)}/{len(hotspot_depth_values)} valid)"
+                            else:
+                                depth_quality = "no_valid_depths"
+                        else:
+                            depth_quality = "no_hotspot_depths"
+                except Exception as e:
+                    depth_quality = f"error({str(e)[:20]})"
+                    if hasattr(self.node, 'get_logger'):
+                        self.node.get_logger().warn(f"Error processing depth data: {e}")
             
             # Compute statistics
             hotspot_pixels = np.sum(filtered_mask > 0)
@@ -133,13 +166,15 @@ class SemanticHotspotPublisher:
                 'mask_data': filtered_mask.flatten().tolist(),  # Binary mask as list
                 'threshold_used': self.hotspot_threshold,
                 'has_depth_data': depth_image is not None,
-                'depth_data': hotspot_depth_data,  # NEW: Full depth data
+                'depth_data': hotspot_depth_data,  # Enhanced depth data
+                'depth_quality': depth_quality,  # NEW: Depth quality indicator
                 'stats': {
                     'hotspot_count': hotspot_count,
                     'hotspot_pixels': int(hotspot_pixels),
                     'max_similarity': float(np.max(hotspot_similarity_values)),
                     'avg_similarity': float(np.mean(hotspot_similarity_values)),
-                    'threshold': self.hotspot_threshold
+                    'threshold': self.hotspot_threshold,
+                    'depth_quality': depth_quality  # Include in stats
                 }
             }
             
@@ -150,7 +185,7 @@ class SemanticHotspotPublisher:
             self.last_publish_time = current_time
             
             if hasattr(self.node, 'get_logger'):
-                depth_info = f" + depth({len(hotspot_depth_values) if hotspot_depth_data else 0} values)" if depth_image is not None else ""
+                depth_info = f" + depth({depth_quality})" if depth_image is not None else ""
                 self.node.get_logger().info(f"Published {hotspot_count} hotspots for '{vlm_answer}' (>{self.hotspot_threshold}){depth_info}")
             
             return True
