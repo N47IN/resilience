@@ -36,12 +36,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 from resilience.risk_buffer import RiskBufferManager
 from resilience.historical_cause_analysis import HistoricalCauseAnalyzer
 
-# Import semantic bridge
-try:
-    from resilience.semantic_info_bridge import SemanticHotspotPublisher
-    SEMANTIC_BRIDGE_AVAILABLE = True
-except ImportError:
-    SEMANTIC_BRIDGE_AVAILABLE = False
+
 
 
 class ResilienceNode(Node):
@@ -71,23 +66,9 @@ class ResilienceNode(Node):
         }
         self.image_data_lock = threading.Lock()
         
-        # SYNCHRONIZED DATA BUFFER: Store timestamped triplets for perfect sync
-        self.synchronized_data_buffer = []  # [(timestamp, rgb_msg, pose, depth_msg)]
-        self.max_sync_buffer_size = 100  # Increased from 50 to handle more data
-        self.sync_buffer_lock = threading.Lock()
-        self.sync_tolerance = 0.08  # Increased from 0.05s to 100ms for better coverage
-        self.interpolation_enabled = True  # NEW: Enable pose/depth interpolation
-        self.min_sync_quality = 0.12  # NEW: Maximum acceptable sync quality (150ms)
-        
-        # NEW: Synchronization quality tracking
-        self.sync_stats = {
-            'total_frames': 0,
-            'successful_sync': 0,
-            'interpolated_sync': 0,
-            'dropped_frames': 0,
-            'avg_sync_quality': 0.0,
-            'last_sync_report': 0.0
-        }
+        # SIMPLE: Store RGB images with timestamps for hotspot publishing
+        self.rgb_images_with_timestamps = []  # [(rgb_msg, timestamp)]
+        self.max_rgb_buffer = 50  # Keep last 50 RGB images
         
 
         
@@ -263,18 +244,11 @@ class ResilienceNode(Node):
             self.publish_vlm_objects_legend()
         
         # Print synchronization configuration
-        print(f"Data Capture on Image Reception: ENABLED")
-        print(f"  - Captures pose and depth when each image is received")
-        print(f"  - Ensures temporal alignment with the image")
-        print(f"  - No interference with main node functionality")
-        
-        # NEW: Print synchronization configuration
-        print(f"Enhanced Synchronization: ENABLED")
-        print(f"  - Sync tolerance: {self.sync_tolerance:.3f}s")
-        print(f"  - Min sync quality: {self.min_sync_quality:.3f}s")
-        print(f"  - Interpolation: {'ENABLED' if self.interpolation_enabled else 'DISABLED'}")
-        print(f"  - Buffer size: {self.max_sync_buffer_size}")
-        print(f"  - Periodic cleanup: Every 10 seconds")
+        print(f"Clean Hotspot Publishing: ENABLED")
+        print(f"  - Publishes only hotspot mask + timestamp")
+        print(f"  - No pose/depth synchronization complexity")
+        print(f"  - Octomap creates triplets from its own data")
+        print(f"  - RGB buffer size: {self.max_rgb_buffer}")
 
     def print_embedding_method_config(self):
         """Print information about embedding method configuration and availability."""
@@ -440,7 +414,7 @@ class ResilienceNode(Node):
     def init_semantic_bridge(self):
         """Initialize semantic hotspot bridge for communication with octomap."""
         try:
-            if SEMANTIC_BRIDGE_AVAILABLE and self.enable_voxel_mapping:
+            if self.enable_voxel_mapping:
                 # Load semantic bridge config from segmentation config
                 segmentation_config = getattr(self.naradio_processor, 'segmentation_config', {})
                 
@@ -449,10 +423,7 @@ class ResilienceNode(Node):
                 print("✓ Semantic hotspot bridge initialized (voxel mapping enabled)")
             else:
                 self.semantic_bridge = None
-                if not SEMANTIC_BRIDGE_AVAILABLE:
-                    print("✗ Semantic bridge not available")
-                else:
-                    print("✗ Semantic bridge disabled (voxel mapping disabled)")
+                print("✗ Semantic bridge disabled (voxel mapping disabled)")
         except Exception as e:
             print(f"Error initializing semantic bridge: {e}")
             self.semantic_bridge = None
@@ -478,79 +449,20 @@ class ResilienceNode(Node):
             print(f"Historical analysis thread already running")
     
     def rgb_callback(self, msg):
-        """Store latest RGB message with synchronized pose and depth data."""
-
+        """Store RGB message with timestamp for hotspot publishing."""
         msg_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
-        # IMPROVED SYNCHRONIZATION: Create combined pose+depth entries
-        with self.sync_buffer_lock:
-            self.sync_stats['total_frames'] += 1
-            
-            # Find best matching pose and depth with interpolation
-            best_pose_data = self._find_best_sync_data(msg_timestamp, 'pose')
-            best_depth_data = self._find_best_sync_data(msg_timestamp, 'depth')
-            
-            if best_pose_data and best_depth_data:
-                # Calculate sync quality
-                pose_quality = abs(msg_timestamp - best_pose_data['timestamp'])
-                depth_quality = abs(msg_timestamp - best_depth_data['timestamp'])
-                overall_quality = max(pose_quality, depth_quality)
-                
-                # Accept if quality is within acceptable range
-                if overall_quality <= self.min_sync_quality:
-                    # Create COMBINED entry with both pose and depth
-                    sync_data = {
-                        'timestamp': msg_timestamp,
-                        'rgb_msg': msg,
-                        'pose': best_pose_data['data'],
-                        'depth_msg': best_depth_data['data'],
-                        'sync_quality': overall_quality,
-                        'interpolated': best_pose_data['interpolated'] or best_depth_data['interpolated'],
-                        'type': 'combined'  # NEW: Mark as combined entry
-                    }
-                    
-                    self.synchronized_data_buffer.append(sync_data)
-                    
-                    # Keep buffer size manageable
-                    if len(self.synchronized_data_buffer) > self.max_sync_buffer_size:
-                        self.synchronized_data_buffer.pop(0)
-                    
-                    # Update stats
-                    if sync_data['interpolated']:
-                        self.sync_stats['interpolated_sync'] += 1
-                    else:
-                        self.sync_stats['successful_sync'] += 1
-                    
-                    self.sync_stats['avg_sync_quality'] = (
-                        (self.sync_stats['avg_sync_quality'] * (self.sync_stats['successful_sync'] + self.sync_stats['interpolated_sync'] - 1) + overall_quality) /
-                        (self.sync_stats['successful_sync'] + self.sync_stats['interpolated_sync'])
-                    )
-                    
-                    print(f"✓ Combined sync data stored: RGB={msg_timestamp:.6f}, quality={overall_quality:.6f}s, interpolated={sync_data['interpolated']}")
-                else:
-                    self.sync_stats['dropped_frames'] += 1
-                    print(f"✗ Frame dropped - sync quality too poor: {overall_quality:.6f}s > {self.min_sync_quality:.3f}s")
-            else:
-                self.sync_stats['dropped_frames'] += 1
-                print(f"✗ Could not synchronize RGB frame: pose={best_pose_data is not None}, depth={best_depth_data is not None}")
-        
-        # Report sync stats periodically
-        current_time = time.time()
-        if current_time - self.sync_stats['last_sync_report'] > 10.0:  # Every 10 seconds
-            self._report_sync_stats()
-            self.sync_stats['last_sync_report'] = current_time
-            
-            # Also clean up sync buffer periodically
-            self._cleanup_sync_buffer()
+        # Store RGB image with timestamp for hotspot publishing
+        self.rgb_images_with_timestamps.append((msg, msg_timestamp))
+        if len(self.rgb_images_with_timestamps) > self.max_rgb_buffer:
+            self.rgb_images_with_timestamps.pop(0)
         
         with self.processing_lock:
             self.latest_rgb_msg = msg
             if self.latest_pose is not None:
                 self.detection_pose = self.latest_pose.copy()
                 self.detection_pose_time = self.latest_pose_time
-                
-
-            
+        
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         
         self.image_buffer.append((cv_image, msg_timestamp, msg))
@@ -564,141 +476,12 @@ class ResilienceNode(Node):
         while self.rolling_image_buffer and (current_system_time - self.rolling_image_buffer[0][1]) > self.rolling_buffer_duration:
             self.rolling_image_buffer.pop(0)
     
-    def get_synchronized_data_for_rgb(self, rgb_timestamp, tolerance=0.15):
-        """Get perfectly synchronized pose and depth for a given RGB timestamp."""
-        with self.sync_buffer_lock:
-            best_match = None
-            best_time_diff = float('inf')
-            
-            # Look for combined pose+depth entries in sync buffer
-            for sync_data in self.synchronized_data_buffer:
-                # Only process combined entries (not individual pose/depth entries)
-                if 'pose' in sync_data and 'depth_msg' in sync_data:
-                    time_diff = abs(sync_data['timestamp'] - rgb_timestamp)
-                    if time_diff < tolerance and time_diff < best_time_diff:
-                        best_time_diff = time_diff
-                        best_match = sync_data
-            
-            if best_match:
-                try:
-                    # Convert depth message to numpy array
-                    depth_image = self.bridge.imgmsg_to_cv2(best_match['depth_msg'], desired_encoding='passthrough')
-                    if depth_image.dtype == np.uint16:
-                        depth_image = depth_image.astype(np.float32) / 1000.0
-                    
-                    return {
-                        'pose': best_match['pose'],
-                        'depth_image': depth_image,
-                        'timestamp': best_match['timestamp'],
-                        'sync_quality': best_match.get('sync_quality', best_time_diff),
-                        'time_diff': best_time_diff,
-                        'interpolated': best_match.get('interpolated', False)
-                    }
-                except Exception as e:
-                    print(f"Error converting synchronized depth image: {e}")
-                    return None
-            
-            # If no combined match found, try to create one from individual entries
-            best_pose = None
-            best_depth = None
-            best_pose_time = None
-            best_depth_time = None
-            
-            # Find best pose within tolerance
-            for sync_data in self.synchronized_data_buffer:
-                if sync_data.get('type') == 'pose':
-                    time_diff = abs(sync_data['timestamp'] - rgb_timestamp)
-                    if time_diff < tolerance:
-                        if best_pose is None or time_diff < abs(best_pose_time - rgb_timestamp):
-                            best_pose = sync_data['pose']
-                            best_pose_time = sync_data['timestamp']
-            
-            # Find best depth within tolerance
-            for sync_data in self.synchronized_data_buffer:
-                if sync_data.get('type') == 'depth':
-                    time_diff = abs(sync_data['timestamp'] - rgb_timestamp)
-                    if time_diff < tolerance:
-                        if best_depth is None or time_diff < abs(best_depth_time - rgb_timestamp):
-                            best_depth = sync_data['depth_msg']
-                            best_depth_time = sync_data['timestamp']
-            
-            # If we have both pose and depth, create combined entry
-            if best_pose is not None and best_depth is not None:
-                try:
-                    depth_image = self.bridge.imgmsg_to_cv2(best_depth, desired_encoding='passthrough')
-                    if depth_image.dtype == np.uint16:
-                        depth_image = depth_image.astype(np.float32) / 1000.0
-                    
-                    pose_time_diff = abs(best_pose_time - rgb_timestamp)
-                    depth_time_diff = abs(best_depth_time - rgb_timestamp)
-                    overall_quality = max(pose_time_diff, depth_time_diff)
-                    
-                    return {
-                        'pose': best_pose,
-                        'depth_image': depth_image,
-                        'timestamp': rgb_timestamp,
-                        'sync_quality': overall_quality,
-                        'time_diff': overall_quality,
-                        'interpolated': True
-                    }
-                except Exception as e:
-                    print(f"Error creating combined sync data: {e}")
-                    return None
-            
-            # Final fallback: use latest data if within tolerance
-            if self.latest_pose is not None and self.latest_depth_msg is not None:
-                pose_time_diff = abs(rgb_timestamp - self.latest_pose_time)
-                depth_timestamp = self.latest_depth_msg.header.stamp.sec + self.latest_depth_msg.header.stamp.nanosec * 1e-9
-                depth_time_diff = abs(rgb_timestamp - depth_timestamp)
-                
-                # Use if both are within tolerance
-                if pose_time_diff <= tolerance and depth_time_diff <= tolerance:
-                    try:
-                        depth_image = self.bridge.imgmsg_to_cv2(self.latest_depth_msg, desired_encoding='passthrough')
-                        if depth_image.dtype == np.uint16:
-                            depth_image = depth_image.astype(np.float32) / 1000.0
-                        
-                        overall_quality = max(pose_time_diff, depth_time_diff)
-                        
-                        return {
-                            'pose': self.latest_pose.copy(),
-                            'depth_image': depth_image,
-                            'timestamp': rgb_timestamp,
-                            'sync_quality': overall_quality,
-                            'time_diff': overall_quality,
-                            'interpolated': True
-                        }
-                    except Exception as e:
-                        print(f"Error converting latest depth image: {e}")
-                        return None
-            
-            return None
+
         
     def depth_callback(self, msg):
-        """Store latest depth message with minimal buffer operations to reduce lag."""
+        """Store latest depth message."""
         with self.processing_lock:
             self.latest_depth_msg = msg
-        
-        # NEW: Store depth in sync buffer for better synchronization
-        depth_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        
-        with self.sync_buffer_lock:
-            # Store depth message with timestamp for synchronization
-            depth_sync_data = {
-                'timestamp': depth_timestamp,
-                'depth_msg': msg,
-                'type': 'depth'
-            }
-            
-            # Add to sync buffer
-            self.synchronized_data_buffer.append(depth_sync_data)
-            
-            # Try to create combined entries with existing pose data
-            self._try_create_combined_entries(depth_timestamp, msg, 'depth')
-            
-            # Keep buffer size manageable
-            if len(self.synchronized_data_buffer) > self.max_sync_buffer_size:
-                self.synchronized_data_buffer.pop(0)
         
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
@@ -716,23 +499,7 @@ class ResilienceNode(Node):
             
             self.narration_manager.add_actual_point(pos, pose_time, self.flip_y_axis)
 
-        # NEW: Store pose in sync buffer for better synchronization
-        with self.sync_buffer_lock:
-            pose_sync_data = {
-                'timestamp': pose_time,
-                'pose': pos.copy(),
-                'type': 'pose'
-            }
-            
-            # Add to sync buffer
-            self.synchronized_data_buffer.append(pose_sync_data)
-            
-            # Try to create combined entries with existing depth data
-            self._try_create_combined_entries(pose_time, pos, 'pose')
-            
-            # Keep buffer size manageable
-            if len(self.synchronized_data_buffer) > self.max_sync_buffer_size:
-                self.synchronized_data_buffer.pop(0)
+
 
         breach_now = self.drift_calculator.is_breach(drift)
         
@@ -1271,193 +1038,7 @@ class ResilienceNode(Node):
         except Exception:
             return time.time()
 
-    def _find_best_sync_data(self, target_timestamp: float, data_type: str) -> Optional[Dict[str, Any]]:
-        """
-        Find the best matching pose or depth data for a given RGB timestamp.
-        Uses interpolation if exact match is not found.
-        """
-        try:
-            if data_type == 'pose':
-                if self.latest_pose is None or self.latest_pose_time is None:
-                    return None
-                
-                # Check if we have recent pose data
-                time_diff = abs(target_timestamp - self.latest_pose_time)
-                if time_diff <= self.sync_tolerance:
-                    return {
-                        'data': self.latest_pose.copy(),
-                        'timestamp': self.latest_pose_time,
-                        'interpolated': time_diff > 0.01  # Consider interpolated if > 10ms off
-                    }
-                
-                # Try to find pose in sync buffer
-                best_pose = None
-                best_time_diff = float('inf')
-                
-                # Look for pose data in the sync buffer (both individual and combined entries)
-                for sync_data in self.synchronized_data_buffer:
-                    if sync_data.get('type') == 'pose' or 'pose' in sync_data:
-                        pose_time = sync_data['timestamp']
-                        time_diff = abs(target_timestamp - pose_time)
-                        if time_diff < best_time_diff and time_diff <= self.sync_tolerance:
-                            best_time_diff = time_diff
-                            best_pose = sync_data.get('pose') or sync_data.get('data')
-                
-                if best_pose is not None:
-                    return {
-                        'data': best_pose,
-                        'timestamp': target_timestamp - best_time_diff if target_timestamp > best_time_diff else target_timestamp + best_time_diff,
-                        'interpolated': True
-                    }
-                
-                return None
-                
-            elif data_type == 'depth':
-                if self.latest_depth_msg is None:
-                    return None
-                
-                # Check if we have recent depth data
-                depth_timestamp = self.latest_depth_msg.header.stamp.sec + self.latest_depth_msg.header.stamp.nanosec * 1e-9
-                time_diff = abs(target_timestamp - depth_timestamp)
-                if time_diff <= self.sync_tolerance:
-                    return {
-                        'data': self.latest_depth_msg,
-                        'timestamp': depth_timestamp,
-                        'interpolated': time_diff > 0.01  # Consider interpolated if > 10ms off
-                    }
-                
-                # Try to find depth in sync buffer
-                best_depth = None
-                best_time_diff = float('inf')
-                
-                # Look for depth data in the sync buffer (both individual and combined entries)
-                for sync_data in self.synchronized_data_buffer:
-                    if sync_data.get('type') == 'depth' or 'depth_msg' in sync_data:
-                        depth_time = sync_data['timestamp']
-                        time_diff = abs(target_timestamp - depth_time)
-                        if time_diff < best_time_diff and time_diff <= self.sync_tolerance:
-                            best_time_diff = time_diff
-                            best_depth = sync_data.get('depth_msg') or sync_data.get('data')
-                
-                if best_depth is not None:
-                    return {
-                        'data': best_depth,
-                        'timestamp': target_timestamp - best_time_diff if target_timestamp > best_time_diff else target_timestamp + best_time_diff,
-                        'interpolated': True
-                    }
-                
-                return None
-            
-            return None
-            
-        except Exception as e:
-            print(f"Error in _find_best_sync_data: {e}")
-            return None
 
-    def _try_create_combined_entries(self, timestamp: float, data: Any, data_type: str):
-        """Try to create combined pose+depth entries when individual data arrives."""
-        try:
-            tolerance = 0.05  # 50ms tolerance for creating combined entries
-            
-            if data_type == 'pose':
-                # Look for depth data around this timestamp
-                for sync_data in self.synchronized_data_buffer:
-                    if sync_data.get('type') == 'depth':
-                        time_diff = abs(timestamp - sync_data['timestamp'])
-                        if time_diff <= tolerance:
-                            # Create combined entry
-                            combined_entry = {
-                                'timestamp': timestamp,
-                                'pose': data,
-                                'depth_msg': sync_data['depth_msg'],
-                                'sync_quality': time_diff,
-                                'interpolated': time_diff > 0.01,
-                                'type': 'combined'
-                            }
-                            self.synchronized_data_buffer.append(combined_entry)
-                            print(f"✓ Created combined entry from pose+existing depth (time_diff: {time_diff:.3f}s)")
-                            break
-                            
-            elif data_type == 'depth':
-                # Look for pose data around this timestamp
-                for sync_data in self.synchronized_data_buffer:
-                    if sync_data.get('type') == 'pose':
-                        time_diff = abs(timestamp - sync_data['timestamp'])
-                        if time_diff <= tolerance:
-                            # Create combined entry
-                            combined_entry = {
-                                'timestamp': timestamp,
-                                'pose': sync_data['pose'],
-                                'depth_msg': data,
-                                'sync_quality': time_diff,
-                                'interpolated': time_diff > 0.01,
-                                'type': 'combined'
-                            }
-                            self.synchronized_data_buffer.append(combined_entry)
-                            print(f"✓ Created combined entry from existing pose+depth (time_diff: {time_diff:.3f}s)")
-                            break
-                            
-        except Exception as e:
-            print(f"Error creating combined entries: {e}")
-
-    def _cleanup_sync_buffer(self):
-        """Clean up synchronization buffer to remove old data and improve performance."""
-        try:
-            with self.sync_buffer_lock:
-                current_time = time.time()
-                original_size = len(self.synchronized_data_buffer)
-                
-                # Remove data older than 5 seconds
-                max_age = 5.0
-                self.synchronized_data_buffer = [
-                    data for data in self.synchronized_data_buffer
-                    if current_time - data.get('timestamp', 0) <= max_age
-                ]
-                
-                cleaned_size = len(self.synchronized_data_buffer)
-                if original_size != cleaned_size:
-                    print(f"Cleaned sync buffer: {original_size} -> {cleaned_size} entries (removed {original_size - cleaned_size} old entries)")
-                
-                # Ensure buffer doesn't exceed maximum size
-                if len(self.synchronized_data_buffer) > self.max_sync_buffer_size:
-                    excess = len(self.synchronized_data_buffer) - self.max_sync_buffer_size
-                    self.synchronized_data_buffer = self.synchronized_data_buffer[excess:]
-                    print(f"Trimmed sync buffer: removed {excess} excess entries")
-                
-                # Log buffer composition
-                combined_count = sum(1 for data in self.synchronized_data_buffer if data.get('type') == 'combined')
-                pose_count = sum(1 for data in self.synchronized_data_buffer if data.get('type') == 'pose')
-                depth_count = sum(1 for data in self.synchronized_data_buffer if data.get('type') == 'depth')
-                print(f"Sync buffer composition: {combined_count} combined, {pose_count} pose, {depth_count} depth entries")
-                    
-        except Exception as e:
-            print(f"Error cleaning up sync buffer: {e}")
-
-    def _report_sync_stats(self):
-        """Report synchronization statistics."""
-        try:
-            total_synced = self.sync_stats['successful_sync'] + self.sync_stats['interpolated_sync']
-            success_rate = (total_synced / max(self.sync_stats['total_frames'], 1)) * 100
-            
-            print(f"=== SYNCHRONIZATION STATS ===")
-            print(f"Total Frames: {self.sync_stats['total_frames']}")
-            print(f"Successful Sync: {self.sync_stats['successful_sync']} (exact)")
-            print(f"Interpolated Sync: {self.sync_stats['interpolated_sync']} (close)")
-            print(f"Dropped Frames: {self.sync_stats['dropped_frames']}")
-            print(f"Success Rate: {success_rate:.1f}%")
-            print(f"Avg Sync Quality: {self.sync_stats['avg_sync_quality']:.3f}s")
-            print(f"Buffer Size: {len(self.synchronized_data_buffer)}/{self.max_sync_buffer_size}")
-            print(f"Timestamp: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
-            print("=" * 30)
-            
-            # Reset counters for next period
-            self.sync_stats['total_frames'] = 0
-            self.sync_stats['successful_sync'] = 0
-            self.sync_stats['interpolated_sync'] = 0
-            self.sync_stats['dropped_frames'] = 0
-            
-        except Exception as e:
-            print(f"Error reporting sync stats: {e}")
 
 
     def naradio_processing_loop(self):
@@ -1544,85 +1125,29 @@ class ResilienceNode(Node):
                                         if self.publish_refined_mask:
                                             self.refined_mask_pub.publish(similarity_msg)
                                     
-                                    # ENHANCED: Publish binary hotspots with perfectly synchronized depth and pose
+                                    # ENHANCED: Publish binary hotspots with simplified approach (timestamp-only)
                                     if (self.enable_voxel_mapping and
                                         hasattr(self, 'semantic_bridge') and self.semantic_bridge and 
                                         similarity_result.get('similarity_map') is not None):
                                         
-                                        # GET PERFECTLY SYNCHRONIZED DATA: Find pose and depth that match RGB timestamp exactly
+                                        # Get RGB timestamp for this image
                                         rgb_timestamp = self._get_ros_timestamp(rgb_msg)
-                                        sync_data = self.get_synchronized_data_for_rgb(rgb_timestamp, tolerance=0.15)  # Increased tolerance
                                         
-                                        if sync_data is not None:
-                                            try:
-                                                sync_quality = sync_data['sync_quality']
-                                                time_diff = sync_data['time_diff']
-                                                interpolated = sync_data.get('interpolated', False)
-                                                
-                                                # Quality-based logging
-                                                if sync_quality <= 0.05:  # Excellent sync
-                                                    quality_level = "EXCELLENT"
-                                                elif sync_quality <= 0.1:  # Good sync
-                                                    quality_level = "GOOD"
-                                                elif sync_quality <= 0.15:  # Acceptable sync
-                                                    quality_level = "ACCEPTABLE"
-                                                else:
-                                                    quality_level = "POOR"
-                                                
-                                                print(f"✓ Publishing hotspots with {quality_level} synchronization:")
-                                                print(f"  RGB timestamp: {rgb_timestamp:.6f}")
-                                                print(f"  Sync timestamp: {sync_data['timestamp']:.6f}")  
-                                                print(f"  Time difference: {time_diff:.6f}s")
-                                                print(f"  Sync quality: {sync_quality:.6f}s")
-                                                print(f"  Interpolated: {interpolated}")
-                                                
-                                                # Only publish if sync quality is acceptable
-                                                if sync_quality <= self.min_sync_quality:
-                                                    # DEBUG: Show exact data being sent
-                                                    pose_data = sync_data['pose']
-                                                    depth_shape = sync_data['depth_image'].shape if sync_data['depth_image'] is not None else 'None'
-                                                    print(f"  DEBUG - Sending to semantic bridge:")
-                                                    print(f"    Pose: {pose_data} (type: {type(pose_data)})")
-                                                    print(f"    Depth shape: {depth_shape}")
-                                                    print(f"    Timestamp: {sync_data['timestamp']:.6f}")
-                                                    
-                                                    self.semantic_bridge.publish_similarity_hotspots(
-                                                        vlm_answer=vlm_answer,
-                                                        similarity_map=similarity_result['similarity_map'],
-                                                        pose=sync_data['pose'],
-                                                        timestamp=sync_data['timestamp'],
-                                                        original_image=rgb_image,  # Original RGB image
-                                                        depth_image=sync_data['depth_image']  # Perfectly synchronized depth
-                                                    )
-                                                    
-                                                    print(f"✓ Published {quality_level} synchronized hotspots for '{vlm_answer}' (quality: {sync_quality:.6f}s)")
-                                                else:
-                                                    print(f"✗ Skipping hotspot publishing - sync quality too poor: {sync_quality:.6f}s > {self.min_sync_quality:.3f}s")
-                                                
-                                            except Exception as e:
-                                                print(f"Error publishing to semantic bridge: {e}")
-                                                import traceback
-                                                traceback.print_exc()
-                                        else:
-                                            print(f"✗ Skipping semantic bridge - no synchronized data found for RGB timestamp {rgb_timestamp:.6f}")
-                                            print(f"  Available sync buffer size: {len(self.synchronized_data_buffer)}")
-                                            print(f"  Latest pose time: {self.latest_pose_time:.6f if self.latest_pose_time else 'None'}")
-                                            if self.latest_depth_msg:
-                                                depth_timestamp = self.latest_depth_msg.header.stamp.sec + self.latest_depth_msg.header.stamp.nanosec * 1e-9
-                                                print(f"  Latest depth time: {depth_timestamp:.6f}")
-                                            else:
-                                                print(f"  Latest depth time: None")
-                                    elif not self.enable_voxel_mapping:
-                                        # Skip semantic bridge publishing when voxel mapping is disabled
-                                        print(f"✗ Voxel mapping disabled - skipping hotspot publishing for '{vlm_answer}'")
-                                        pass
-                                
-                                # Save similarity results to risk buffer if active
-                                if (self.risk_buffer_manager and 
-                                    len(self.risk_buffer_manager.active_buffers) > 0 and 
-                                    self.current_breach_active):
-                                    
-                                    self.save_similarity_to_buffer(similarity_result, rgb_msg.header.stamp, vlm_answer)
+                                        # Resize similarity map to match original image dimensions
+                                        similarity_map = similarity_result['similarity_map']
+                                        original_height, original_width = rgb_image.shape[:2]
+                                        
+                                        if similarity_map.shape[:2] != (original_height, original_width):
+                                            similarity_map = cv2.resize(similarity_map, (original_width, original_height), 
+                                                                     interpolation=cv2.INTER_LINEAR)
+                                        
+                                        # Publish ONLY hotspot mask + timestamp
+                                        self.semantic_bridge.publish_similarity_hotspots(
+                                            vlm_answer=vlm_answer,
+                                            similarity_map=similarity_map,
+                                            timestamp=rgb_timestamp,
+                                            original_image=rgb_image
+                                        )
                         
                         except Exception as seg_e:
                             pass  # SPEED OPTIMIZATION: Silent error handling
