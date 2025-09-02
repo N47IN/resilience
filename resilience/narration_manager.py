@@ -25,6 +25,9 @@ class NarrationManager:
         self.intended_points = []  # List[TrajectoryPoint]
         self.actual_points = []    # List[TrajectoryPoint]
         
+        # MODIFIED: Limit to last 25 pose messages
+        self.max_actual_points = 25
+        
         # Thread management
         self.narration_thread = None
         self.narration_running = False
@@ -57,41 +60,50 @@ class NarrationManager:
         print(f"[Narration] Initialized with {len(self.intended_points)} intended points, soft_threshold={self.soft_threshold}")
     
     def add_actual_point(self, pos: np.ndarray, timestamp: float, flip_y_axis: bool = False):
-        """Add actual trajectory point."""
+        """Add actual trajectory point, keeping only the last 25 points."""
         pos_2d = np.array([pos[0], pos[1]])
         if flip_y_axis:
             pos_2d[1] = -pos_2d[1]
         self.actual_points.append(TrajectoryPoint(position=pos_2d, time=timestamp))
         
-        # Keep only recent points to prevent memory buildup
-        max_points = len(self.intended_points) if self.intended_points else 1000
-        if len(self.actual_points) > max_points:
+        # MODIFIED: Keep only the last 25 points instead of historical accumulation
+        if len(self.actual_points) > self.max_actual_points:
             self.actual_points.pop(0)
     
     def check_for_narration(self, current_time: float, breach_idx: Optional[int] = None) -> Optional[str]:
-        """Generate narration during active breach."""
+        """Generate narration during active breach using only recent pose data."""
         try:
             if not self.actual_points:
                 return None
             
             actual_len = len(self.actual_points)
-            robot_idx = min(actual_len - 1, breach_idx if breach_idx is not None else 0)
             
-            # For narration, match actual and intended up to available points
-            intended = self.intended_points[:actual_len]
-            actual = self.actual_points[-actual_len:]
+            # MODIFIED: Use the most recent actual point index instead of breach_idx
+            # This ensures we're always looking at the most recent data within our 25-point window
+            robot_idx = actual_len - 1
             
-            if len(intended) <= robot_idx or len(actual) <= robot_idx:
+            # MODIFIED: For intended points, take a window around the current position
+            # Since we only have 25 actual points, we'll use a similar window for intended
+            intended_start = max(0, robot_idx - actual_len + 1)
+            intended_end = min(len(self.intended_points), intended_start + actual_len)
+            intended = self.intended_points[intended_start:intended_end]
+            
+            # Use all available actual points (up to 25)
+            actual = self.actual_points
+            
+            if len(intended) == 0 or len(actual) == 0:
                 return None
-        
-            # Generate narration
+            
+            # MODIFIED: Use the most recent actual point for narration generation
             narration = self.descriptor.generate_description(intended, actual, robot_idx)
             
             if narration:  # Only return if there's actual narration
                 print("=" * 50)
-                print("NARRATION GENERATED")
+                print("NARRATION GENERATED (Last 25 poses)")
                 print("=" * 50)
                 print(f"Content: {narration}")
+                print(f"Using {len(actual)} actual points (max 25)")
+                print(f"Using {len(intended)} intended points")
                 print("=" * 50)
                 
                 # Mark that we've sent narration for this breach (ONLY ONE PER BREACH)

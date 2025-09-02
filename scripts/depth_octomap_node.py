@@ -28,6 +28,7 @@ from typing import Optional
 import sensor_msgs_py.point_cloud2 as pc2
 import threading
 import cv2
+import os
 
 # Import helpers
 try:
@@ -73,7 +74,10 @@ class SemanticDepthOctoMapNode(Node):
 			('bridge_queue_max_size', 100),
 			('bridge_queue_process_interval', 0.1),
 			('enable_voxel_mapping', True),
-			('sync_buffer_seconds', 2.0)
+			('sync_buffer_seconds', 2.0),
+			# New: inactivity detection and export
+			('inactivity_threshold_seconds', 2.5),
+			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers')
 		])
 
 		params = self.get_parameters([
@@ -83,7 +87,7 @@ class SemanticDepthOctoMapNode(Node):
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate', 'stats_publish_rate',
 			'pose_is_base_link', 'apply_optical_frame_rotation', 'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim',
 			'enable_semantic_mapping', 'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval',
-			'enable_voxel_mapping', 'sync_buffer_seconds'
+			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory'
 		])
 
 		# Extract parameter values
@@ -94,7 +98,7 @@ class SemanticDepthOctoMapNode(Node):
 		 self.pose_is_base_link, self.apply_optical_frame_rotation, self.cam_to_base_rpy_deg, self.cam_to_base_xyz,
 		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
 		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval,
-		 self.enable_voxel_mapping, self.sync_buffer_seconds) = [p.value for p in params]
+		 self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds, self.semantic_export_directory) = [p.value for p in params]
 
 		# State
 		self.bridge = CvBridge()
@@ -102,6 +106,9 @@ class SemanticDepthOctoMapNode(Node):
 		self.latest_pose = None
 		self.last_marker_pub = 0.0
 		self.last_stats_pub = 0.0
+		# Inactivity detection state
+		self.last_data_time = time.time()
+		self.semantic_pcd_exported = False
 
 		# Timestamped buffers for sync
 		self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters)
@@ -173,10 +180,15 @@ class SemanticDepthOctoMapNode(Node):
 			f"  - Topics: depth={self.depth_topic}, pose={self.pose_topic}"
 		)
 
+		# Timer for inactivity detection (non-intrusive)
+		self.inactivity_timer = self.create_timer(0.5, self._check_inactivity_timer_cb)
+
 	def camera_info_callback(self, msg: CameraInfo):
 		if self.camera_intrinsics is None:
 			self.camera_intrinsics = [msg.k[0], msg.k[4], msg.k[2], msg.k[5]]
 			self.get_logger().info(f"Camera intrinsics set: fx={msg.k[0]:.2f}, fy={msg.k[4]:.2f}")
+		# Update activity
+		self.last_data_time = time.time()
 
 	def pose_callback(self, msg: PoseStamped):
 		self.latest_pose = msg
@@ -188,6 +200,8 @@ class SemanticDepthOctoMapNode(Node):
 				self._prune_sync_buffers()
 		except Exception:
 			pass
+		# Update activity
+		self.last_data_time = time.time()
 
 	def semantic_hotspot_callback(self, msg: String):
 		"""Queue incoming semantic hotspot messages for batch processing."""
@@ -212,6 +226,8 @@ class SemanticDepthOctoMapNode(Node):
 				queue_size = len(self.bridge_message_queue)
 			
 			self.get_logger().info(f"Queued hotspot message (queue size: {queue_size})")
+			# Update activity
+			self.last_data_time = time.time()
 			
 		except Exception as e:
 			self.get_logger().error(f"Error queuing semantic hotspot message: {e}")
@@ -447,6 +463,9 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().error(f"Error storing depth frame: {e}")
 
+		# Activity update
+		self.last_data_time = time.time()
+
 		# Process queue periodically
 		current_time = time.time()
 		if (current_time - self.last_queue_process_time) >= self.queue_processing_interval:
@@ -526,7 +545,7 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Check if semantic mapper is available
 			has_semantic_mapper = (hasattr(self.voxel_helper, 'semantic_mapper') and 
-							  self.voxel_helper.semantic_mapper is not None)
+						  self.voxel_helper.semantic_mapper is not None)
 			
 			if has_semantic_mapper:
 				semantic_mapper = self.voxel_helper.semantic_mapper
@@ -831,6 +850,87 @@ class SemanticDepthOctoMapNode(Node):
 			return Rz @ Ry @ Rx
 		except Exception:
 			return np.eye(3, dtype=np.float32)
+
+	# ==== Inactivity detection and PCD export ====
+	def _check_inactivity_timer_cb(self):
+		try:
+			now = time.time()
+			inactivity = now - self.last_data_time
+			threshold = float(self.inactivity_threshold_seconds)
+			# Export only once per node lifetime
+			if (not self.semantic_pcd_exported) and inactivity >= threshold:
+				export_dir = self._resolve_export_directory()
+				os.makedirs(export_dir, exist_ok=True)
+				ts_str = time.strftime('%Y%m%d_%H%M%S')
+				filename = f"semantic_voxels_{ts_str}.pcd"
+				filepath = os.path.join(export_dir, filename)
+				count = self._save_semantic_voxels_to_pcd(filepath)
+				if count > 0:
+					self.get_logger().info(f"✓ Exported {count} semantic voxel points to PCD: {filepath}")
+				else:
+					self.get_logger().warn(f"No semantic voxels to export (skipped writing): {filepath}")
+				self.semantic_pcd_exported = True
+		except Exception as e:
+			self.get_logger().error(f"Inactivity check error: {e}")
+
+	def _save_semantic_voxels_to_pcd(self, filepath: str) -> int:
+		"""Write accumulated semantic voxels as PCD using Open3D (XYZ)."""
+		try:
+			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
+				return 0
+			semantic_mapper = self.voxel_helper.semantic_mapper
+			with semantic_mapper.voxel_semantics_lock:
+				voxel_keys = list(semantic_mapper.voxel_semantics.keys())
+			if not voxel_keys:
+				return 0
+			points = []
+			for key in voxel_keys:
+				center = self._get_voxel_center_from_key(key)
+				if center is not None:
+					points.append(center)
+			if not points:
+				return 0
+			pts = np.array(points, dtype=np.float32)
+			try:
+				import open3d as o3d
+				pcd = o3d.geometry.PointCloud()
+				pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+				ok = o3d.io.write_point_cloud(filepath, pcd, write_ascii=True)
+				return int(pts.shape[0] if ok else 0)
+			except Exception:
+				# Fallback to simple ASCII PCD header if Open3D not available
+				with open(filepath, 'w') as f:
+					f.write("# .PCD v0.7 - Point Cloud Data file\n")
+					f.write("VERSION 0.7\n")
+					f.write("FIELDS x y z\n")
+					f.write("SIZE 4 4 4\n")
+					f.write("TYPE F F F\n")
+					f.write("COUNT 1 1 1\n")
+					f.write(f"WIDTH {pts.shape[0]}\n")
+					f.write("HEIGHT 1\n")
+					f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+					f.write(f"POINTS {pts.shape[0]}\n")
+					f.write("DATA ascii\n")
+					for p in pts:
+						f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+				return pts.shape[0]
+		except Exception as e:
+			self.get_logger().error(f"Failed to save semantic voxels to PCD: {e}")
+			return 0
+	
+	def _resolve_export_directory(self) -> str:
+		"""Return latest run_* dir under buffers if available; else configured directory."""
+		try:
+			base_dir = str(self.semantic_export_directory or '').strip()
+			root = base_dir
+			if base_dir.endswith('/buffers') and os.path.isdir(base_dir):
+				candidates = [os.path.join(base_dir, d) for d in os.listdir(base_dir) if d.startswith('run_')]
+				if candidates:
+					candidates.sort(key=lambda p: os.path.getmtime(p))
+					return candidates[-1]
+			return root
+		except Exception:
+			return str(self.semantic_export_directory)
 
 
 
