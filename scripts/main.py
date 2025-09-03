@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Resilience Main Node
+Resilience Main Node - Clean NARadio Pipeline
 
-Integrated node that combines drift detection, YOLO, NARadio, and narration.
+Simplified node focused on drift detection, NARadio processing, and semantic mapping.
+Removed YOLO/SAM and historical analysis components for lightweight operation.
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
-from std_msgs.msg import String, Header
+from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 import tf2_ros
 from cv_bridge import CvBridge
 import numpy as np
 import json
 import threading
 import time
-import torch
 import cv2
 import warnings
 import os
@@ -27,20 +27,13 @@ from typing import Optional, List, Dict, Any
 warnings.filterwarnings('ignore')
 
 from resilience.drift_calculator import DriftCalculator
-from resilience.yolo_sam_detector import YOLODetector
 from resilience.naradio_processor import NARadioProcessor
 from resilience.narration_manager import NarrationManager
-from resilience.pointcloud_manager import PointCloudManager
-from resilience.simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
-import sensor_msgs_py.point_cloud2 as pc2
 from resilience.risk_buffer import RiskBufferManager
-from resilience.historical_cause_analysis import HistoricalCauseAnalyzer
-
-
 
 
 class ResilienceNode(Node):
-    """Resilience Node - Integrated drift detection, YOLO, NARadio, and narration."""
+    """Resilience Node - Clean NARadio pipeline with drift detection and semantic mapping."""
     
     def __init__(self):
         super().__init__('resilience_node')
@@ -57,33 +50,13 @@ class ResilienceNode(Node):
         # Track recent VLM answers for smart semantic processing
         self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
-        # SIMPLE: Store image, pose, and depth that come together
-        self.current_image_data = {
-            'rgb_image': None,
-            'depth_image': None, 
-            'pose': None,
-            'timestamp': None
-        }
-        self.image_data_lock = threading.Lock()
-        
-        # SIMPLE: Store RGB images with timestamps for hotspot publishing
+        # Store RGB images with timestamps for hotspot publishing
         self.rgb_images_with_timestamps = []  # [(rgb_msg, timestamp)]
         self.max_rgb_buffer = 50  # Keep last 50 RGB images
         
-
-        
         self.declare_parameters('', [
-            ('min_confidence', 0.05),
-            ('min_detection_distance', 0.5),
-            ('max_detection_distance', 2.0),
-            ('yolo_model', 'yolov8l-world.pt'),
-            ('yolo_imgsz', 480),
-            ('detection_color_r', 255),
-            ('detection_color_g', 0),
-            ('detection_color_b', 0),
             ('flip_y_axis', False),
             ('use_tf', False),
-            ('disable_yolo_printing', True),
             ('radio_model_version', 'radio_v2.5-b'),
             ('radio_lang_model', 'siglip'),
             ('radio_input_resolution', 512),
@@ -95,31 +68,17 @@ class ResilienceNode(Node):
         ])
 
         param_values = self.get_parameters([
-            'min_confidence', 'min_detection_distance', 'max_detection_distance',
-            'yolo_model', 'yolo_imgsz',
-            'detection_color_r', 'detection_color_g', 'detection_color_b',
-            'flip_y_axis', 'use_tf', 'disable_yolo_printing',
+            'flip_y_axis', 'use_tf',
             'radio_model_version', 'radio_lang_model', 'radio_input_resolution',
             'enable_naradio_visualization', 'enable_combined_segmentation',
             'segmentation_config_path', 'publish_original_mask', 'publish_refined_mask'
         ])
         
-        (self.min_confidence, self.min_detection_distance, self.max_detection_distance,
-         self.yolo_model, self.yolo_imgsz,
-         det_color_r, det_color_g, det_color_b,
-         self.flip_y_axis, self.use_tf, self.disable_yolo_printing,
+        (self.flip_y_axis, self.use_tf,
          self.radio_model_version, self.radio_lang_model, self.radio_input_resolution,
          self.enable_naradio_visualization, self.enable_combined_segmentation,
          self.segmentation_config_path, self.publish_original_mask, self.publish_refined_mask
         ) = [p.value for p in param_values]
-        
-        self.detection_color = np.array([det_color_r, det_color_g, det_color_b], dtype=np.uint8)
-        
-        self.detection_prompts = []
-        self.current_detection_prompt = ""
-        self.vlm_answer_received = False
-        self.last_vlm_answer = ""
-        self.detection_enabled = False
 
         self.init_components()
         
@@ -173,27 +132,21 @@ class ResilienceNode(Node):
         self.transform_cache_duration = 0.1
 
         self.init_risk_buffer_manager()
-        self.init_historical_analyzer()
-        self.init_parallel_processing()
         self.init_semantic_bridge()
         
         self.start_naradio_thread()
-        self.start_historical_analysis_thread()
         
         self.print_initialization_status()
 
     def init_publishers(self):
         """Initialize publishers."""
         publishers = [
-            ('/yolo_bbox_image', Image, 1),
-            ('/detection_cloud', PointCloud2, 10),
             ('/drift_narration', String, 10),
             ('/narration_text', String, 10),
             ('/naradio_image', Image, 10),
             ('/narration_image', Image, 10)
         ]
         
-        self.yolo_bbox_pub, self.detection_cloud_pub, \
         self.narration_pub, self.narration_text_pub, self.naradio_image_pub, \
         self.narration_image_pub = [self.create_publisher(msg_type, topic, qos) 
                                    for topic, msg_type, qos in publishers]
@@ -234,8 +187,6 @@ class ResilienceNode(Node):
         
         if vlm_enabled:
             all_objects = self.naradio_processor.get_all_objects()
-            dynamic_objects = self.naradio_processor.dynamic_objects
-            print(f"  - Base objects: {len(self.naradio_processor.word_list)}")
             print(f"  - Total objects: {len(all_objects)}")
             
             # Print embedding method configuration
@@ -243,12 +194,7 @@ class ResilienceNode(Node):
             
             self.publish_vlm_objects_legend()
         
-        # Print synchronization configuration
-        print(f"Clean Hotspot Publishing: ENABLED")
-        print(f"  - Publishes only hotspot mask + timestamp")
-        print(f"  - No pose/depth synchronization complexity")
-        print(f"  - Octomap creates triplets from its own data")
-        print(f"  - RGB buffer size: {self.max_rgb_buffer}")
+        print(f"RGB buffer size: {self.max_rgb_buffer}")
 
     def print_embedding_method_config(self):
         """Print information about embedding method configuration and availability."""
@@ -260,7 +206,7 @@ class ResilienceNode(Node):
             config = self.naradio_processor.segmentation_config
             prefer_enhanced = config['segmentation'].get('prefer_enhanced_embeddings', True)
             
-            print(f"SIMILARITY METHOD: {'ENHANCED EMBEDDINGS' if prefer_enhanced else 'VLM TEXT EMBEDDINGS'}")
+            print(f"Embedding method: {'ENHANCED' if prefer_enhanced else 'TEXT'}")
             
         except Exception as e:
             print(f"Error printing embedding method config: {e}")
@@ -286,13 +232,6 @@ class ResilienceNode(Node):
         self.drift_calculator = DriftCalculator(self.nominal_traj_file)
         soft_threshold, hard_threshold = self.drift_calculator.get_thresholds()
         
-        self.yolo_detector = YOLODetector(
-            yolo_model=self.yolo_model,
-            yolo_imgsz=self.yolo_imgsz,
-            min_confidence=self.min_confidence,
-            disable_yolo_printing=self.disable_yolo_printing
-        )
-        
         try:
             self.naradio_processor = NARadioProcessor(
                 radio_model_version=self.radio_model_version,
@@ -306,11 +245,11 @@ class ResilienceNode(Node):
             if not self.naradio_processor.is_ready():
                 print("Warning: NARadio initialization failed, will retry in processing loop")
             else:
-                print("✓ NARadio processor initialized successfully")
+                print("NARadio processor initialized")
                 
             if self.enable_combined_segmentation:
                 if self.naradio_processor.is_segmentation_ready():
-                    print("✓ Combined segmentation initialized successfully")
+                    print("Combined segmentation initialized")
                 else:
                     print("Warning: Combined segmentation initialization failed")
             
@@ -320,7 +259,6 @@ class ResilienceNode(Node):
                 hasattr(self.naradio_processor, 'segmentation_config')):
                 try:
                     self.enable_voxel_mapping = self.naradio_processor.segmentation_config.get('enable_voxel_mapping', False)
-                    print(f"Voxel mapping parameter read from config: {self.enable_voxel_mapping}")
                 except Exception as e:
                     print(f"Warning: Could not read voxel mapping parameter from config: {e}")
                     self.enable_voxel_mapping = False
@@ -341,7 +279,6 @@ class ResilienceNode(Node):
             )
         
         self.narration_manager = NarrationManager(soft_threshold, hard_threshold)
-        self.pointcloud_manager = PointCloudManager()
         
         # Ensure voxel mapping parameter is always set (final fallback)
         if not hasattr(self, 'enable_voxel_mapping'):
@@ -363,53 +300,13 @@ class ResilienceNode(Node):
             os.makedirs(self.current_run_dir, exist_ok=True)
             
             self.risk_buffer_manager = RiskBufferManager(save_directory=self.current_run_dir)
-            print(f"Buffer save directory: {self.current_run_dir}")
+            print(f"Buffer directory: {self.current_run_dir}")
             
             self.node_id = f"resilience_{unique_id}"
-            print(f"Node identifier: {self.node_id}")
             
         except Exception as e:
             print(f"Error initializing risk buffer manager: {e}")
             self.risk_buffer_manager = None
-    
-    def init_historical_analyzer(self):
-        """Initialize historical cause analyzer."""
-        try:
-            if self.risk_buffer_manager:
-                historical_yolo_path = self.yolo_model
-                
-                node_id = getattr(self, 'node_id', 'unknown')
-                print(f"[HistoricalAnalysis] Initializing for node: {node_id}")
-                
-                self.historical_analyzer = HistoricalCauseAnalyzer(
-                    yolo_model_path=historical_yolo_path,
-                    save_directory=self.current_run_dir
-                )
-                
-                print(f"[HistoricalAnalysis] Initialized historical analyzer with save_dir: {self.current_run_dir}")
-                print(f"[HistoricalAnalysis] Using YOLO model: {historical_yolo_path}")
-                print(f"[HistoricalAnalysis] Node identifier: {node_id}")
-            else:
-                self.historical_analyzer = None
-                print("Historical analyzer disabled - no risk buffer manager")
-                
-        except Exception as e:
-            print(f"[HistoricalAnalysis] Error initializing historical analyzer: {e}")
-            import traceback
-            traceback.print_exc()
-            self.historical_analyzer = None
-    
-    def init_parallel_processing(self):
-        """Initialize parallel processing infrastructure."""
-        self.historical_analysis_queue = []
-        self.historical_analysis_condition = threading.Condition()
-        self.historical_analysis_lock = threading.Lock()
-        self.historical_analysis_running = True
-        
-        self.parallel_analysis_results = {}
-        self.parallel_analysis_status = {}
-        
-        print("Parallel processing infrastructure initialized")
     
     def init_semantic_bridge(self):
         """Initialize semantic hotspot bridge for communication with octomap."""
@@ -420,10 +317,10 @@ class ResilienceNode(Node):
                 
                 from resilience.semantic_info_bridge import SemanticHotspotPublisher
                 self.semantic_bridge = SemanticHotspotPublisher(self, segmentation_config)
-                print("✓ Semantic hotspot bridge initialized (voxel mapping enabled)")
+                print("Semantic bridge initialized")
             else:
                 self.semantic_bridge = None
-                print("✗ Semantic bridge disabled (voxel mapping disabled)")
+                print("Semantic bridge disabled")
         except Exception as e:
             print(f"Error initializing semantic bridge: {e}")
             self.semantic_bridge = None
@@ -434,20 +331,10 @@ class ResilienceNode(Node):
             self.naradio_running = True
             self.naradio_thread = threading.Thread(target=self.naradio_processing_loop, daemon=True)
             self.naradio_thread.start()
-            print(f"Parallel NARadio processing thread started")
+            print("NARadio processing thread started")
         else:
-            print(f"NARadio thread already running")
-    
-    def start_historical_analysis_thread(self):
-        """Start the parallel historical analysis thread."""
-        if not hasattr(self, 'historical_analysis_thread') or self.historical_analysis_thread is None or not self.historical_analysis_thread.is_alive():
-            self.historical_analysis_running = True
-            self.historical_analysis_thread = threading.Thread(target=self.historical_analysis_worker, daemon=True)
-            self.historical_analysis_thread.start()
-            print(f"Parallel historical analysis thread started")
-        else:
-            print(f"Historical analysis thread already running")
-    
+            print("NARadio thread already running")
+
     def rgb_callback(self, msg):
         """Store RGB message with timestamp for hotspot publishing."""
         msg_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -510,18 +397,13 @@ class ResilienceNode(Node):
             self.last_breach_state = True
             self.current_breach_active = True
             self.narration_manager.reset_narration_state()
-            self.detection_enabled = True
             
             print("BREACH STARTED")
             print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
             
-            if not self.detection_prompts:
-                self.detection_prompts = []
-                self.current_detection_prompt = ""
-            
+            # Start new buffer when breach begins
             if self.risk_buffer_manager:
                 self.risk_buffer_manager.start_buffer(pose_time)
-                print(f"New buffer started at {pose_time:.3f}")
             
             self.narration_manager.queue_breach_event('start', pose_time)
             
@@ -532,21 +414,9 @@ class ResilienceNode(Node):
             print("BREACH ENDED")
             print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
             
+            # Freeze buffers when breach ends
             if self.risk_buffer_manager:
                 frozen_buffers = self.risk_buffer_manager.freeze_active_buffers(pose_time)
-                print(f"Buffers frozen at {pose_time:.3f}")
-                
-                if frozen_buffers:
-                    for buffer in frozen_buffers:
-                        self.queue_historical_analysis('buffer_frozen', buffer_id=buffer.buffer_id)
-                
-                self.save_comprehensive_buffers(pose_time)
-                
-                # NEW: Save risk library for this run
-                if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
-                    self.naradio_processor.save_risk_library(self.current_run_dir)
-            
-            self.detection_enabled = False
             
             self.narration_manager.queue_breach_event('end', pose_time)
             
@@ -554,18 +424,13 @@ class ResilienceNode(Node):
             self.last_breach_state = True
             self.current_breach_active = True
             self.narration_manager.reset_narration_state()
-            self.detection_enabled = True
             
             print("BREACH DETECTED (already in progress)")
             print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
             
-            if not self.detection_prompts:
-                self.detection_prompts = []
-                self.current_detection_prompt = ""
-            
+            # Start new buffer when breach is detected
             if self.risk_buffer_manager:
                 self.risk_buffer_manager.start_buffer(pose_time)
-                print(f"New buffer started at {pose_time:.3f}")
             
             self.narration_manager.queue_breach_event('start', pose_time)
         
@@ -587,7 +452,6 @@ class ResilienceNode(Node):
         with self.processing_lock:
             if (self.latest_rgb_msg is not None and 
                 self.latest_depth_msg is not None and 
-                self.detection_enabled and 
                 self.current_breach_active and
                 not self.is_processing):
                 self.trigger_detection_processing()
@@ -616,7 +480,7 @@ class ResilienceNode(Node):
                 pose = self.detection_pose
                 pose_time = self.detection_pose_time
             
-            if not self.yolo_detector.is_ready():
+            if not self.naradio_processor.is_ready():
                 return
                 
             if not self.camera_info_received:
@@ -631,59 +495,51 @@ class ResilienceNode(Node):
             self.is_processing = False
 
     def process_detection(self, rgb_msg, depth_msg, pose, pose_time):
-        """Process YOLO detection with latest messages."""
+        """Process NARadio detection with latest messages."""
         try:
             rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
             depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
             transform_matrix = self.pose_to_transform_matrix(pose)
 
-            bboxes, labels, confidences = self.yolo_detector.detect_objects(rgb_image)
+            # Process features and get similarity maps
+            feat_map_np, naradio_vis = self.naradio_processor.process_features_optimized(
+                rgb_image, 
+                need_visualization=False,  # Disabled for speed
+                reuse_features=True
+            )
             
-            if not bboxes:
-                return
-
-            filtered_bboxes, valid_indices = self.yolo_detector.filter_detections_by_distance(
-                bboxes, depth_image, self.min_detection_distance, self.max_detection_distance, self.camera_intrinsics)
-            
-            if not filtered_bboxes:
-                return
-
-            bbox_centers = []
-            for bbox in filtered_bboxes:
-                x1, y1, x2, y2 = bbox
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
-                bbox_centers.append([center_x, center_y])
-
-            yolo_bbox_img = rgb_image.copy()
-            for bbox in filtered_bboxes:
-                x1, y1, x2, y2 = bbox
-                cv2.rectangle(yolo_bbox_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
-                cv2.circle(yolo_bbox_img, (center_x, center_y), 5, (255, 0, 0), -1)
-            
-            yolo_bbox_msg = self.bridge.cv2_to_imgmsg(yolo_bbox_img, encoding='rgb8')
-            yolo_bbox_msg.header = rgb_msg.header
-            self.yolo_bbox_pub.publish(yolo_bbox_msg)
-
-            if len(bbox_centers) == 0:
-                return
-                 
-            success = self.pointcloud_manager.create_bbox_center_pointclouds(
-                filtered_bboxes, depth_image, self.camera_intrinsics, transform_matrix,
-                self.min_detection_distance, self.max_detection_distance)
-            
-            if success:
-                header = Header()
-                header.stamp = self.get_clock().now().to_msg()
-                header.frame_id = 'map'
-                pointcloud_msg = self.pointcloud_manager.create_pointcloud_message(header)
-                self.detection_cloud_pub.publish(pointcloud_msg)
+            # Get dynamic VLM objects and their similarity maps
+            if (self.enable_combined_segmentation and 
+                self.naradio_processor.is_segmentation_ready() and
+                self.naradio_processor.dynamic_objects and
+                feat_map_np is not None):
                 
-                self.pointcloud_manager.increment_frame_count()
-
+                try:
+                    # Create merged hotspot masks for all VLM answers
+                    vlm_answers = self.naradio_processor.dynamic_objects
+                    vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers)
+                    
+                    if vlm_hotspots and len(vlm_hotspots) > 0:
+                        # Get RGB timestamp for this image
+                        rgb_timestamp = self._get_ros_timestamp(rgb_msg)
+                        
+                        # Publish merged hotspots with color-based association
+                        self.semantic_bridge.publish_merged_hotspots(
+                            vlm_hotspots=vlm_hotspots,
+                            timestamp=rgb_timestamp,
+                            original_image=rgb_image
+                        )
+                
+                except Exception as seg_e:
+                    pass  # Silent error handling
+            
+            # Publish NARadio image if visualization is enabled
+            if self.enable_naradio_visualization and naradio_vis is not None:
+                naradio_msg = self.bridge.cv2_to_imgmsg(naradio_vis, encoding='rgb8')
+                naradio_msg.header = rgb_msg.header
+                self.naradio_image_pub.publish(naradio_msg)
+            
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -756,7 +612,7 @@ class ResilienceNode(Node):
                 
                 self.save_narration_image_to_buffer(closest_image, narration_text, current_time)
                 
-                # NEW: Store narration data in active buffers for VLM processing
+                # Store narration data in active buffers for VLM processing
                 # Include the original image timestamp for proper semantic mapping
                 if self.risk_buffer_manager:
                     self.risk_buffer_manager.store_narration_data_with_timestamp(
@@ -796,161 +652,12 @@ class ResilienceNode(Node):
             
             # Load the enhanced embedding
             enhanced_embedding = np.load(embedding_path)
-            print(f"Loaded enhanced embedding from: {embedding_path}")
-            print(f"  Shape: {enhanced_embedding.shape}, Norm: {np.linalg.norm(enhanced_embedding):.4f}")
             
             return enhanced_embedding
             
         except Exception as e:
             print(f"Error loading enhanced embedding: {e}")
             return None
-
-    def save_comprehensive_buffers(self, current_time):
-        """Save all frozen buffers with comprehensive metadata."""
-        try:
-            with self.lock:
-                frozen_buffers = self.risk_buffer_manager.frozen_buffers.copy()
-            
-            if not frozen_buffers:
-                print("No frozen buffers to save")
-                return
-            
-            print(f"Saving {len(frozen_buffers)} frozen buffers...")
-            
-            saved_count = 0
-            for buffer in frozen_buffers:
-                if self.save_single_comprehensive_buffer(buffer):
-                    saved_count += 1
-            
-            self.save_run_summary(frozen_buffers)
-            
-            print(f"Saved: {saved_count}/{len(frozen_buffers)} buffers to {self.current_run_dir}")
-            
-        except Exception as e:
-            print(f"Error saving comprehensive buffers: {e}")
-
-    def save_single_comprehensive_buffer(self, buffer):
-        """Save a single buffer with all metadata, images, narration, and cause data."""
-        try:
-            print(f"Saving buffer {buffer.buffer_id}: poses={len(buffer.poses)}, images={len(buffer.images)}")
-            
-            buffer_dir = os.path.join(self.current_run_dir, buffer.buffer_id)
-            os.makedirs(buffer_dir, exist_ok=True)
-            
-            soft_threshold, hard_threshold = self.drift_calculator.get_thresholds()
-            
-            metadata = {
-                'buffer_id': buffer.buffer_id,
-                'start_time': buffer.start_time,
-                'end_time': buffer.end_time,
-                'state': buffer.state.value,
-                'cause': buffer.cause,
-                'duration': buffer.get_duration(),
-                'pose_count': len(buffer.poses)
-            }
-            
-            with open(os.path.join(buffer_dir, 'metadata.json'), 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            if buffer.poses:
-                poses_array = np.array([(t, p[0], p[1], p[2], d) for t, p, d in buffer.poses])
-                np.save(os.path.join(buffer_dir, 'poses.npy'), poses_array)
-            
-            if buffer.images:
-                if len(buffer.images) >= 1:
-                    first_img = buffer.images[0][1]
-                    cv2.imwrite(os.path.join(buffer_dir, 'first_image.png'), first_img)
-                
-                if len(buffer.images) >= 2:
-                    last_img = buffer.images[-1][1]
-                    cv2.imwrite(os.path.join(buffer_dir, 'last_image.png'), last_img)
-            
-            print(f"Saved comprehensive buffer: {buffer.buffer_id}")
-            return True
-            
-        except Exception as e:
-            print(f"Error saving buffer {buffer.buffer_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def save_run_summary(self, frozen_buffers):
-        """Save summary of the entire run."""
-        try:
-            if not frozen_buffers:
-                frozen_buffers = []
-                
-            soft_threshold, hard_threshold = self.drift_calculator.get_thresholds()
-            
-            run_summary = {
-                'run_timestamp': datetime.now().isoformat(),
-                'run_directory': self.current_run_dir,
-                'total_buffers': len(frozen_buffers),
-                'buffers_with_cause': sum(1 for b in frozen_buffers if b.has_cause()),
-                'buffers_without_cause': sum(1 for b in frozen_buffers if not b.has_cause()),
-                'total_images': sum(len(b.images) for b in frozen_buffers),
-                'total_poses': sum(len(b.poses) for b in frozen_buffers),
-                'total_duration': sum(b.get_duration() for b in frozen_buffers),
-                'soft_threshold': soft_threshold,
-                'hard_threshold': hard_threshold,
-                'detection_prompts_used': self.detection_prompts,
-                'buffer_details': []
-            }
-            
-            for buffer in frozen_buffers:
-                buffer_detail = {
-                    'buffer_id': buffer.buffer_id,
-                    'start_time': buffer.start_time,
-                    'end_time': buffer.end_time,
-                    'duration': buffer.get_duration(),
-                    'cause': buffer.cause,
-                    'has_cause': buffer.has_cause(),
-                    'data_counts': buffer.get_data_counts()
-                }
-                run_summary['buffer_details'].append(buffer_detail)
-            
-            with open(os.path.join(self.current_run_dir, 'run_summary.json'), 'w') as f:
-                json.dump(run_summary, f, indent=2)
-            
-            print(f"Run summary saved: {self.current_run_dir}/run_summary.json")
-            
-        except Exception as e:
-            print(f"Error saving run summary: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def save_similarity_to_buffer(self, similarity_result, timestamp, vlm_answer):
-        """Save VLM similarity results to the current active buffer with reduced I/O."""
-        try:
-            if not self.risk_buffer_manager or len(self.risk_buffer_manager.active_buffers) == 0:
-                return
-            
-            processing_info = similarity_result.get('processing_info', {})
-            if processing_info.get('processing_time', 0) > 2.0:
-                print(f"Skipping similarity save - processing took too long: {processing_info.get('processing_time', 0):.2f}s")
-                return
-            
-            current_buffer = self.risk_buffer_manager.active_buffers[-1]
-            buffer_dir = os.path.join(self.current_run_dir, current_buffer.buffer_id)
-            
-            similarity_dir = os.path.join(buffer_dir, 'vlm_similarity')
-            os.makedirs(similarity_dir, exist_ok=True)
-            
-            timestamp_str = f"{timestamp.sec}_{timestamp.nanosec}"
-            
-            safe_vlm_name = vlm_answer.replace(' ', '_').replace('/', '_').replace('\\', '_')
-            
-            if similarity_result['colored_similarity'] is not None:
-                colored_path = os.path.join(similarity_dir, f"colored_similarity_{safe_vlm_name}_{timestamp_str}.png")
-                colored_bgr = cv2.cvtColor(similarity_result['colored_similarity'], cv2.COLOR_RGB2BGR)
-                cv2.imwrite(colored_path, colored_bgr)
-            
-            print(f"Saved VLM similarity results for '{vlm_answer}' to buffer {current_buffer.buffer_id} (optimized)")
-            
-        except Exception as e:
-            print(f"Error saving VLM similarity to buffer: {e}")
-            import traceback
-            traceback.print_exc()
 
     def save_lagged_image_for_pose(self, pose_time, drift):
         """Extracted lagged image saving logic for pose callback."""
@@ -1019,7 +726,6 @@ class ResilienceNode(Node):
                     return
             
             current_buffer = self.risk_buffer_manager.active_buffers[-1]
-            print(f"Saving narration image to buffer: {current_buffer.buffer_id}")
             
             buffer_dir = os.path.join(self.current_run_dir, current_buffer.buffer_id)
             narration_dir = os.path.join(buffer_dir, 'narration')
@@ -1051,15 +757,10 @@ class ResilienceNode(Node):
         """
         try:
             if not hasattr(self, 'semantic_bridge') or self.semantic_bridge is None:
-                print(f"Semantic bridge not available for narration hotspot publishing")
                 return False
             
             if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
-                print(f"NARadio processor not ready for narration hotspot processing")
                 return False
-            
-            print(f"Processing narration image hotspot mask for VLM '{vlm_answer}' from buffer {buffer_id}")
-            print(f"Original image timestamp: {original_image_timestamp:.6f}")
             
             # Process the narration image to get hotspot mask
             # Use the same similarity processing as regular VLM objects
@@ -1126,7 +827,7 @@ class ResilienceNode(Node):
 
     def naradio_processing_loop(self):
         """Parallel NARadio processing loop with robust error handling."""
-        print(f"NARadio processing loop started")
+        print("NARadio processing loop started")
         
         last_memory_cleanup = time.time()
         memory_cleanup_interval = 60.0  # SPEED OPTIMIZATION: Increased from 30s
@@ -1213,10 +914,6 @@ class ResilienceNode(Node):
                     
                     # NOTE: Old continuous similarity processing removed - using smart semantic regions instead
                         
-                except torch.cuda.OutOfMemoryError:
-                    self.naradio_processor.handle_cuda_out_of_memory()
-                    time.sleep(1.0)
-                    continue
                 except Exception as e:
                     time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced sleep on error
                     continue
@@ -1225,221 +922,6 @@ class ResilienceNode(Node):
                 
             except Exception as e:
                 time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced sleep on error
-    
-    def historical_analysis_worker(self):
-        """Parallel historical analysis worker thread that processes analysis requests"""
-        print(f"Historical analysis worker started")
-        
-        while rclpy.ok() and self.historical_analysis_running:
-            try:
-                with self.historical_analysis_condition:
-                    while not self.historical_analysis_queue and self.historical_analysis_running:
-                        self.historical_analysis_condition.wait(timeout=1.0)
-                    
-                    if not self.historical_analysis_running:
-                        break
-                    
-                    queue_size = len(self.historical_analysis_queue)
-                    if queue_size > 0:
-                        print(f"[HistoricalAnalysis] Processing {queue_size} queued requests")
-                    
-                    while self.historical_analysis_queue:
-                        request = self.historical_analysis_queue.pop(0)
-                        self.process_historical_analysis_request(request)
-                        
-            except Exception as e:
-                print(f"Error in historical analysis worker: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(0.1)
-        
-        print(f"Historical analysis worker ended")
-
-    def process_historical_analysis_request(self, request):
-        """Process a historical analysis request in parallel"""
-        request_type = request.get('type')
-        vlm_answer = request.get('vlm_answer', '')
-        buffer_id = request.get('buffer_id', '')
-        
-        print(f"[ParallelAnalysis] Processing request: {request_type}")
-        
-        try:
-            if request_type == 'vlm_answer_received':
-                self.queue_historical_analysis('analyze_vlm_answer', vlm_answer=vlm_answer)
-            elif request_type == 'buffer_frozen':
-                self.queue_historical_analysis('analyze_frozen_buffer', buffer_id=buffer_id)
-            elif request_type == 'analyze_vlm_answer':
-                self.perform_parallel_vlm_analysis(vlm_answer)
-            elif request_type == 'analyze_frozen_buffer':
-                self.perform_parallel_buffer_analysis(buffer_id)
-                
-        except Exception as e:
-            print(f"Error processing historical analysis request: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def queue_historical_analysis(self, request_type, **kwargs):
-        """Queue a historical analysis request for parallel processing"""
-        with self.historical_analysis_condition:
-            request = {
-                'type': request_type,
-                'timestamp': time.time(),
-                **kwargs
-            }
-            self.historical_analysis_queue.append(request)
-            self.historical_analysis_condition.notify()
-            print(f"[ParallelAnalysis] Queued request: {request_type}")
-
-    def perform_parallel_vlm_analysis(self, vlm_answer):
-        """Perform VLM answer analysis in parallel without blocking main thread"""
-        try:
-            print(f"[ParallelAnalysis] Starting VLM analysis for: '{vlm_answer}' (Node: {getattr(self, 'node_id', 'unknown')})")
-            
-            if not self.historical_analyzer:
-                print("[ParallelAnalysis] Historical analyzer not available")
-                return
-            
-            with self.historical_analysis_lock:
-                status = self.risk_buffer_manager.get_status()
-                frozen_buffers = self.risk_buffer_manager.frozen_buffers.copy()
-                active_buffers = self.risk_buffer_manager.active_buffers.copy()
-            
-            print(f"[ParallelAnalysis] Buffer status: {status['frozen_buffers']} frozen, {status['active_buffers']} active")
-            print(f"[ParallelAnalysis] Current run directory: {getattr(self, 'current_run_dir', 'unknown')}")
-            
-            results = {}
-            
-            frozen_with_cause = [b for b in frozen_buffers if b.has_cause()]
-            if frozen_with_cause:
-                print(f"[ParallelAnalysis] Analyzing {len(frozen_with_cause)} frozen buffers with causes...")
-                try:
-                    frozen_results = self.historical_analyzer.analyze_all_buffers()
-                    results.update(frozen_results)
-                    print(f"[ParallelAnalysis] Found {len(frozen_results)} locations in frozen buffers")
-                except Exception as e:
-                    print(f"[ParallelAnalysis] Error analyzing frozen buffers: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            if not results:
-                active_with_cause = [b for b in active_buffers if b.has_cause()]
-                if active_with_cause:
-                    print(f"[ParallelAnalysis] Analyzing {len(active_with_cause)} active buffers with causes...")
-                    try:
-                        active_results = self.historical_analyzer.analyze_active_buffers(active_with_cause)
-                        results.update(active_results)
-                        print(f"[ParallelAnalysis] Found {len(active_results)} locations in active buffers")
-                    except Exception as e:
-                        print(f"[ParallelAnalysis] Error analyzing active buffers: {e}")
-                        import traceback
-                        traceback.print_exc()
-            
-            print(f"[ParallelAnalysis] VLM analysis completed. Results: {len(results)} locations found")
-            
-            self.save_parallel_analysis_results(vlm_answer, results)
-            
-        except Exception as e:
-            print(f"[ParallelAnalysis] Error in VLM analysis: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def perform_parallel_buffer_analysis(self, buffer_id):
-        """Perform buffer analysis in parallel without blocking main thread"""
-        try:
-            print(f"[ParallelAnalysis] Starting buffer analysis for: {buffer_id}")
-            
-            if not self.historical_analyzer:
-                print("[ParallelAnalysis] Historical analyzer not available")
-                return
-            
-            with self.historical_analysis_lock:
-                frozen_buffers = self.risk_buffer_manager.frozen_buffers.copy()
-                active_buffers = self.risk_buffer_manager.active_buffers.copy()
-            
-            target_buffer = None
-            for buffer in frozen_buffers + active_buffers:
-                if buffer.buffer_id == buffer_id:
-                    target_buffer = buffer
-                    break
-            
-            if not target_buffer:
-                print(f"[ParallelAnalysis] Buffer {buffer_id} not found")
-                return
-            
-            if target_buffer.has_cause():
-                print(f"[ParallelAnalysis] Analyzing buffer {buffer_id} with cause: {target_buffer.cause}")
-                result = self.historical_analyzer.analyze_single_buffer(target_buffer)
-                
-                results = [result] if result else []
-                print(f"[ParallelAnalysis] Buffer analysis completed. Results: {len(results)} locations found")
-                
-                self.save_parallel_analysis_results(f"buffer_{buffer_id}", results)
-            else:
-                print(f"[ParallelAnalysis] Buffer {buffer_id} has no cause assigned")
-                
-        except Exception as e:
-            print(f"[ParallelAnalysis] Error in buffer analysis: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def save_parallel_analysis_results(self, analysis_id, results):
-        """Save parallel analysis results to disk"""
-        try:
-            analysis_dir = os.path.join(self.current_run_dir, 'parallel_analysis_results')
-            os.makedirs(analysis_dir, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            node_id = getattr(self, 'node_id', 'unknown')
-            filename = f"analysis_{analysis_id}_{timestamp}_{node_id}.json"
-            filepath = os.path.join(analysis_dir, filename)
-            
-            analysis_data = {
-                'analysis_id': analysis_id,
-                'node_id': node_id,
-                'timestamp': time.time(),
-                'datetime': datetime.now().isoformat(),
-                'results': results,
-                'result_count': len(results) if results else 0,
-                'status': 'completed',
-                'run_directory': getattr(self, 'current_run_dir', 'unknown')
-            }
-            
-            with open(filepath, 'w') as f:
-                json.dump(analysis_data, f, indent=2)
-            
-            with self.historical_analysis_lock:
-                self.parallel_analysis_results[analysis_id] = {
-                    'results': results,
-                    'timestamp': time.time(),
-                    'status': 'completed',
-                    'filepath': filepath,
-                    'node_id': node_id
-                }
-                self.parallel_analysis_status[analysis_id] = 'completed'
-            
-            print(f"[ParallelAnalysis] Saved results for {analysis_id}: {len(results) if results else 0} locations")
-            print(f"[ParallelAnalysis] File: {filepath}")
-            
-        except Exception as e:
-            print(f"Error saving parallel analysis results: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def get_parallel_analysis_status(self):
-        """Get status of parallel analysis"""
-        with self.historical_analysis_lock:
-            return {
-                'queue_size': len(self.historical_analysis_queue),
-                'completed_analyses': len(self.parallel_analysis_results),
-                'recent_results': list(self.parallel_analysis_results.keys())[-5:]
-            }
-
-    def print_parallel_analysis_status(self):
-        """Print current parallel analysis status"""
-        status = self.get_parallel_analysis_status()
-        print(f"[ParallelAnalysis] Status: {status['queue_size']} queued, {status['completed_analyses']} completed")
-        if status['recent_results']:
-            print(f"[ParallelAnalysis] Recent: {status['recent_results']}")
     
     def camera_info_callback(self, msg):
         """Handle camera info to get intrinsics."""
@@ -1454,7 +936,6 @@ class ResilienceNode(Node):
             vlm_answer = msg.data.strip()
             
             if not vlm_answer or "VLM Error" in vlm_answer or "VLM not available" in vlm_answer:
-                print(f"Skipping VLM answer: '{vlm_answer}' (empty or error)")
                 return
             
             print(f"VLM ANSWER RECEIVED: '{vlm_answer}'")
@@ -1465,20 +946,25 @@ class ResilienceNode(Node):
             # Clean up old VLM answers periodically
             self._cleanup_old_vlm_answers(max_age_seconds=300.0)
             
-            if vlm_answer not in self.detection_prompts:
-                self.detection_prompts.append(vlm_answer)
-                self.current_detection_prompt = vlm_answer
-                
-                if self.current_breach_active:
-                    self.detection_enabled = True
+            # Add VLM answer to NARadio processor for continuous monitoring
+            if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
+                success = self.naradio_processor.add_vlm_object(vlm_answer)
+                if success:
+                    print(f"VLM object '{vlm_answer}' added for monitoring")
+                    
+                    if hasattr(self, 'segmentation_legend_pub'):
+                        try:
+                            all_objects = self.naradio_processor.get_all_objects()
+                            legend_text = "VLM Objects Available for Similarity:\n"
+                            for i, obj in enumerate(all_objects):
+                                legend_text += f"{i}: {obj}\n"
+                            
+                            self.segmentation_legend_pub.publish(String(data=legend_text))
+                        except Exception as e:
+                            print(f"Error updating VLM objects legend: {e}")
+                    
                 else:
-                    self.detection_enabled = False
-                
-                if self.yolo_detector.update_prompts(self.detection_prompts):
-                    print(f"YOLO updated with new prompts")
-                else:
-                    print(f"Failed to update YOLO prompts")
-                    self.detection_enabled = False
+                    print(f"Failed to add VLM object '{vlm_answer}' to object list")
             
             self.associate_vlm_answer_with_buffer_reliable(vlm_answer)
             
@@ -1503,16 +989,14 @@ class ResilienceNode(Node):
                 else:
                     print(f"✗ Failed to add VLM object '{vlm_answer}' to object list")
             
-            self.queue_historical_analysis('vlm_answer_received', vlm_answer=vlm_answer)
-            
-            # NEW: Process narration image chain IMMEDIATELY when VLM answer is received
+            # Process narration image chain IMMEDIATELY when VLM answer is received
             # This ensures hotspot mask is sent to semantic bridge as soon as possible
             narration_success = self.process_narration_chain_for_vlm_answer(vlm_answer)
             
             if narration_success:
-                print(f"✓ Completed narration processing chain for VLM '{vlm_answer}'")
+                print(f"Narration processing completed for '{vlm_answer}'")
             else:
-                print(f"✗ Narration processing chain failed for VLM '{vlm_answer}'")
+                print(f"Narration processing failed for '{vlm_answer}'")
             
         except Exception as e:
             print(f"Error processing VLM answer: {e}")
@@ -1566,7 +1050,6 @@ class ResilienceNode(Node):
             narration_image = None
             if target_buffer.has_narration_image():
                 narration_image = target_buffer.get_narration_image()
-                print(f"Found narration image in buffer {target_buffer.buffer_id} memory")
             else:
                 # Fallback: look for narration images on disk
                 narration_dir = os.path.join(buffer_dir, 'narration')
@@ -1583,13 +1066,12 @@ class ResilienceNode(Node):
                         if narration_image is not None:
                             # Convert BGR to RGB
                             narration_image = cv2.cvtColor(narration_image, cv2.COLOR_BGR2RGB)
-                            print(f"Found narration image for buffer {target_buffer.buffer_id} on disk: {latest_narration_file}")
             
             if narration_image is None:
-                print(f"No narration image found for buffer {target_buffer.buffer_id} with VLM '{vlm_answer}'")
+                print(f"No narration image found for buffer {target_buffer.buffer_id}")
                 return False
             
-            print(f"Processing narration image similarity for VLM '{vlm_answer}' from buffer {target_buffer.buffer_id}")
+            print(f"Processing narration image for '{vlm_answer}' from buffer {target_buffer.buffer_id}")
             
             # STEP 1: Process similarity and get hotspot mask IMMEDIATELY
             similarity_result = self.naradio_processor.process_vlm_similarity_visualization(
@@ -1616,20 +1098,16 @@ class ResilienceNode(Node):
             if target_buffer.get_original_image_timestamp() is not None:
                 # Use the stored original image timestamp
                 original_image_timestamp = target_buffer.get_original_image_timestamp()
-                print(f"Using stored original image timestamp: {original_image_timestamp:.6f}")
             elif target_buffer.narration_timestamp is not None:
                 # The narration_timestamp is when narration was generated
                 # We need to estimate the original image timestamp
                 # For now, use the buffer start time as approximation
                 original_image_timestamp = target_buffer.start_time
-                print(f"Using buffer start time as original image timestamp: {original_image_timestamp:.6f}")
             else:
                 # Fallback: use current time
                 original_image_timestamp = time.time()
-                print(f"Using current time as fallback for original image timestamp: {original_image_timestamp:.6f}")
             
             # STEP 3: Send hotspot mask through semantic bridge IMMEDIATELY
-            print(f"Sending narration hotspot mask to semantic bridge for voxel mapping...")
             hotspot_success = self.publish_narration_hotspot_mask(
                 narration_image=narration_image,
                 vlm_answer=vlm_answer,
@@ -1638,16 +1116,11 @@ class ResilienceNode(Node):
             )
             
             if hotspot_success:
-                print(f"✓ Successfully sent narration hotspot mask to semantic bridge for voxel mapping")
-                print(f"  VLM Answer: '{vlm_answer}'")
-                print(f"  Original timestamp: {original_image_timestamp:.6f}")
-                print(f"  Hotspot pixels: {int(np.sum(hotspot_mask))}")
-                print(f"  Threshold: {threshold:.3f}")
+                print(f"Hotspot mask sent to semantic bridge for '{vlm_answer}'")
             else:
-                print(f"✗ Failed to send narration hotspot mask to semantic bridge")
+                print(f"Failed to send hotspot mask to semantic bridge")
             
             # STEP 4: Process enhanced embedding in background (non-blocking)
-            print(f"Processing enhanced embedding for '{vlm_answer}' in background...")
             try:
                 # Process the narration image for enhanced embedding
                 enhanced_success = self.naradio_processor.process_narration_image_similarity(
@@ -1658,8 +1131,6 @@ class ResilienceNode(Node):
                 )
                 
                 if enhanced_success:
-                    print(f"✓ Completed enhanced embedding processing for VLM '{vlm_answer}'")
-                    
                     # Load and store enhanced embedding in buffer object
                     try:
                         enhanced_embedding = self.load_enhanced_embedding_from_buffer(buffer_dir, vlm_answer)
@@ -1671,17 +1142,10 @@ class ResilienceNode(Node):
                                 self.naradio_processor.is_segmentation_ready()):
                                 success = self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
                                 if success:
-                                    print(f"✓ Added enhanced embedding to NARadio processor for real-time detection")
-                                else:
-                                    print(f"✗ Failed to add enhanced embedding to NARadio processor")
+                                    print(f"Enhanced embedding added to NARadio processor")
                             
-                            print(f"✓ Loaded and stored enhanced embedding in buffer {target_buffer.buffer_id}")
-                        else:
-                            print(f"✗ Failed to load enhanced embedding for buffer {target_buffer.buffer_id}")
                     except Exception as e:
-                        print(f"✗ Error loading enhanced embedding: {e}")
-                else:
-                    print(f"✗ Failed to process enhanced embedding for VLM '{vlm_answer}'")
+                        print(f"Error loading enhanced embedding: {e}")
             except Exception as e:
                 print(f"Error processing enhanced embedding: {e}")
             
@@ -1696,14 +1160,12 @@ class ResilienceNode(Node):
     def associate_vlm_answer_with_buffer_reliable(self, vlm_answer):
         """Associate VLM answer with buffer."""
         try:
-            print(f"Associating VLM answer '{vlm_answer}' with buffer...")
-            
             success = self.risk_buffer_manager.assign_cause(vlm_answer)
             
             if success:
-                print(f"✓ Successfully associated '{vlm_answer}' with risk buffer")
+                print(f"Associated '{vlm_answer}' with risk buffer")
             else:
-                print(f"✗ No suitable buffer found for '{vlm_answer}'")
+                print(f"No suitable buffer found for '{vlm_answer}'")
                     
         except Exception as e:
             print(f"Error associating VLM answer with buffer: {e}")
@@ -1762,13 +1224,6 @@ def main():
             node.naradio_running = False
             if hasattr(node, 'naradio_thread') and node.naradio_thread and node.naradio_thread.is_alive():
                 node.naradio_thread.join(timeout=2.0)
-        
-        if hasattr(node, 'historical_analysis_running') and node.historical_analysis_running:
-            node.historical_analysis_running = False
-            with node.historical_analysis_condition:
-                node.historical_analysis_condition.notify_all()
-            if hasattr(node, 'historical_analysis_thread') and node.historical_analysis_thread and node.historical_analysis_thread.is_alive():
-                node.historical_analysis_thread.join(timeout=2.0)
         
         if hasattr(node, 'naradio_processor') and node.naradio_processor.is_ready():
             try:
