@@ -324,6 +324,9 @@ class SemanticDepthOctoMapNode(Node):
 					)
 					if success:
 						processed_count += 1
+						# NEW: Special logging for narration hotspots
+						if len(vlm_info) == 1:  # Single VLM answer (likely narration)
+							self.get_logger().info(f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels")
 			
 			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots")
 			return processed_count > 0

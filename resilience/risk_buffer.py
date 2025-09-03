@@ -130,6 +130,26 @@ class RiskBuffer:
             print(f"[RiskBuffer] Error storing narration data for {self.buffer_id}: {e}")
             return False
     
+    def set_narration_data_with_timestamp(self, narration_image, narration_text: str, 
+                                        narration_timestamp: float, original_image_timestamp: float) -> bool:
+        """Store narration image and related data with original image timestamp for semantic mapping."""
+        try:
+            self.narration_image = narration_image.copy() if narration_image is not None else None
+            self.narration_text = narration_text
+            self.narration_timestamp = narration_timestamp
+            self.original_image_timestamp = original_image_timestamp  # NEW: Store original image timestamp
+            print(f"[RiskBuffer] Stored narration data for {self.buffer_id}")
+            print(f"  Narration timestamp: {narration_timestamp:.6f}")
+            print(f"  Original image timestamp: {original_image_timestamp:.6f}")
+            return True
+        except Exception as e:
+            print(f"[RiskBuffer] Error storing narration data with timestamp for {self.buffer_id}: {e}")
+            return False
+    
+    def get_original_image_timestamp(self) -> Optional[float]:
+        """Get the original image timestamp for semantic mapping."""
+        return getattr(self, 'original_image_timestamp', None)
+    
     def has_narration_image(self) -> bool:
         """Check if buffer has narration image stored."""
         return self.narration_image is not None
@@ -330,6 +350,27 @@ class RiskBufferManager:
             
             if stored:
                 print(f"[RiskBufferManager] Stored narration data in {len(self.active_buffers)} active buffer(s)")
+            
+            return stored
+    
+    def store_narration_data_with_timestamp(self, narration_image, narration_text: str, 
+                                          narration_timestamp: float, original_image_timestamp: float) -> bool:
+        """Store narration data with original image timestamp in all active buffers."""
+        with self.lock:
+            if not self.active_buffers:
+                print("No active buffers to store narration data with timestamp")
+                return False
+
+            stored = False
+            for buffer in self.active_buffers:
+                if buffer.set_narration_data_with_timestamp(narration_image, narration_text, 
+                                                          narration_timestamp, original_image_timestamp):
+                    stored = True
+            
+            if stored:
+                print(f"[RiskBufferManager] Stored narration data with timestamp in {len(self.active_buffers)} active buffer(s)")
+                print(f"  Narration timestamp: {narration_timestamp:.6f}")
+                print(f"  Original image timestamp: {original_image_timestamp:.6f}")
             
             return stored
     

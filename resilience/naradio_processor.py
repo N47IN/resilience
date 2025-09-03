@@ -2066,10 +2066,22 @@ class NARadioProcessor:
                     embedding_path = os.path.join(risk_lib_dir, f"enhanced_embedding_{safe_vlm_name}_{timestamp_str}.npy")
                     np.save(embedding_path, entry['enhanced_embedding'])
                     
+                    # Create JSON-serializable metadata (without numpy arrays)
+                    metadata = {
+                        'vlm_answer': vlm_answer,
+                        'enhanced_embedding_path': f"enhanced_embedding_{safe_vlm_name}_{timestamp_str}.npy",
+                        'enhanced_embedding_shape': list(entry['enhanced_embedding'].shape) if entry['enhanced_embedding'] is not None else None,
+                        'enhanced_embedding_norm': float(np.linalg.norm(entry['enhanced_embedding'])) if entry['enhanced_embedding'] is not None else None,
+                        'metadata': self._make_json_serializable(entry.get('metadata', {})),
+                        'timestamp': entry.get('timestamp', time.time()),
+                        'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'description': 'Risk library entry with enhanced embedding for semantic mapping'
+                    }
+                    
                     # Save metadata
                     metadata_path = os.path.join(risk_lib_dir, f"risk_entry_{safe_vlm_name}_{timestamp_str}.json")
                     with open(metadata_path, 'w') as f:
-                        json.dump(entry, f, indent=2)
+                        json.dump(metadata, f, indent=2)
                 
                 # Save complete risk library summary
                 summary = {
@@ -2167,3 +2179,20 @@ class NARadioProcessor:
             import traceback
             traceback.print_exc()
             return None
+
+    def _make_json_serializable(self, obj):
+        """Convert object to JSON-serializable format, handling numpy arrays and other non-serializable types."""
+        if isinstance(obj, dict):
+            return {key: self._make_json_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_serializable(item) for item in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        else:
+            return obj

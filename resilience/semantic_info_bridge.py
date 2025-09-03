@@ -148,6 +148,13 @@ class SemanticHotspotPublisher:
             if hasattr(self.node, 'get_logger'):
                 self.node.get_logger().info(f"Published merged hotspots for {len(vlm_info)} VLM answers @ {timestamp:.6f}")
             
+            # NEW: Special logging for narration hotspot masks
+            if len(vlm_info) == 1:  # Single VLM answer (likely narration)
+                vlm_answer = list(vlm_info.keys())[0]
+                hotspot_pixels = list(vlm_info.values())[0]['hotspot_pixels']
+                if hasattr(self.node, 'get_logger'):
+                    self.node.get_logger().info(f"NARRATION HOTSPOT: '{vlm_answer}' with {hotspot_pixels} pixels @ {timestamp:.6f}")
+            
             return True
             
         except Exception as e:

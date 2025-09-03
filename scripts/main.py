@@ -751,11 +751,17 @@ class ResilienceNode(Node):
                     closest_msg = msg
             
             if closest_image is not None and closest_msg is not None:
+                # Get the original image timestamp from the message
+                original_image_timestamp = closest_msg.header.stamp.sec + closest_msg.header.stamp.nanosec * 1e-9
+                
                 self.save_narration_image_to_buffer(closest_image, narration_text, current_time)
                 
                 # NEW: Store narration data in active buffers for VLM processing
+                # Include the original image timestamp for proper semantic mapping
                 if self.risk_buffer_manager:
-                    self.risk_buffer_manager.store_narration_data(closest_image, narration_text, current_time)
+                    self.risk_buffer_manager.store_narration_data_with_timestamp(
+                        closest_image, narration_text, current_time, original_image_timestamp
+                    )
                 
                 image_msg = self.bridge.cv2_to_imgmsg(closest_image, encoding='rgb8')
                 image_msg.header.stamp = closest_msg.header.stamp
@@ -1028,6 +1034,79 @@ class ResilienceNode(Node):
             print(f"Error saving narration image to buffer: {e}")
             import traceback
             traceback.print_exc()
+
+    def publish_narration_hotspot_mask(self, narration_image: np.ndarray, vlm_answer: str, 
+                                      original_image_timestamp: float, buffer_id: str) -> bool:
+        """
+        Publish narration image hotspot mask through semantic bridge for semantic voxel mapping.
+        
+        Args:
+            narration_image: The narration image that was used for similarity processing
+            vlm_answer: The VLM answer/cause that was identified
+            original_image_timestamp: Timestamp when the original image was recorded (not narration time)
+            buffer_id: Buffer ID for tracking
+            
+        Returns:
+            True if successfully published, False otherwise
+        """
+        try:
+            if not hasattr(self, 'semantic_bridge') or self.semantic_bridge is None:
+                print(f"Semantic bridge not available for narration hotspot publishing")
+                return False
+            
+            if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
+                print(f"NARadio processor not ready for narration hotspot processing")
+                return False
+            
+            print(f"Processing narration image hotspot mask for VLM '{vlm_answer}' from buffer {buffer_id}")
+            print(f"Original image timestamp: {original_image_timestamp:.6f}")
+            
+            # Process the narration image to get hotspot mask
+            # Use the same similarity processing as regular VLM objects
+            similarity_result = self.naradio_processor.process_vlm_similarity_visualization(
+                narration_image, vlm_answer
+            )
+            
+            if not similarity_result or 'similarity_map' not in similarity_result:
+                print(f"Failed to compute similarity for narration image")
+                return False
+            
+            # Extract similarity map and apply binary threshold
+            similarity_map = similarity_result['similarity_map']
+            threshold = similarity_result.get('threshold_used', 0.6)
+            
+            # Create binary hotspot mask
+            hotspot_mask = (similarity_map > threshold).astype(np.uint8)
+            
+            if not np.any(hotspot_mask):
+                print(f"No hotspots found in narration image for '{vlm_answer}'")
+                return False
+            
+            # Create single VLM hotspot dictionary (same format as merged hotspots)
+            vlm_hotspots = {vlm_answer: hotspot_mask}
+            
+            # Publish through semantic bridge with original image timestamp
+            success = self.semantic_bridge.publish_merged_hotspots(
+                vlm_hotspots=vlm_hotspots,
+                timestamp=original_image_timestamp,  # Use original image timestamp
+                original_image=narration_image
+            )
+            
+            if success:
+                print(f"✓ Published narration hotspot mask for '{vlm_answer}' through semantic bridge")
+                print(f"  Original timestamp: {original_image_timestamp:.6f}")
+                print(f"  Hotspot pixels: {int(np.sum(hotspot_mask))}")
+                print(f"  Threshold: {threshold:.3f}")
+                return True
+            else:
+                print(f"✗ Failed to publish narration hotspot mask through semantic bridge")
+                return False
+                
+        except Exception as e:
+            print(f"Error publishing narration hotspot mask: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     # NOTE: Complex hotspot extraction removed - using clean semantic bridge instead
 
@@ -1426,103 +1505,193 @@ class ResilienceNode(Node):
             
             self.queue_historical_analysis('vlm_answer_received', vlm_answer=vlm_answer)
             
-            # Note: Enhanced embedding handling moved to narration processing for efficiency
+            # NEW: Process narration image chain IMMEDIATELY when VLM answer is received
+            # This ensures hotspot mask is sent to semantic bridge as soon as possible
+            narration_success = self.process_narration_chain_for_vlm_answer(vlm_answer)
             
-            # NEW: Process narration image from buffer directory AFTER historical analysis queuing
-            try:
-                if (hasattr(self, 'naradio_processor') and 
-                    self.naradio_processor.is_segmentation_ready()):
-                    
-                    # Find the buffer that was just assigned the cause
-                    target_buffer = None
-                    with self.lock:
-                        # Check frozen buffers first (most recent with this cause)
-                        for buffer in reversed(self.risk_buffer_manager.frozen_buffers):
-                            if buffer.cause == vlm_answer:
-                                target_buffer = buffer
-                                break
-                        
-                        # If not found, check active buffers
-                        if target_buffer is None:
-                            for buffer in reversed(self.risk_buffer_manager.active_buffers):
-                                if buffer.cause == vlm_answer:
-                                    target_buffer = buffer
-                                    break
-                    
-                    if target_buffer:
-                        buffer_dir = os.path.join(self.current_run_dir, target_buffer.buffer_id)
-                        
-                        # First check if narration image is in buffer memory
-                        narration_image = None
-                        if target_buffer.has_narration_image():
-                            narration_image = target_buffer.get_narration_image()
-                            print(f"Found narration image in buffer {target_buffer.buffer_id} memory")
-                        else:
-                            # Fallback: look for narration images on disk
-                            narration_dir = os.path.join(buffer_dir, 'narration')
-                            if os.path.exists(narration_dir):
-                                narration_files = [f for f in os.listdir(narration_dir) if f.endswith('.png')]
-                                if narration_files:
-                                    # Get the most recent narration image
-                                    narration_files.sort()
-                                    latest_narration_file = narration_files[-1]
-                                    narration_image_path = os.path.join(narration_dir, latest_narration_file)
-                                    
-                                    # Load the narration image
-                                    narration_image = cv2.imread(narration_image_path)
-                                    if narration_image is not None:
-                                        # Convert BGR to RGB
-                                        narration_image = cv2.cvtColor(narration_image, cv2.COLOR_BGR2RGB)
-                                        print(f"Found narration image for buffer {target_buffer.buffer_id} on disk: {latest_narration_file}")
-                        
-                        if narration_image is not None:
-                            print(f"Processing narration image similarity for VLM '{vlm_answer}' from buffer {target_buffer.buffer_id}")
-                            
-                            # Process the narration image for similarity mapping
-                            success = self.naradio_processor.process_narration_image_similarity(
-                                narration_image=narration_image,
-                                vlm_answer=vlm_answer,
-                                buffer_id=target_buffer.buffer_id,
-                                buffer_dir=buffer_dir
-                            )
-                            
-                            if success:
-                                print(f"✓ Completed narration similarity processing for VLM '{vlm_answer}' in buffer {target_buffer.buffer_id}")
-                                
-                                # Load and store enhanced embedding in buffer object
-                                try:
-                                    enhanced_embedding = self.load_enhanced_embedding_from_buffer(buffer_dir, vlm_answer)
-                                    if enhanced_embedding is not None:
-                                        target_buffer.assign_enhanced_cause_embedding(enhanced_embedding)
-                                        
-                                        # Also add to NARadio processor for real-time similarity detection
-                                        if (hasattr(self, 'naradio_processor') and 
-                                            self.naradio_processor.is_segmentation_ready()):
-                                            success = self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
-                                            if success:
-                                                print(f"✓ Added enhanced embedding to NARadio processor for real-time detection")
-                                            else:
-                                                print(f"✗ Failed to add enhanced embedding to NARadio processor")
-                                        
-                                        print(f"✓ Loaded and stored enhanced embedding in buffer {target_buffer.buffer_id}")
-                                    else:
-                                        print(f"✗ Failed to load enhanced embedding for buffer {target_buffer.buffer_id}")
-                                except Exception as e:
-                                    print(f"✗ Error loading enhanced embedding: {e}")
-                            else:
-                                print(f"✗ Failed to process narration similarity for VLM '{vlm_answer}'")
-                        else:
-                            print(f"✗ No narration image found for buffer {target_buffer.buffer_id} with VLM '{vlm_answer}'")
-                    else:
-                        print(f"✗ No buffer found with cause '{vlm_answer}' for narration processing")
-                        
-            except Exception as e:
-                print(f"Error processing narration image similarity: {e}")
-                import traceback
-                traceback.print_exc()
+            if narration_success:
+                print(f"✓ Completed narration processing chain for VLM '{vlm_answer}'")
+            else:
+                print(f"✗ Narration processing chain failed for VLM '{vlm_answer}'")
             
         except Exception as e:
             print(f"Error processing VLM answer: {e}")
+
+    def process_narration_chain_for_vlm_answer(self, vlm_answer: str) -> bool:
+        """
+        Complete narration processing chain for a VLM answer.
+        This happens immediately when VLM answer is received.
+        
+        Chain of events:
+        1. Find buffer with this cause
+        2. Get narration image
+        3. Process similarity and get hotspot mask
+        4. Send hotspot mask through semantic bridge IMMEDIATELY
+        5. Process enhanced embedding (background)
+        
+        Args:
+            vlm_answer: The VLM answer/cause to process
+            
+        Returns:
+            True if narration processing was successful, False otherwise
+        """
+        try:
+            if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
+                print(f"NARadio processor not ready for narration processing")
+                return False
+            
+            # Find the buffer that was just assigned the cause
+            target_buffer = None
+            with self.lock:
+                # Check frozen buffers first (most recent with this cause)
+                for buffer in reversed(self.risk_buffer_manager.frozen_buffers):
+                    if buffer.cause == vlm_answer:
+                        target_buffer = buffer
+                        break
+                
+                # If not found, check active buffers
+                if target_buffer is None:
+                    for buffer in reversed(self.risk_buffer_manager.active_buffers):
+                        if buffer.cause == vlm_answer:
+                            target_buffer = buffer
+                            break
+            
+            if not target_buffer:
+                print(f"No buffer found with cause '{vlm_answer}' for narration processing")
+                return False
+            
+            buffer_dir = os.path.join(self.current_run_dir, target_buffer.buffer_id)
+            
+            # Get narration image
+            narration_image = None
+            if target_buffer.has_narration_image():
+                narration_image = target_buffer.get_narration_image()
+                print(f"Found narration image in buffer {target_buffer.buffer_id} memory")
+            else:
+                # Fallback: look for narration images on disk
+                narration_dir = os.path.join(buffer_dir, 'narration')
+                if os.path.exists(narration_dir):
+                    narration_files = [f for f in os.listdir(narration_dir) if f.endswith('.png')]
+                    if narration_files:
+                        # Get the most recent narration image
+                        narration_files.sort()
+                        latest_narration_file = narration_files[-1]
+                        narration_image_path = os.path.join(narration_dir, latest_narration_file)
+                        
+                        # Load the narration image
+                        narration_image = cv2.imread(narration_image_path)
+                        if narration_image is not None:
+                            # Convert BGR to RGB
+                            narration_image = cv2.cvtColor(narration_image, cv2.COLOR_BGR2RGB)
+                            print(f"Found narration image for buffer {target_buffer.buffer_id} on disk: {latest_narration_file}")
+            
+            if narration_image is None:
+                print(f"No narration image found for buffer {target_buffer.buffer_id} with VLM '{vlm_answer}'")
+                return False
+            
+            print(f"Processing narration image similarity for VLM '{vlm_answer}' from buffer {target_buffer.buffer_id}")
+            
+            # STEP 1: Process similarity and get hotspot mask IMMEDIATELY
+            similarity_result = self.naradio_processor.process_vlm_similarity_visualization(
+                narration_image, vlm_answer
+            )
+            
+            if not similarity_result or 'similarity_map' not in similarity_result:
+                print(f"Failed to compute similarity for narration image")
+                return False
+            
+            # Extract similarity map and apply binary threshold
+            similarity_map = similarity_result['similarity_map']
+            threshold = similarity_result.get('threshold_used', 0.6)
+            
+            # Create binary hotspot mask
+            hotspot_mask = (similarity_map > threshold).astype(np.uint8)
+            
+            if not np.any(hotspot_mask):
+                print(f"No hotspots found in narration image for '{vlm_answer}'")
+                return False
+            
+            # STEP 2: Get original image timestamp (CRITICAL for proper synchronization)
+            original_image_timestamp = None
+            if target_buffer.get_original_image_timestamp() is not None:
+                # Use the stored original image timestamp
+                original_image_timestamp = target_buffer.get_original_image_timestamp()
+                print(f"Using stored original image timestamp: {original_image_timestamp:.6f}")
+            elif target_buffer.narration_timestamp is not None:
+                # The narration_timestamp is when narration was generated
+                # We need to estimate the original image timestamp
+                # For now, use the buffer start time as approximation
+                original_image_timestamp = target_buffer.start_time
+                print(f"Using buffer start time as original image timestamp: {original_image_timestamp:.6f}")
+            else:
+                # Fallback: use current time
+                original_image_timestamp = time.time()
+                print(f"Using current time as fallback for original image timestamp: {original_image_timestamp:.6f}")
+            
+            # STEP 3: Send hotspot mask through semantic bridge IMMEDIATELY
+            print(f"Sending narration hotspot mask to semantic bridge for voxel mapping...")
+            hotspot_success = self.publish_narration_hotspot_mask(
+                narration_image=narration_image,
+                vlm_answer=vlm_answer,
+                original_image_timestamp=original_image_timestamp,
+                buffer_id=target_buffer.buffer_id
+            )
+            
+            if hotspot_success:
+                print(f"✓ Successfully sent narration hotspot mask to semantic bridge for voxel mapping")
+                print(f"  VLM Answer: '{vlm_answer}'")
+                print(f"  Original timestamp: {original_image_timestamp:.6f}")
+                print(f"  Hotspot pixels: {int(np.sum(hotspot_mask))}")
+                print(f"  Threshold: {threshold:.3f}")
+            else:
+                print(f"✗ Failed to send narration hotspot mask to semantic bridge")
+            
+            # STEP 4: Process enhanced embedding in background (non-blocking)
+            print(f"Processing enhanced embedding for '{vlm_answer}' in background...")
+            try:
+                # Process the narration image for enhanced embedding
+                enhanced_success = self.naradio_processor.process_narration_image_similarity(
+                    narration_image=narration_image,
+                    vlm_answer=vlm_answer,
+                    buffer_id=target_buffer.buffer_id,
+                    buffer_dir=buffer_dir
+                )
+                
+                if enhanced_success:
+                    print(f"✓ Completed enhanced embedding processing for VLM '{vlm_answer}'")
+                    
+                    # Load and store enhanced embedding in buffer object
+                    try:
+                        enhanced_embedding = self.load_enhanced_embedding_from_buffer(buffer_dir, vlm_answer)
+                        if enhanced_embedding is not None:
+                            target_buffer.assign_enhanced_cause_embedding(enhanced_embedding)
+                            
+                            # Also add to NARadio processor for real-time similarity detection
+                            if (hasattr(self, 'naradio_processor') and 
+                                self.naradio_processor.is_segmentation_ready()):
+                                success = self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
+                                if success:
+                                    print(f"✓ Added enhanced embedding to NARadio processor for real-time detection")
+                                else:
+                                    print(f"✗ Failed to add enhanced embedding to NARadio processor")
+                            
+                            print(f"✓ Loaded and stored enhanced embedding in buffer {target_buffer.buffer_id}")
+                        else:
+                            print(f"✗ Failed to load enhanced embedding for buffer {target_buffer.buffer_id}")
+                    except Exception as e:
+                        print(f"✗ Error loading enhanced embedding: {e}")
+                else:
+                    print(f"✗ Failed to process enhanced embedding for VLM '{vlm_answer}'")
+            except Exception as e:
+                print(f"Error processing enhanced embedding: {e}")
+            
+            return hotspot_success  # Return success based on hotspot mask publishing
+            
+        except Exception as e:
+            print(f"Error in narration processing chain: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def associate_vlm_answer_with_buffer_reliable(self, vlm_answer):
         """Associate VLM answer with buffer."""
