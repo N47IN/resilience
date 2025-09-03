@@ -541,6 +541,10 @@ class ResilienceNode(Node):
                         self.queue_historical_analysis('buffer_frozen', buffer_id=buffer.buffer_id)
                 
                 self.save_comprehensive_buffers(pose_time)
+                
+                # NEW: Save risk library for this run
+                if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
+                    self.naradio_processor.save_risk_library(self.current_run_dir)
             
             self.detection_enabled = False
             
@@ -1104,50 +1108,20 @@ class ResilienceNode(Node):
                         feat_map_np is not None):
                         
                         try:
-                            # Process all dynamic objects using adaptive similarity (config-controlled)
-                            for vlm_answer in self.naradio_processor.dynamic_objects:
+                            # NEW: Create merged hotspot masks for all VLM answers
+                            vlm_answers = self.naradio_processor.dynamic_objects
+                            vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers)
+                            
+                            if vlm_hotspots and len(vlm_hotspots) > 0:
+                                # Get RGB timestamp for this image
+                                rgb_timestamp = self._get_ros_timestamp(rgb_msg)
                                 
-                                # Use adaptive method that chooses enhanced vs VLM based on config
-                                similarity_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
-                                    rgb_image, vlm_answer, feat_map_np)
-                                
-                                if similarity_result:
-                                    if similarity_result['colored_similarity'] is not None:
-                                        similarity_msg = self.bridge.cv2_to_imgmsg(
-                                            similarity_result['colored_similarity'], 
-                                            encoding='rgb8'
-                                        )
-                                        similarity_msg.header = rgb_msg.header
-                                        
-                                        if self.publish_original_mask:
-                                            self.original_mask_pub.publish(similarity_msg)
-                                        
-                                        if self.publish_refined_mask:
-                                            self.refined_mask_pub.publish(similarity_msg)
-                                    
-                                    # ENHANCED: Publish binary hotspots with simplified approach (timestamp-only)
-                                    if (self.enable_voxel_mapping and
-                                        hasattr(self, 'semantic_bridge') and self.semantic_bridge and 
-                                        similarity_result.get('similarity_map') is not None):
-                                        
-                                        # Get RGB timestamp for this image
-                                        rgb_timestamp = self._get_ros_timestamp(rgb_msg)
-                                        
-                                        # Resize similarity map to match original image dimensions
-                                        similarity_map = similarity_result['similarity_map']
-                                        original_height, original_width = rgb_image.shape[:2]
-                                        
-                                        if similarity_map.shape[:2] != (original_height, original_width):
-                                            similarity_map = cv2.resize(similarity_map, (original_width, original_height), 
-                                                                     interpolation=cv2.INTER_LINEAR)
-                                        
-                                        # Publish ONLY hotspot mask + timestamp
-                                        self.semantic_bridge.publish_similarity_hotspots(
-                                            vlm_answer=vlm_answer,
-                                            similarity_map=similarity_map,
-                                            timestamp=rgb_timestamp,
-                                            original_image=rgb_image
-                                        )
+                                # Publish merged hotspots with color-based association
+                                self.semantic_bridge.publish_merged_hotspots(
+                                    vlm_hotspots=vlm_hotspots,
+                                    timestamp=rgb_timestamp,
+                                    original_image=rgb_image
+                                )
                         
                         except Exception as seg_e:
                             pass  # SPEED OPTIMIZATION: Silent error handling

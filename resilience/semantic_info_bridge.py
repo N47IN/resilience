@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+import threading
 
 
 class SemanticHotspotPublisher:
@@ -32,6 +33,27 @@ class SemanticHotspotPublisher:
         # Rate limiting
         self.last_publish_time = 0.0
         
+        # Color palette for VLM answers
+        self.color_palette = [
+            [255, 0, 0],    # Red
+            [0, 255, 0],    # Green
+            [0, 0, 255],    # Blue
+            [255, 255, 0],  # Yellow
+            [255, 0, 255],  # Magenta
+            [0, 255, 255],  # Cyan
+            [255, 128, 0],  # Orange
+            [128, 0, 255],  # Purple
+            [128, 128, 0],  # Olive
+            [0, 128, 128],  # Teal
+            [128, 0, 128],  # Maroon
+            [255, 165, 0],  # Orange Red
+            [75, 0, 130],   # Indigo
+            [240, 230, 140], # Khaki
+            [255, 20, 147]  # Deep Pink
+        ]
+        self.vlm_color_map = {}  # vlm_answer -> color
+        self.color_map_lock = threading.Lock()
+        
         # Publishers
         self.hotspot_data_pub = self.node.create_publisher(String, '/semantic_hotspots', 10)
         self.hotspot_mask_pub = self.node.create_publisher(Image, '/semantic_hotspot_mask', 10)
@@ -40,17 +62,23 @@ class SemanticHotspotPublisher:
         if hasattr(self.node, 'get_logger'):
             self.node.get_logger().info(f"Semantic bridge initialized - threshold: {self.hotspot_threshold}")
     
-    def publish_similarity_hotspots(self, vlm_answer: str, similarity_map: np.ndarray,
-                                   timestamp: float,
-                                   original_image: Optional[np.ndarray] = None) -> bool:
+    def _get_color_for_vlm_answer(self, vlm_answer: str) -> List[int]:
+        """Get unique color for VLM answer."""
+        with self.color_map_lock:
+            if vlm_answer not in self.vlm_color_map:
+                color_idx = len(self.vlm_color_map) % len(self.color_palette)
+                self.vlm_color_map[vlm_answer] = self.color_palette[color_idx]
+            return self.vlm_color_map[vlm_answer]
+    
+    def publish_merged_hotspots(self, vlm_hotspots: Dict[str, np.ndarray], 
+                               timestamp: float, original_image: Optional[np.ndarray] = None) -> bool:
         """
-        Publish binary hotspot mask built from a similarity map along with original RGB timestamp.
+        Publish merged hotspot mask with different colors for different VLM answers.
         
         Args:
-            vlm_answer: VLM answer being processed
-            similarity_map: 2D similarity map (H, W) with values in [0, 1]
-            timestamp: Original RGB image timestamp (float seconds)
-            original_image: Original RGB image for overlay visualization (optional)
+            vlm_hotspots: Dict mapping vlm_answer -> hotspot_mask (binary)
+            timestamp: Original RGB image timestamp
+            original_image: Original RGB image for overlay visualization
             
         Returns:
             True if hotspots were published, False otherwise
@@ -61,61 +89,54 @@ class SemanticHotspotPublisher:
             if current_time - self.last_publish_time < (1.0 / self.publish_rate_limit):
                 return False
             
-            # Validate input data
-            if similarity_map is None or similarity_map.size == 0:
-                if hasattr(self.node, 'get_logger'):
-                    self.node.get_logger().warn(f"Invalid similarity map for '{vlm_answer}'")
+            if not vlm_hotspots:
                 return False
             
-            # Apply binary threshold directly to similarity map
-            hotspot_mask = similarity_map > self.hotspot_threshold
+            # Get dimensions from first mask
+            first_mask = next(iter(vlm_hotspots.values()))
+            h, w = first_mask.shape
             
-            if not np.any(hotspot_mask):
+            # Create merged colored mask
+            merged_mask = np.zeros((h, w, 3), dtype=np.uint8)
+            vlm_info = {}
+            
+            for vlm_answer, hotspot_mask in vlm_hotspots.items():
+                if not np.any(hotspot_mask):
+                    continue
+                
+                # Get unique color for this VLM answer
+                color = self._get_color_for_vlm_answer(vlm_answer)
+                
+                # Apply color to hotspot regions
+                merged_mask[hotspot_mask > 0] = color
+                
+                # Count hotspots for this VLM answer
+                hotspot_count = int(np.sum(hotspot_mask > 0))
+                vlm_info[vlm_answer] = {
+                    'color': color,
+                    'hotspot_pixels': hotspot_count,
+                    'hotspot_threshold': float(self.hotspot_threshold)
+                }
+            
+            if not np.any(merged_mask):
                 return False  # No hotspots
             
-            # Filter small regions using connected components
-            hotspot_mask_uint8 = (hotspot_mask * 255).astype(np.uint8)
-            contours, _ = cv2.findContours(hotspot_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Create filtered mask with only significant regions
-            filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
-            hotspot_count = 0
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area >= self.min_area:
-                    cv2.fillPoly(filtered_mask, [contour], 255)
-                    hotspot_count += 1
-            
-            if hotspot_count == 0:
-                return False  # No significant hotspots
-            
-            # Compute statistics
-            hotspot_pixels = int(np.sum(filtered_mask > 0))
-            hotspot_similarity_values = similarity_map[hotspot_mask]
-            
-            # Publish binary mask image for RViz visualization
-            self._publish_hotspot_mask_image(filtered_mask, vlm_answer, timestamp)
+            # Publish merged mask image
+            self._publish_merged_hotspot_mask_image(merged_mask, timestamp)
             
             # Publish overlay image if original image provided
             if original_image is not None:
-                self._publish_hotspot_overlay(original_image, filtered_mask, vlm_answer, timestamp)
+                self._publish_merged_hotspot_overlay(original_image, merged_mask, timestamp)
             
-            # Create structured data message for voxel mapping (timestamp-only, no pose/depth)
+            # Create structured data message
             hotspot_data = {
-                'type': 'similarity_hotspots',
-                'vlm_answer': vlm_answer,
+                'type': 'merged_similarity_hotspots',
                 'timestamp': float(timestamp),
-                'mask_shape': list(filtered_mask.shape),
-                'mask_data': filtered_mask.flatten().tolist(),  # Binary mask as list
-                'threshold_used': float(self.hotspot_threshold),
-                'stats': {
-                    'hotspot_count': int(hotspot_count),
-                    'hotspot_pixels': int(hotspot_pixels),
-                    'max_similarity': float(np.max(hotspot_similarity_values)),
-                    'avg_similarity': float(np.mean(hotspot_similarity_values)),
-                    'threshold': float(self.hotspot_threshold)
-                }
+                'mask_shape': list(merged_mask.shape),
+                'mask_data': merged_mask.flatten().tolist(),  # Colored mask as list
+                'vlm_info': vlm_info,
+                'total_vlm_answers': len(vlm_info),
+                'threshold_used': float(self.hotspot_threshold)
             }
             
             # Publish structured data
@@ -125,13 +146,13 @@ class SemanticHotspotPublisher:
             self.last_publish_time = current_time
             
             if hasattr(self.node, 'get_logger'):
-                self.node.get_logger().info(f"Published {hotspot_count} hotspots for '{vlm_answer}' (>{self.hotspot_threshold}) @ {timestamp:.6f}")
+                self.node.get_logger().info(f"Published merged hotspots for {len(vlm_info)} VLM answers @ {timestamp:.6f}")
             
             return True
             
         except Exception as e:
             if hasattr(self.node, 'get_logger'):
-                self.node.get_logger().error(f"Error publishing hotspots: {e}")
+                self.node.get_logger().error(f"Error publishing merged hotspots: {e}")
             return False
     
     def _publish_hotspot_mask_image(self, mask: np.ndarray, vlm_answer: str, timestamp: float):
@@ -151,6 +172,20 @@ class SemanticHotspotPublisher:
         except Exception as e:
             if hasattr(self.node, 'get_logger'):
                 self.node.get_logger().error(f"Error publishing mask image: {e}")
+    
+    def _publish_merged_hotspot_mask_image(self, merged_mask: np.ndarray, timestamp: float):
+        """Publish merged colored hotspot mask as ROS Image for RViz visualization."""
+        try:
+            # Convert to ROS Image message
+            mask_msg = self.bridge.cv2_to_imgmsg(merged_mask, encoding='rgb8')
+            mask_msg.header.stamp = self.node.get_clock().now().to_msg()
+            mask_msg.header.frame_id = 'camera_link'
+            
+            self.hotspot_mask_pub.publish(mask_msg)
+            
+        except Exception as e:
+            if hasattr(self.node, 'get_logger'):
+                self.node.get_logger().error(f"Error publishing merged mask image: {e}")
     
     def _publish_hotspot_overlay(self, original_image: np.ndarray, mask: np.ndarray, 
                                 vlm_answer: str, timestamp: float):
@@ -182,6 +217,37 @@ class SemanticHotspotPublisher:
         except Exception as e:
             if hasattr(self.node, 'get_logger'):
                 self.node.get_logger().error(f"Error publishing overlay image: {e}")
+    
+    def _publish_merged_hotspot_overlay(self, original_image: np.ndarray, merged_mask: np.ndarray, 
+                                      timestamp: float):
+        """Publish overlay of merged colored hotspots on original image."""
+        try:
+            # Create overlay
+            overlay = original_image.copy()
+            
+            # Apply colored overlay where hotspots are detected
+            hotspot_pixels = np.any(merged_mask > 0, axis=2)
+            overlay[hotspot_pixels] = cv2.addWeighted(
+                overlay[hotspot_pixels], 0.6,
+                merged_mask[hotspot_pixels], 0.4,
+                0
+            )
+            
+            # Add text label
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text = f"Merged Hotspots: {len(self.vlm_color_map)} VLM answers"
+            cv2.putText(overlay, text, (10, 30), font, 0.7, (255, 255, 255), 2)
+            
+            # Convert to ROS Image message
+            overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding='rgb8')
+            overlay_msg.header.stamp = self.node.get_clock().now().to_msg()
+            overlay_msg.header.frame_id = 'camera_link'
+            
+            self.hotspot_overlay_pub.publish(overlay_msg)
+            
+        except Exception as e:
+            if hasattr(self.node, 'get_logger'):
+                self.node.get_logger().error(f"Error publishing merged overlay image: {e}")
 
 
 class SemanticHotspotSubscriber:

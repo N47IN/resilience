@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from scipy.optimize import minimize
 
 # Optional: 3D isosurfaces via marching cubes
 try:
@@ -332,8 +333,19 @@ def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, 
     field_3d = mean_field.reshape(Ny, Nx, Nz)
     volume = np.transpose(field_3d, (2, 0, 1))
 
-    # More levels for richer isolines
+    # Compute levels based on actual data range
+    field_min, field_max = mean_field.min(), mean_field.max()
+    field_range = field_max - field_min
+    
+    if field_range < 1e-8:
+        print("Warning: Field has very low variance, skipping isosurfaces")
+        return
+    
+    # Use percentiles of the actual data range
     levels = np.percentile(mean_field, [60, 72, 84, 92, 97])[:num_levels]
+    
+    # Ensure levels are within the volume range
+    levels = np.clip(levels, field_min + 0.01 * field_range, field_max - 0.01 * field_range)
 
     dx = xs[1] - xs[0] if len(xs) > 1 else 1.0
     dy = ys[1] - ys[0] if len(ys) > 1 else 1.0
@@ -708,8 +720,7 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
     """Fit parameters of identical anisotropic kernel centered at each cause point such that
     A * sum_j exp(-0.5 * Q_l(x - c_j)) + b approximates the existing GP mean field.
 
-    We perform a small grid search over lxy and lz, and for each pair solve for optimal [A, b]
-    in least squares closed-form.
+    Uses BFGS optimization over lxy and lz, with closed-form solution for A and b.
 
     Returns dict with best params and the reconstructed field.
     """
@@ -725,33 +736,216 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
         }
 
     target = mean_field.astype(float)
-    # Candidate length-scales (meters). Adjust as needed.
-    lxy_grid = np.array([0.04, 0.06, 0.08, 0.12, 0.18, 0.25], dtype=float)
-    lz_grid = np.array([0.03, 0.06, 0.10, 0.16, 0.24], dtype=float)
-
-    best = {'mse': float('inf')}
-
-    for lxy in lxy_grid:
-        for lz in lz_grid:
-            phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
-            # Solve for A and b in least squares: target ≈ A*phi + b
-            n = phi.shape[0]
-            X = np.column_stack([phi, np.ones(n, dtype=float)])
-            # Closed form using normal equations
+    
+    # Normalize target to have better numerical properties
+    target_mean = np.mean(target)
+    target_std = np.std(target)
+    if target_std < 1e-8:
+        print("Warning: Target field has very low variance, fitting may be unstable")
+        target_std = 1.0
+    target_norm = (target - target_mean) / target_std
+    
+    def objective(params):
+        """Objective function: MSE between target and reconstructed field."""
+        lxy, lz = params
+        # Ensure positive length scales
+        lxy = max(lxy, 0.01)
+        lz = max(lz, 0.01)
+        
+        phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+        
+        # Normalize phi for better conditioning
+        phi_mean = np.mean(phi)
+        phi_std = np.std(phi)
+        if phi_std < 1e-8:
+            return float('inf')  # Avoid singular cases
+        phi_norm = (phi - phi_mean) / phi_std
+        
+        # Closed-form solution for A and b
+        n = phi_norm.shape[0]
+        X = np.column_stack([phi_norm, np.ones(n, dtype=float)])
+        try:
             XtX = X.T @ X
-            XtY = X.T @ target
-            try:
-                params = np.linalg.solve(XtX, XtY)
-            except np.linalg.LinAlgError:
-                params = np.linalg.lstsq(X, target, rcond=None)[0]
-            A, b = float(params[0]), float(params[1])
-            recon = A * phi + b
-            mse = float(np.mean((recon - target) ** 2))
-            if mse < best['mse']:
-                best = {'lxy': lxy, 'lz': lz, 'A': A, 'b': b, 'recon': recon, 'mse': mse}
-
-    print(f"Extended-cause fit -> lxy: {best['lxy']:.3f} m, lz: {best['lz']:.3f} m, A: {best['A']:.4f}, b: {best['b']:.4f}, MSE: {best['mse']:.6f}")
-    return best
+            XtY = X.T @ target_norm
+            params_ab = np.linalg.solve(XtX, XtY)
+        except np.linalg.LinAlgError:
+            params_ab = np.linalg.lstsq(X, target_norm, rcond=None)[0]
+        
+        A_norm, b_norm = params_ab[0], params_ab[1]
+        recon_norm = A_norm * phi_norm + b_norm
+        mse = np.mean((recon_norm - target_norm) ** 2)
+        
+        # Add regularization to prefer reasonable length scales
+        reg_term = 0.1 * (1.0 / (lxy + 0.1) + 1.0 / (lz + 0.1))
+        return mse + reg_term
+    
+    def objective_with_grad(params):
+        """Objective function with gradient for faster convergence."""
+        lxy, lz = params
+        # Ensure positive length scales
+        lxy = max(lxy, 0.01)
+        lz = max(lz, 0.01)
+        
+        phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+        
+        # Normalize phi
+        phi_mean = np.mean(phi)
+        phi_std = np.std(phi)
+        if phi_std < 1e-8:
+            return float('inf'), np.array([0.0, 0.0])
+        phi_norm = (phi - phi_mean) / phi_std
+        
+        # Closed-form solution for A and b
+        n = phi_norm.shape[0]
+        X = np.column_stack([phi_norm, np.ones(n, dtype=float)])
+        try:
+            XtX = X.T @ X
+            XtY = X.T @ target_norm
+            params_ab = np.linalg.solve(XtX, XtY)
+        except np.linalg.LinAlgError:
+            params_ab = np.linalg.lstsq(X, target_norm, rcond=None)[0]
+        
+        A_norm, b_norm = params_ab[0], params_ab[1]
+        recon_norm = A_norm * phi_norm + b_norm
+        residual = recon_norm - target_norm
+        
+        # Compute gradients w.r.t. lxy and lz
+        grad_phi_lxy = np.zeros_like(phi)
+        grad_phi_lz = np.zeros_like(phi)
+        
+        chunk = 200000
+        inv_lxy3 = 1.0 / (lxy * lxy * lxy + 1e-12)
+        inv_lz3 = 1.0 / (lz * lz * lz + 1e-12)
+        
+        for start in range(0, grid_points.shape[0], chunk):
+            end = min(grid_points.shape[0], start + chunk)
+            gp_chunk = grid_points[start:end]
+            
+            dx = gp_chunk[:, None, 0] - cause_points[None, :, 0]
+            dy = gp_chunk[:, None, 1] - cause_points[None, :, 1]
+            dz = gp_chunk[:, None, 2] - cause_points[None, :, 2]
+            
+            d2_xy = dx * dx + dy * dy
+            d2_z = dz * dz
+            
+            exp_term = np.exp(-0.5 * (d2_xy / (lxy * lxy) + d2_z / (lz * lz)))
+            
+            # Gradients
+            grad_phi_lxy[start:end] = (d2_xy * inv_lxy3 * exp_term).sum(axis=1)
+            grad_phi_lz[start:end] = (d2_z * inv_lz3 * exp_term).sum(axis=1)
+        
+        # Normalize gradients
+        grad_phi_lxy = (grad_phi_lxy - np.mean(grad_phi_lxy)) / phi_std
+        grad_phi_lz = (grad_phi_lz - np.mean(grad_phi_lz)) / phi_std
+        
+        # Gradient of MSE w.r.t. lxy and lz
+        grad_lxy = 2 * A_norm * np.mean(residual * grad_phi_lxy)
+        grad_lz = 2 * A_norm * np.mean(residual * grad_phi_lz)
+        
+        # Add regularization gradients
+        grad_lxy += 0.1 / (lxy + 0.1)**2
+        grad_lz += 0.1 / (lz + 0.1)**2
+        
+        mse = np.mean(residual ** 2) + 0.1 * (1.0 / (lxy + 0.1) + 1.0 / (lz + 0.1))
+        return mse, np.array([grad_lxy, grad_lz])
+    
+    # Multiple initial guesses to avoid local minima
+    initial_guesses = [
+        [0.05, 0.05],   # Small scales
+        [0.1, 0.1],     # Medium scales
+        [0.2, 0.2],     # Large scales
+        [0.1, 0.05],    # Anisotropic
+        [0.05, 0.1],    # Anisotropic
+    ]
+    
+    # Bounds for length scales (positive)
+    bounds = [(0.01, 0.5), (0.01, 0.5)]
+    
+    print("Optimizing length scales with BFGS...")
+    
+    best_result = None
+    best_mse = float('inf')
+    
+    for i, x0 in enumerate(initial_guesses):
+        print(f"  Trying initial guess {i+1}/{len(initial_guesses)}: lxy={x0[0]:.3f}, lz={x0[1]:.3f}")
+        
+        try:
+            result = minimize(
+                objective, 
+                x0, 
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 50, 'ftol': 1e-6}
+            )
+            
+            if result.success and result.fun < best_mse:
+                best_result = result
+                best_mse = result.fun
+                print(f"    New best: MSE={result.fun:.6f}, lxy={result.x[0]:.3f}, lz={result.x[1]:.3f}")
+            
+        except Exception as e:
+            print(f"    Failed: {e}")
+    
+    if best_result is None:
+        print("All optimization attempts failed. Falling back to grid search.")
+        # Fallback to original grid search
+        lxy_grid = np.array([0.04, 0.06, 0.08, 0.12, 0.18, 0.25], dtype=float)
+        lz_grid = np.array([0.03, 0.06, 0.10, 0.16, 0.24], dtype=float)
+        
+        best = {'mse': float('inf')}
+        
+        for lxy in lxy_grid:
+            for lz in lz_grid:
+                phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+                n = phi.shape[0]
+                X = np.column_stack([phi, np.ones(n, dtype=float)])
+                try:
+                    XtX = X.T @ X
+                    XtY = X.T @ target
+                    params = np.linalg.solve(XtX, XtY)
+                except np.linalg.LinAlgError:
+                    params = np.linalg.lstsq(X, target, rcond=None)[0]
+                A, b = float(params[0]), float(params[1])
+                recon = A * phi + b
+                mse = float(np.mean((recon - target) ** 2))
+                if mse < best['mse']:
+                    best = {'lxy': lxy, 'lz': lz, 'A': A, 'b': b, 'recon': recon, 'mse': mse}
+        
+        print(f"Grid search fallback -> lxy: {best['lxy']:.3f} m, lz: {best['lz']:.3f} m, A: {best['A']:.4f}, b: {best['b']:.4f}, MSE: {best['mse']:.6f}")
+        return best
+    
+    # Extract optimal parameters
+    lxy_opt, lz_opt = best_result.x
+    phi_opt = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy_opt, lz=lz_opt)
+    
+    # Final closed-form solution for A and b (using original scale)
+    n = phi_opt.shape[0]
+    X = np.column_stack([phi_opt, np.ones(n, dtype=float)])
+    try:
+        XtX = X.T @ X
+        XtY = X.T @ target
+        params_ab = np.linalg.solve(XtX, XtY)
+    except np.linalg.LinAlgError:
+        params_ab = np.linalg.lstsq(X, target, rcond=None)[0]
+    
+    A_opt, b_opt = float(params_ab[0]), float(params_ab[1])
+    recon_opt = A_opt * phi_opt + b_opt
+    mse_opt = float(np.mean((recon_opt - target) ** 2))
+    
+    print(f"Optimized fit -> lxy: {lxy_opt:.3f} m, lz: {lz_opt:.3f} m, A: {A_opt:.4f}, b: {b_opt:.4f}, MSE: {mse_opt:.6f}")
+    print(f"Optimization iterations: {best_result.nit}, function evaluations: {best_result.nfev}")
+    print(f"Target field stats - mean: {target_mean:.4f}, std: {target_std:.4f}")
+    print(f"Reconstructed field stats - mean: {np.mean(recon_opt):.4f}, std: {np.std(recon_opt):.4f}")
+    
+    return {
+        'lxy': lxy_opt,
+        'lz': lz_opt,
+        'A': A_opt,
+        'b': b_opt,
+        'recon': recon_opt,
+        'mse': mse_opt,
+        'optimization_result': best_result
+    }
 
 
 def main():

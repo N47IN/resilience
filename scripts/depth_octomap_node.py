@@ -24,7 +24,7 @@ from cv_bridge import CvBridge
 import time
 import json
 import math
-from typing import Optional
+from typing import Optional, List
 import sensor_msgs_py.point_cloud2 as pc2
 import threading
 import cv2
@@ -275,9 +275,66 @@ class SemanticDepthOctoMapNode(Node):
 			# Parse the JSON message
 			data = json.loads(msg_data)
 			
-			if data.get('type') != 'similarity_hotspots':
+			if data.get('type') == 'merged_similarity_hotspots':
+				return self._process_merged_hotspot_message(data)
+			elif data.get('type') == 'similarity_hotspots':
+				return self._process_single_hotspot_message(data)
+			else:
 				return False
 			
+		except Exception as e:
+			self.get_logger().error(f"Error processing single bridge message: {e}")
+			return False
+
+	def _process_merged_hotspot_message(self, data: dict) -> bool:
+		"""Process merged hotspot message with color-based VLM answer association."""
+		try:
+			mask_shape = data.get('mask_shape')
+			mask_data = data.get('mask_data')
+			vlm_info = data.get('vlm_info', {})
+			rgb_timestamp = float(data.get('timestamp', 0.0))
+			
+			if not mask_data or not mask_shape or rgb_timestamp <= 0.0:
+				self.get_logger().warn(f"Incomplete merged hotspot data")
+				return False
+			
+			# Reconstruct colored mask
+			merged_mask = np.array(mask_data, dtype=np.uint8).reshape(tuple(mask_shape))
+			
+			# Lookup closest depth frame and pose by timestamp
+			depth_image, pose_msg, used_ts = self._lookup_depth_and_pose(rgb_timestamp)
+			if depth_image is None or pose_msg is None:
+				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
+				return False
+			
+			# Process each VLM answer based on color
+			processed_count = 0
+			for vlm_answer, info in vlm_info.items():
+				color = info.get('color', [0, 0, 0])
+				
+				# Create binary mask for this VLM answer based on color
+				vlm_mask = np.all(merged_mask == color, axis=2)
+				
+				if np.any(vlm_mask):
+					success = self._process_hotspot_with_depth(
+						vlm_mask, pose_msg, depth_image, vlm_answer, 
+						info.get('hotspot_threshold', 0.6), 
+						{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
+						rgb_timestamp, used_ts
+					)
+					if success:
+						processed_count += 1
+			
+			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots")
+			return processed_count > 0
+			
+		except Exception as e:
+			self.get_logger().error(f"Error processing merged hotspot message: {e}")
+			return False
+
+	def _process_single_hotspot_message(self, data: dict) -> bool:
+		"""Process single hotspot message (legacy support)."""
+		try:
 			vlm_answer = data.get('vlm_answer')
 			mask_shape = data.get('mask_shape')
 			mask_data = data.get('mask_data')
@@ -302,7 +359,7 @@ class SemanticDepthOctoMapNode(Node):
 			return self._process_hotspot_with_depth(mask, pose_msg, depth_image, vlm_answer, threshold_used, stats, rgb_timestamp, used_ts)
 			
 		except Exception as e:
-			self.get_logger().error(f"Error processing single bridge message: {e}")
+			self.get_logger().error(f"Error processing single hotspot message: {e}")
 			return False
 
 	def _lookup_depth_and_pose(self, target_ts: float):
@@ -526,7 +583,7 @@ class SemanticDepthOctoMapNode(Node):
 			return None, None, None
 
 	def _create_semantic_colored_cloud(self, max_points: int) -> Optional[PointCloud2]:
-		"""Create a colored point cloud that shows semantic voxels in red."""
+		"""Create a colored point cloud that shows semantic voxels with VLM answer colors."""
 		try:
 			# Get all voxels from the helper using the correct attribute
 			all_voxels = list(self.voxel_helper.voxels.keys())
@@ -558,8 +615,12 @@ class SemanticDepthOctoMapNode(Node):
 						
 						# Check if this voxel has semantic information
 						if voxel_key in semantic_mapper.voxel_semantics:
-							# Semantic voxel - color it RED
-							color = [255, 0, 0]  # Red for semantic voxels
+							# Get VLM answer and use consistent color
+							semantic_info = semantic_mapper.voxel_semantics[voxel_key]
+							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+							
+							# Use consistent color based on VLM answer
+							color = self._get_vlm_answer_color(vlm_answer)
 							semantic_count += 1
 						else:
 							# Regular voxel - use default color (gray)
@@ -588,7 +649,7 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Log the coloring information
 			if has_semantic_mapper and semantic_count > 0:
-				self.get_logger().info(f"Creating colored cloud: {semantic_count} semantic voxels (RED), {regular_count} regular voxels (GRAY)")
+				self.get_logger().info(f"Creating colored cloud: {semantic_count} semantic voxels (colored by VLM answer), {regular_count} regular voxels (GRAY)")
 			else:
 				self.get_logger().info(f"Creating colored cloud: {regular_count} regular voxels (GRAY)")
 			
@@ -647,7 +708,32 @@ class SemanticDepthOctoMapNode(Node):
 			import traceback
 			traceback.print_exc()
 			return None
-	
+
+	def _get_vlm_answer_color(self, vlm_answer: str) -> List[int]:
+		"""Get consistent color for VLM answer (same as bridge)."""
+		# Use same color palette as semantic bridge
+		color_palette = [
+			[255, 0, 0],    # Red
+			[0, 255, 0],    # Green
+			[0, 0, 255],    # Blue
+			[255, 255, 0],  # Yellow
+			[255, 0, 255],  # Magenta
+			[0, 255, 255],  # Cyan
+			[255, 128, 0],  # Orange
+			[128, 0, 255],  # Purple
+			[128, 128, 0],  # Olive
+			[0, 128, 128],  # Teal
+			[128, 0, 128],  # Maroon
+			[255, 165, 0],  # Orange Red
+			[75, 0, 130],   # Indigo
+			[240, 230, 140], # Khaki
+			[255, 20, 147]  # Deep Pink
+		]
+		
+		# Simple hash-based color assignment
+		hash_val = hash(vlm_answer) % len(color_palette)
+		return color_palette[hash_val]
+
 	def _get_voxel_center_from_key(self, voxel_key: tuple) -> Optional[np.ndarray]:
 		"""Get voxel center position from voxel key."""
 		try:
@@ -869,6 +955,7 @@ class SemanticDepthOctoMapNode(Node):
 					self.get_logger().info(f"✓ Exported {count} semantic voxel points to PCD: {filepath}")
 				else:
 					self.get_logger().warn(f"No semantic voxels to export (skipped writing): {filepath}")
+				
 				self.semantic_pcd_exported = True
 		except Exception as e:
 			self.get_logger().error(f"Inactivity check error: {e}")
@@ -917,7 +1004,7 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().error(f"Failed to save semantic voxels to PCD: {e}")
 			return 0
-	
+
 	def _resolve_export_directory(self) -> str:
 		"""Return latest run_* dir under buffers if available; else configured directory."""
 		try:

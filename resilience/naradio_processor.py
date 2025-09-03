@@ -124,6 +124,10 @@ class NARadioProcessor:
         # Initialize combined segmentation if enabled
         if self.enable_combined_segmentation:
             self.init_combined_segmentation(segmentation_config_path)
+        
+        # Risk library for tracking VLM answers with enhanced embeddings
+        self.risk_library = {}  # vlm_answer -> {enhanced_embedding, metadata, timestamp}
+        self.risk_library_lock = threading.Lock()
     
     def _compute_image_hash(self, rgb_image: np.ndarray) -> str:
         """Compute hash for image caching."""
@@ -1761,11 +1765,26 @@ class NARadioProcessor:
                     # Add enhanced embedding to similarity result for completeness
                     similarity_result['enhanced_embedding'] = enhanced_embedding
                     
+                    # NEW: Add to risk library for semantic mapping
+                    metadata = {
+                        'buffer_id': buffer_id,
+                        'buffer_dir': buffer_dir,
+                        'similarity_map_shape': list(similarity_map.shape),
+                        'similarity_map_max': float(np.max(similarity_map)),
+                        'similarity_map_mean': float(np.mean(similarity_map)),
+                        'computation_method': 'similarity_weighted_spatial_features'
+                    }
+                    self.add_to_risk_library(vlm_answer, enhanced_embedding, metadata)
+                    
                     print(f"✓ Computed and saved enhanced embedding for '{vlm_answer}' (shape: {enhanced_embedding.shape})")
                 else:
                     print(f"✗ Failed to compute enhanced embedding for '{vlm_answer}'")
             else:
                 print(f"✗ No similarity map available for enhanced embedding computation")
+            
+            # NEW: Extract and save hotspot mask
+            if similarity_map is not None:
+                self._save_hotspot_mask(vlm_answer, buffer_dir, similarity_map, narration_image)
             
             # Save the similarity result to the buffer
             self._save_narration_similarity_result_simple(
@@ -1904,3 +1923,247 @@ class NARadioProcessor:
                     rgb_image, vlm_answer, feat_map_np)
             else:
                 return None
+
+    def _save_hotspot_mask(self, vlm_answer: str, buffer_dir: str, similarity_map: np.ndarray, 
+                          original_image: np.ndarray):
+        """Save hotspot mask extracted from similarity map to buffer directory."""
+        try:
+            # Create hotspot masks directory
+            hotspot_dir = os.path.join(buffer_dir, 'hotspot_masks')
+            os.makedirs(hotspot_dir, exist_ok=True)
+            
+            # Get hotspot threshold from config (same as semantic bridge)
+            hotspot_threshold = self.segmentation_config['segmentation'].get('hotspot_threshold', 0.6)
+            min_area = self.segmentation_config['segmentation'].get('min_hotspot_area', 50)
+            
+            # Apply binary threshold to similarity map
+            hotspot_mask = similarity_map > hotspot_threshold
+            
+            if not np.any(hotspot_mask):
+                print(f"No hotspots found for '{vlm_answer}' with threshold {hotspot_threshold}")
+                return
+            
+            # Filter small regions using connected components
+            hotspot_mask_uint8 = (hotspot_mask * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(hotspot_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Create filtered mask with only significant regions
+            filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
+            hotspot_count = 0
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area >= min_area:
+                    cv2.fillPoly(filtered_mask, [contour], 255)
+                    hotspot_count += 1
+            
+            if hotspot_count == 0:
+                print(f"No significant hotspots found for '{vlm_answer}' (min area: {min_area})")
+                return
+            
+            # Create safe filename
+            safe_vlm_name = vlm_answer.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            timestamp_str = f"{time.time():.3f}"
+            
+            # Save binary hotspot mask
+            mask_path = os.path.join(hotspot_dir, f"hotspot_mask_{safe_vlm_name}_{timestamp_str}.png")
+            cv2.imwrite(mask_path, filtered_mask)
+            
+            # Save colored hotspot mask (green hotspots on black background)
+            colored_mask = np.zeros((filtered_mask.shape[0], filtered_mask.shape[1], 3), dtype=np.uint8)
+            colored_mask[filtered_mask > 0] = [0, 255, 0]  # Green hotspots
+            colored_mask_path = os.path.join(hotspot_dir, f"hotspot_mask_colored_{safe_vlm_name}_{timestamp_str}.png")
+            cv2.imwrite(colored_mask_path, colored_mask)
+            
+            # Save hotspot overlay on original image
+            overlay = original_image.copy()
+            overlay[filtered_mask > 0] = [0, 255, 0]  # Green hotspots on original image
+            overlay_path = os.path.join(hotspot_dir, f"hotspot_overlay_{safe_vlm_name}_{timestamp_str}.png")
+            cv2.imwrite(overlay_path, overlay)
+            
+            # Compute statistics
+            hotspot_pixels = int(np.sum(filtered_mask > 0))
+            hotspot_similarity_values = similarity_map[hotspot_mask]
+            
+            # Save metadata
+            metadata = {
+                'vlm_answer': vlm_answer,
+                'hotspot_threshold': float(hotspot_threshold),
+                'min_area': int(min_area),
+                'hotspot_count': int(hotspot_count),
+                'hotspot_pixels': int(hotspot_pixels),
+                'max_similarity': float(np.max(hotspot_similarity_values)) if len(hotspot_similarity_values) > 0 else 0.0,
+                'avg_similarity': float(np.mean(hotspot_similarity_values)) if len(hotspot_similarity_values) > 0 else 0.0,
+                'mask_shape': list(filtered_mask.shape),
+                'timestamp': time.time(),
+                'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'files': {
+                    'binary_mask': f"hotspot_mask_{safe_vlm_name}_{timestamp_str}.png",
+                    'colored_mask': f"hotspot_mask_colored_{safe_vlm_name}_{timestamp_str}.png",
+                    'overlay': f"hotspot_overlay_{safe_vlm_name}_{timestamp_str}.png"
+                }
+            }
+            
+            metadata_path = os.path.join(hotspot_dir, f"hotspot_mask_{safe_vlm_name}_{timestamp_str}_metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"✓ Saved hotspot mask for '{vlm_answer}' to {hotspot_dir}")
+            print(f"  Hotspots: {hotspot_count}, Pixels: {hotspot_pixels}")
+            print(f"  Files: {mask_path}, {colored_mask_path}, {overlay_path}")
+            
+        except Exception as e:
+            print(f"Error saving hotspot mask: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def add_to_risk_library(self, vlm_answer: str, enhanced_embedding: np.ndarray, metadata: dict = None):
+        """Add VLM answer with enhanced embedding to risk library."""
+        try:
+            with self.risk_library_lock:
+                risk_entry = {
+                    'vlm_answer': vlm_answer,
+                    'enhanced_embedding': enhanced_embedding,
+                    'embedding_shape': list(enhanced_embedding.shape),
+                    'embedding_norm': float(np.linalg.norm(enhanced_embedding)),
+                    'timestamp': time.time(),
+                    'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'metadata': metadata or {}
+                }
+                
+                self.risk_library[vlm_answer] = risk_entry
+                print(f"✓ Added '{vlm_answer}' to risk library (embedding shape: {enhanced_embedding.shape})")
+                
+        except Exception as e:
+            print(f"Error adding to risk library: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def get_risk_library(self) -> dict:
+        """Get current risk library."""
+        with self.risk_library_lock:
+            return self.risk_library.copy()
+
+    def save_risk_library(self, buffer_dir: str):
+        """Save risk library to buffer directory."""
+        try:
+            with self.risk_library_lock:
+                if not self.risk_library:
+                    print("No risk library entries to save")
+                    return
+                
+                # Create risk library directory
+                risk_lib_dir = os.path.join(buffer_dir, 'risk_library')
+                os.makedirs(risk_lib_dir, exist_ok=True)
+                
+                timestamp_str = f"{time.time():.3f}"
+                
+                # Save each risk entry
+                for vlm_answer, entry in self.risk_library.items():
+                    safe_vlm_name = vlm_answer.replace(' ', '_').replace('/', '_').replace('\\', '_')
+                    
+                    # Save enhanced embedding
+                    embedding_path = os.path.join(risk_lib_dir, f"enhanced_embedding_{safe_vlm_name}_{timestamp_str}.npy")
+                    np.save(embedding_path, entry['enhanced_embedding'])
+                    
+                    # Save metadata
+                    metadata_path = os.path.join(risk_lib_dir, f"risk_entry_{safe_vlm_name}_{timestamp_str}.json")
+                    with open(metadata_path, 'w') as f:
+                        json.dump(entry, f, indent=2)
+                
+                # Save complete risk library summary
+                summary = {
+                    'total_entries': len(self.risk_library),
+                    'entries': list(self.risk_library.keys()),
+                    'timestamp': time.time(),
+                    'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'description': 'Risk library containing VLM answers with enhanced embeddings for semantic mapping'
+                }
+                
+                summary_path = os.path.join(risk_lib_dir, f"risk_library_summary_{timestamp_str}.json")
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                
+                print(f"✓ Saved risk library to {risk_lib_dir}")
+                print(f"  Total entries: {len(self.risk_library)}")
+                print(f"  Entries: {list(self.risk_library.keys())}")
+                
+        except Exception as e:
+            print(f"Error saving risk library: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str]) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Create hotspot masks for multiple VLM answers and merge them with different colors.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answers: List of VLM answers to process
+            
+        Returns:
+            Dict mapping vlm_answer -> hotspot_mask (binary) or None if failed
+        """
+        try:
+            if not self.is_segmentation_ready():
+                print("Cannot create merged hotspots - segmentation not ready")
+                return None
+            
+            # Get hotspot threshold from config
+            hotspot_threshold = self.segmentation_config['segmentation'].get('hotspot_threshold', 0.6)
+            min_area = self.segmentation_config['segmentation'].get('min_hotspot_area', 50)
+            
+            vlm_hotspots = {}
+            
+            for vlm_answer in vlm_answers:
+                if vlm_answer not in self.get_all_objects():
+                    print(f"VLM answer '{vlm_answer}' not in object list, skipping")
+                    continue
+                
+                # Process VLM similarity for this answer
+                similarity_result = self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np=None)
+                
+                if similarity_result is None:
+                    continue
+                
+                similarity_map = similarity_result.get('similarity_map')
+                if similarity_map is None:
+                    continue
+                
+                # Apply binary threshold to similarity map
+                hotspot_mask = similarity_map > hotspot_threshold
+                
+                if not np.any(hotspot_mask):
+                    continue
+                
+                # Filter small regions using connected components
+                hotspot_mask_uint8 = (hotspot_mask * 255).astype(np.uint8)
+                contours, _ = cv2.findContours(hotspot_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                # Create filtered mask with only significant regions
+                filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
+                hotspot_count = 0
+                
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area >= min_area:
+                        cv2.fillPoly(filtered_mask, [contour], 255)
+                        hotspot_count += 1
+                
+                if hotspot_count > 0:
+                    vlm_hotspots[vlm_answer] = filtered_mask
+                    print(f"✓ Created hotspot mask for '{vlm_answer}' ({hotspot_count} regions)")
+            
+            if not vlm_hotspots:
+                # print("No valid hotspot masks created")
+                return None
+            
+            print(f"✓ Created merged hotspot masks for {len(vlm_hotspots)} VLM answers")
+            return vlm_hotspots
+            
+        except Exception as e:
+            print(f"Error creating merged hotspot masks: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
