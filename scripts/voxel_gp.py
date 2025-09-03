@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-3D Gaussian Process Disturbance Field Visualization (with vertical component)
+3D Direct Disturbance Field Modeling with Superposed Anisotropic Kernels
 
 - Loads buffer poses and cause location
-- Clips nominal trajectory to actual segment (same as 2D script)
+- Clips nominal trajectory to actual segment (same as before)
 - Computes disturbance (including Z/vertical deviations)
-- Fits a 3D Gaussian Process centered at the cause location
+- Directly fits a superposed anisotropic kernel model to observed disturbances:
+  * A * sum_j exp(-0.5 * Q_l(x - c_j)) + b
+  * Where Q_l is anisotropic distance metric with shared parameters lxy, lz
+  * Each cause point c_j contributes identically to the field
 - Predicts on a 3D grid and visualizes:
   * 2D points (XY) colored by disturbance
   * 3D volume with translucent isosurfaces (preferred) or colored point cloud (fallback)
@@ -18,8 +21,6 @@ import os
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.optimize import minimize
 
@@ -172,44 +173,8 @@ def compute_disturbance_at_nominal_points(nominal_xyz: np.ndarray, actual_xyz: n
     return np.array(nominal_points_used), np.array(disturbances)
 
 
-def create_cause_centric_features_nominal(nominal_points: np.ndarray, cause_xyz: np.ndarray):
-    """Create features relative to cause location for nominal points."""
-    if cause_xyz is None:
-        cause_xyz = nominal_points.mean(axis=0)
-        print(f"Warning: No cause location found, using nominal trajectory centroid: {cause_xyz}")
-
-    distances = np.linalg.norm(nominal_points - cause_xyz, axis=1)
-    relative_positions = nominal_points - cause_xyz
-
-    features = np.column_stack([
-        distances,
-        relative_positions[:, 0],
-        relative_positions[:, 1],
-        relative_positions[:, 2]
-    ])
-
-    return features, cause_xyz
-
-
-def fit_cause_centric_gp(features: np.ndarray, drift_magnitudes: np.ndarray):
-    """Fit a Gaussian Process to model disturbance as function of position relative to cause."""
-    kernel_distance = ConstantKernel(1.0) * RBF(length_scale=1.0, length_scale_bounds=(0.1, 10.0))
-    kernel_position = ConstantKernel(1.0) * RBF(length_scale=1.0, length_scale_bounds=(0.1, 10.0))
-    kernel = kernel_distance + kernel_position
-
-    gp = GaussianProcessRegressor(
-        kernel=kernel,
-        alpha=1e-6,
-        n_restarts_optimizer=8,
-        random_state=42
-    )
-
-    gp.fit(features, drift_magnitudes)
-
-    print(f"Fitted GP kernel: {gp.kernel_}")
-    print(f"GP score: {gp.score(features, drift_magnitudes):.4f}")
-
-    return gp
+# Removed: create_cause_centric_features_nominal and fit_cause_centric_gp functions
+# These are no longer needed since we eliminated the global GP step
 
 
 def clip_nominal_to_actual_segment(nominal_xyz: np.ndarray, actual_xyz: np.ndarray, plane: str = 'xy'):
@@ -268,20 +233,8 @@ def create_3d_prediction_grid(xyz: np.ndarray, cause_xyz: np.ndarray, resolution
     return Xg, Yg, Zg, grid_points, xs, ys, zs
 
 
-def predict_gp_field_3d(gp, grid_points: np.ndarray, cause_xyz: np.ndarray):
-    """Predict disturbance field on 3D grid using fitted GP."""
-    distances = np.linalg.norm(grid_points - cause_xyz, axis=1)
-    relative_positions = grid_points - cause_xyz
-
-    grid_features = np.column_stack([
-        distances,
-        relative_positions[:, 0],
-        relative_positions[:, 1],
-        relative_positions[:, 2]
-    ])
-
-    mean_pred, std_pred = gp.predict(grid_features, return_std=True)
-    return mean_pred, std_pred
+# Removed: predict_gp_field_3d function
+# This is no longer needed since we eliminated the global GP step
 
 
 def _normalize_percentile(values: np.ndarray, lower_pct: float, upper_pct: float):
@@ -324,7 +277,7 @@ def plot_2d_points(xyz: np.ndarray, nominal_points_used: np.ndarray, disturbance
     return fig
 
 
-def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, ax, num_levels: int = 5):
+def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, ax, num_levels: int = 8):
     """Draw translucent isosurfaces into provided 3D axis using marching cubes (if available), without mesh edges."""
     if not _HAS_SKIMAGE:
         raise RuntimeError("skimage not available for isosurface rendering")
@@ -333,7 +286,7 @@ def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, 
     field_3d = mean_field.reshape(Ny, Nx, Nz)
     volume = np.transpose(field_3d, (2, 0, 1))
 
-    # Compute levels based on actual data range
+    # Compute levels based on actual data range with more granularity
     field_min, field_max = mean_field.min(), mean_field.max()
     field_range = field_max - field_min
     
@@ -341,11 +294,12 @@ def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, 
         print("Warning: Field has very low variance, skipping isosurfaces")
         return
     
-    # Use percentiles of the actual data range
-    levels = np.percentile(mean_field, [60, 72, 84, 92, 97])[:num_levels]
+    # Use more percentiles for better visualization
+    percentiles = np.linspace(50, 98, num_levels)
+    levels = np.percentile(mean_field, percentiles)
     
-    # Ensure levels are within the volume range
-    levels = np.clip(levels, field_min + 0.01 * field_range, field_max - 0.01 * field_range)
+    # Ensure levels are within the volume range with some padding
+    levels = np.clip(levels, field_min + 0.005 * field_range, field_max - 0.005 * field_range)
 
     dx = xs[1] - xs[0] if len(xs) > 1 else 1.0
     dy = ys[1] - ys[0] if len(ys) > 1 else 1.0
@@ -353,18 +307,26 @@ def plot_3d_isosurfaces(mean_field: np.ndarray, xs: np.ndarray, ys: np.ndarray, 
 
     xmin, ymin, zmin = xs.min(), ys.min(), zs.min()
 
-    colors = ['#2196F3', '#4CAF50', '#FFC107', '#FF9800', '#F44336']
-    alphas = [0.2, 0.22, 0.22, 0.22, 0.22]
+    # More varied colors and alphas for better visualization
+    colors = ['#2196F3', '#4CAF50', '#FFC107', '#FF9800', '#F44336', '#9C27B0', '#00BCD4', '#795548']
+    alphas = [0.15, 0.18, 0.20, 0.22, 0.25, 0.28, 0.30, 0.32]
 
-    for level, color, alpha in zip(levels, colors, alphas):
+    print(f"Rendering {len(levels)} isosurfaces at levels: {levels}")
+    
+    for i, (level, color, alpha) in enumerate(zip(levels, colors, alphas)):
         try:
             verts, faces, normals, values = _sk_measure.marching_cubes(volume=volume, level=level, spacing=(dz, dy, dx))
-            verts_world = np.column_stack([
-                verts[:, 2] + xmin,
-                verts[:, 1] + ymin,
-                verts[:, 0] + zmin,
-            ])
-            ax.plot_trisurf(verts_world[:, 0], verts_world[:, 1], faces, verts_world[:, 2], color=color, lw=0.0, edgecolor='none', alpha=alpha)
+            if len(verts) > 0:
+                verts_world = np.column_stack([
+                    verts[:, 2] + xmin,
+                    verts[:, 1] + ymin,
+                    verts[:, 0] + zmin,
+                ])
+                ax.plot_trisurf(verts_world[:, 0], verts_world[:, 1], faces, verts_world[:, 2], 
+                              color=color, lw=0.0, edgecolor='none', alpha=alpha)
+                print(f"  Isosurface {i+1}: level={level:.4f}, vertices={len(verts)}")
+            else:
+                print(f"  Isosurface {i+1}: level={level:.4f} - no vertices found")
         except Exception as e:
             print(f"Isosurface at level {level:.4f} failed: {e}")
 
@@ -611,12 +573,15 @@ def plot_3d_pyvista_volume_with_points(xs, ys, zs, mean_field, xyz, cause_points
     grid.cell_data['disturbance'] = volume.ravel(order='F')
 
     Vn, vmin, vmax = _normalize_percentile(mean_field, *PERCENTILE_RANGE_3D)
-    levels = np.percentile(Vn, [60, 72, 84, 92, 97])
+    # More isosurfaces for better visualization
+    levels = np.percentile(Vn, [55, 65, 75, 82, 88, 93, 96, 98])
     raw_levels = vmin + levels * (vmax - vmin)
+
+    print(f"PyVista: Rendering {len(raw_levels)} isosurfaces at levels: {raw_levels}")
 
     try:
         contour = grid.contour(isosurfaces=list(raw_levels), scalars='disturbance')
-        plotter.add_mesh(contour, opacity=0.24, cmap='viridis', show_edges=False)
+        plotter.add_mesh(contour, opacity=0.20, cmap='viridis', show_edges=False)
     except Exception as e:
         print(f"PyVista contour failed: {e}; falling back to volume rendering")
         plotter.add_volume(grid, scalars='disturbance', opacity='sigmoid', cmap='viridis', shade=True)
@@ -716,43 +681,50 @@ def _sum_of_anisotropic_rbf(grid_points: np.ndarray, centers: np.ndarray, lxy: f
     return phi
 
 
-def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.ndarray, cause_points: np.ndarray):
-    """Fit parameters of identical anisotropic kernel centered at each cause point such that
-    A * sum_j exp(-0.5 * Q_l(x - c_j)) + b approximates the existing GP mean field.
+# Removed: fit_extended_cause_superposition function
+# This is no longer needed since we eliminated the global GP step and now fit directly to disturbances
 
-    Uses BFGS optimization over lxy and lz, with closed-form solution for A and b.
 
-    Returns dict with best params and the reconstructed field.
+def fit_direct_superposition_to_disturbances(nominal_points: np.ndarray, disturbance_magnitudes: np.ndarray, cause_points: np.ndarray):
+    """Directly fit superposed identical anisotropic kernel to observed disturbances.
+    
+    Fits A * sum_j exp(-0.5 * Q_l(x - c_j)) + b to match the actual disturbance measurements
+    at nominal trajectory points, where Q_l is the anisotropic distance metric.
+    
+    Returns dict with best params and the reconstructed disturbance field.
     """
     if cause_points.size == 0:
-        print("Warning: No cause points to fit extended model; skipping.")
+        print("Warning: No cause points to fit direct model; skipping.")
         return {
             'lxy': None,
             'lz': None,
             'A': 0.0,
             'b': 0.0,
-            'recon': np.zeros_like(mean_field),
-            'mse': float('inf')
+            'recon': np.zeros_like(disturbance_magnitudes),
+            'mse': float('inf'),
+            'r2_score': 0.0,
+            'mae': float('inf'),
+            'rmse': float('inf')
         }
 
-    target = mean_field.astype(float)
+    target = disturbance_magnitudes.astype(float)
     
     # Normalize target to have better numerical properties
     target_mean = np.mean(target)
     target_std = np.std(target)
     if target_std < 1e-8:
-        print("Warning: Target field has very low variance, fitting may be unstable")
+        print("Warning: Target disturbances have very low variance, fitting may be unstable")
         target_std = 1.0
     target_norm = (target - target_mean) / target_std
     
     def objective(params):
-        """Objective function: MSE between target and reconstructed field."""
+        """Objective function: MSE between target disturbances and reconstructed field."""
         lxy, lz = params
         # Ensure positive length scales
         lxy = max(lxy, 0.01)
         lz = max(lz, 0.01)
         
-        phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+        phi = _sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy, lz=lz)
         
         # Normalize phi for better conditioning
         phi_mean = np.mean(phi)
@@ -776,92 +748,29 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
         mse = np.mean((recon_norm - target_norm) ** 2)
         
         # Add regularization to prefer reasonable length scales
-        reg_term = 0.1 * (1.0 / (lxy + 0.1) + 1.0 / (lz + 0.1))
+        reg_term = 0.05 * (1.0 / (lxy + 0.05) + 1.0 / (lz + 0.05))
         return mse + reg_term
     
-    def objective_with_grad(params):
-        """Objective function with gradient for faster convergence."""
-        lxy, lz = params
-        # Ensure positive length scales
-        lxy = max(lxy, 0.01)
-        lz = max(lz, 0.01)
-        
-        phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
-        
-        # Normalize phi
-        phi_mean = np.mean(phi)
-        phi_std = np.std(phi)
-        if phi_std < 1e-8:
-            return float('inf'), np.array([0.0, 0.0])
-        phi_norm = (phi - phi_mean) / phi_std
-        
-        # Closed-form solution for A and b
-        n = phi_norm.shape[0]
-        X = np.column_stack([phi_norm, np.ones(n, dtype=float)])
-        try:
-            XtX = X.T @ X
-            XtY = X.T @ target_norm
-            params_ab = np.linalg.solve(XtX, XtY)
-        except np.linalg.LinAlgError:
-            params_ab = np.linalg.lstsq(X, target_norm, rcond=None)[0]
-        
-        A_norm, b_norm = params_ab[0], params_ab[1]
-        recon_norm = A_norm * phi_norm + b_norm
-        residual = recon_norm - target_norm
-        
-        # Compute gradients w.r.t. lxy and lz
-        grad_phi_lxy = np.zeros_like(phi)
-        grad_phi_lz = np.zeros_like(phi)
-        
-        chunk = 200000
-        inv_lxy3 = 1.0 / (lxy * lxy * lxy + 1e-12)
-        inv_lz3 = 1.0 / (lz * lz * lz + 1e-12)
-        
-        for start in range(0, grid_points.shape[0], chunk):
-            end = min(grid_points.shape[0], start + chunk)
-            gp_chunk = grid_points[start:end]
-            
-            dx = gp_chunk[:, None, 0] - cause_points[None, :, 0]
-            dy = gp_chunk[:, None, 1] - cause_points[None, :, 1]
-            dz = gp_chunk[:, None, 2] - cause_points[None, :, 2]
-            
-            d2_xy = dx * dx + dy * dy
-            d2_z = dz * dz
-            
-            exp_term = np.exp(-0.5 * (d2_xy / (lxy * lxy) + d2_z / (lz * lz)))
-            
-            # Gradients
-            grad_phi_lxy[start:end] = (d2_xy * inv_lxy3 * exp_term).sum(axis=1)
-            grad_phi_lz[start:end] = (d2_z * inv_lz3 * exp_term).sum(axis=1)
-        
-        # Normalize gradients
-        grad_phi_lxy = (grad_phi_lxy - np.mean(grad_phi_lxy)) / phi_std
-        grad_phi_lz = (grad_phi_lz - np.mean(grad_phi_lz)) / phi_std
-        
-        # Gradient of MSE w.r.t. lxy and lz
-        grad_lxy = 2 * A_norm * np.mean(residual * grad_phi_lxy)
-        grad_lz = 2 * A_norm * np.mean(residual * grad_phi_lz)
-        
-        # Add regularization gradients
-        grad_lxy += 0.1 / (lxy + 0.1)**2
-        grad_lz += 0.1 / (lz + 0.1)**2
-        
-        mse = np.mean(residual ** 2) + 0.1 * (1.0 / (lxy + 0.1) + 1.0 / (lz + 0.1))
-        return mse, np.array([grad_lxy, grad_lz])
-    
-    # Multiple initial guesses to avoid local minima
+    # More comprehensive initial guesses covering different scales
     initial_guesses = [
+        [0.02, 0.02],   # Very small scales
         [0.05, 0.05],   # Small scales
         [0.1, 0.1],     # Medium scales
         [0.2, 0.2],     # Large scales
-        [0.1, 0.05],    # Anisotropic
-        [0.05, 0.1],    # Anisotropic
+        [0.3, 0.3],     # Very large scales
+        [0.1, 0.05],    # Anisotropic (xy > z)
+        [0.05, 0.1],    # Anisotropic (z > xy)
+        [0.15, 0.08],   # Anisotropic (xy > z)
+        [0.08, 0.15],   # Anisotropic (z > xy)
     ]
     
-    # Bounds for length scales (positive)
-    bounds = [(0.01, 0.5), (0.01, 0.5)]
+    # Wider bounds for better exploration
+    bounds = [(0.005, 1.0), (0.005, 1.0)]
     
-    print("Optimizing length scales with BFGS...")
+    print("Direct optimization: fitting superposed model to observed disturbances...")
+    print(f"Target disturbances - min: {target.min():.6f}, max: {target.max():.6f}, mean: {target_mean:.6f}, std: {target_std:.6f}")
+    print(f"Number of cause points: {cause_points.shape[0]}")
+    print(f"Number of nominal points: {nominal_points.shape[0]}")
     
     best_result = None
     best_mse = float('inf')
@@ -875,28 +784,28 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
                 x0, 
                 method='L-BFGS-B',
                 bounds=bounds,
-                options={'maxiter': 50, 'ftol': 1e-6}
+                options={'maxiter': 100, 'ftol': 1e-8, 'gtol': 1e-8}
             )
             
             if result.success and result.fun < best_mse:
                 best_result = result
                 best_mse = result.fun
-                print(f"    New best: MSE={result.fun:.6f}, lxy={result.x[0]:.3f}, lz={result.x[1]:.3f}")
+                print(f"    New best: MSE={result.fun:.8f}, lxy={result.x[0]:.4f}, lz={result.x[1]:.4f}")
             
         except Exception as e:
             print(f"    Failed: {e}")
     
     if best_result is None:
         print("All optimization attempts failed. Falling back to grid search.")
-        # Fallback to original grid search
-        lxy_grid = np.array([0.04, 0.06, 0.08, 0.12, 0.18, 0.25], dtype=float)
-        lz_grid = np.array([0.03, 0.06, 0.10, 0.16, 0.24], dtype=float)
+        # More comprehensive grid search
+        lxy_grid = np.array([0.01, 0.02, 0.04, 0.06, 0.08, 0.12, 0.18, 0.25, 0.35, 0.5], dtype=float)
+        lz_grid = np.array([0.01, 0.02, 0.04, 0.06, 0.10, 0.16, 0.24, 0.35, 0.5], dtype=float)
         
         best = {'mse': float('inf')}
         
         for lxy in lxy_grid:
             for lz in lz_grid:
-                phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+                phi = _sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy, lz=lz)
                 n = phi.shape[0]
                 X = np.column_stack([phi, np.ones(n, dtype=float)])
                 try:
@@ -911,12 +820,12 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
                 if mse < best['mse']:
                     best = {'lxy': lxy, 'lz': lz, 'A': A, 'b': b, 'recon': recon, 'mse': mse}
         
-        print(f"Grid search fallback -> lxy: {best['lxy']:.3f} m, lz: {best['lz']:.3f} m, A: {best['A']:.4f}, b: {best['b']:.4f}, MSE: {best['mse']:.6f}")
+        print(f"Grid search fallback -> lxy: {best['lxy']:.4f} m, lz: {best['lz']:.4f} m, A: {best['A']:.6f}, b: {best['b']:.6f}, MSE: {best['mse']:.8f}")
         return best
     
     # Extract optimal parameters
     lxy_opt, lz_opt = best_result.x
-    phi_opt = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy_opt, lz=lz_opt)
+    phi_opt = _sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy_opt, lz=lz_opt)
     
     # Final closed-form solution for A and b (using original scale)
     n = phi_opt.shape[0]
@@ -930,12 +839,37 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
     
     A_opt, b_opt = float(params_ab[0]), float(params_ab[1])
     recon_opt = A_opt * phi_opt + b_opt
-    mse_opt = float(np.mean((recon_opt - target) ** 2))
     
-    print(f"Optimized fit -> lxy: {lxy_opt:.3f} m, lz: {lz_opt:.3f} m, A: {A_opt:.4f}, b: {b_opt:.4f}, MSE: {mse_opt:.6f}")
-    print(f"Optimization iterations: {best_result.nit}, function evaluations: {best_result.nfev}")
-    print(f"Target field stats - mean: {target_mean:.4f}, std: {target_std:.4f}")
-    print(f"Reconstructed field stats - mean: {np.mean(recon_opt):.4f}, std: {np.std(recon_opt):.4f}")
+    # Comprehensive error metrics
+    mse_opt = float(np.mean((recon_opt - target) ** 2))
+    rmse_opt = float(np.sqrt(mse_opt))
+    mae_opt = float(np.mean(np.abs(recon_opt - target)))
+    
+    # R-squared score
+    ss_res = np.sum((target - recon_opt) ** 2)
+    ss_tot = np.sum((target - np.mean(target)) ** 2)
+    r2_score = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+    
+    print(f"\n=== OPTIMIZATION RESULTS ===")
+    print(f"Optimal parameters:")
+    print(f"  lxy: {lxy_opt:.4f} m")
+    print(f"  lz:  {lz_opt:.4f} m")
+    print(f"  A:   {A_opt:.6f}")
+    print(f"  b:   {b_opt:.6f}")
+    print(f"\nError metrics:")
+    print(f"  MSE:  {mse_opt:.8f}")
+    print(f"  RMSE: {rmse_opt:.6f}")
+    print(f"  MAE:  {mae_opt:.6f}")
+    print(f"  R²:   {r2_score:.4f}")
+    print(f"\nOptimization details:")
+    print(f"  Iterations: {best_result.nit}")
+    print(f"  Function evaluations: {best_result.nfev}")
+    print(f"  Success: {best_result.success}")
+    print(f"  Message: {best_result.message}")
+    print(f"\nField statistics:")
+    print(f"  Target - mean: {target_mean:.6f}, std: {target_std:.6f}")
+    print(f"  Reconstructed - mean: {np.mean(recon_opt):.6f}, std: {np.std(recon_opt):.6f}")
+    print(f"  Residual - mean: {np.mean(recon_opt - target):.6f}, std: {np.std(recon_opt - target):.6f}")
     
     return {
         'lxy': lxy_opt,
@@ -944,8 +878,31 @@ def fit_extended_cause_superposition(grid_points: np.ndarray, mean_field: np.nda
         'b': b_opt,
         'recon': recon_opt,
         'mse': mse_opt,
+        'rmse': rmse_opt,
+        'mae': mae_opt,
+        'r2_score': r2_score,
         'optimization_result': best_result
     }
+
+
+def predict_direct_field_3d(fit_params: dict, grid_points: np.ndarray, cause_points: np.ndarray):
+    """Predict disturbance field on 3D grid using the directly fitted superposed model."""
+    if fit_params is None or 'lxy' not in fit_params or fit_params['lxy'] is None:
+        return np.zeros(grid_points.shape[0]), np.zeros(grid_points.shape[0])
+    
+    lxy = fit_params['lxy']
+    lz = fit_params['lz']
+    A = fit_params['A']
+    b = fit_params['b']
+    
+    phi = _sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+    mean_pred = A * phi + b
+    
+    # For simplicity, we'll use a constant uncertainty estimate
+    # In a more sophisticated approach, you could model the uncertainty based on distance to training points
+    std_pred = np.full(grid_points.shape[0], 0.1 * np.std(mean_pred))
+    
+    return mean_pred, std_pred
 
 
 def main():
@@ -983,96 +940,109 @@ def main():
         nominal_points_used = xyz
 
     print(f"Disturbance magnitudes - min: {disturbance_magnitudes.min():.4f}, max: {disturbance_magnitudes.max():.4f}")
-    print(f"Using {len(nominal_points_used)} nominal points for GP training")
-
-    print("Creating cause-centric features for nominal points...")
-    features, final_cause_xyz = create_cause_centric_features_nominal(nominal_points_used, cause_xyz)
-
-    print("Fitting Gaussian Process (3D)...")
-    gp = fit_cause_centric_gp(features, disturbance_magnitudes)
-
-    print("Creating 3D prediction grid...")
-    Xg, Yg, Zg, grid_points, xs, ys, zs = create_3d_prediction_grid(xyz, final_cause_xyz, resolution_xy=0.06, resolution_z=0.06)
-
-    print("Predicting 3D disturbance field...")
-    mean_pred, std_pred = predict_gp_field_3d(gp, grid_points, final_cause_xyz)
+    print(f"Using {len(nominal_points_used)} nominal points for direct fitting")
 
     # ----------------------------
-    # Extended-cause fitting
+    # Direct fitting to disturbances (eliminating global GP)
     # ----------------------------
     print("Loading cause object point cloud (PCD)...")
     cause_points = _load_pcd_points(PCD_PATH)
     print(f"Loaded {cause_points.shape[0]} cause points from PCD")
 
-    fit = None
-    recon_field = None
+    direct_fit = None
     if cause_points.size > 0:
-        # Fit identical anisotropic kernel centered at each cause point to approximate mean_pred
-        print("Fitting superposed identical-kernel model to match 3D GP field...")
-        fit = fit_extended_cause_superposition(grid_points, mean_pred, cause_points)
-        recon_field = fit['recon']
-        # Quick diagnostic slices comparison (original vs reconstructed vs residual)
+        # Directly fit superposed model to observed disturbances
+        print("Directly fitting superposed identical-kernel model to observed disturbances...")
+        direct_fit = fit_direct_superposition_to_disturbances(nominal_points_used, disturbance_magnitudes, cause_points)
+        
+        # Quick diagnostic: compare fitted vs observed disturbances
         try:
-            Ny, Nx, Nz = len(ys), len(xs), len(zs)
-            vol_orig = mean_pred.reshape(Ny, Nx, Nz)
-            vol_recon = recon_field.reshape(Ny, Nx, Nz)
-            kz = Nz // 2
-            fig_cmp, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-            im_a = axes[0].imshow(vol_orig[:, :, kz], extent=(xs.min(), xs.max(), ys.min(), ys.max()), origin='lower', cmap='viridis')
-            axes[0].set_title('GP mean (XY mid)')
-            im_b = axes[1].imshow(vol_recon[:, :, kz], extent=(xs.min(), xs.max(), ys.min(), ys.max()), origin='lower', cmap='viridis')
-            axes[1].set_title('Superposed model (XY mid)')
-            im_c = axes[2].imshow((vol_recon - vol_orig)[:, :, kz], extent=(xs.min(), xs.max(), ys.min(), ys.max()), origin='lower', cmap='coolwarm')
-            axes[2].set_title('Residual (recon - GP)')
-            for ax in axes:
-                ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_aspect('equal')
-            fig_cmp.colorbar(im_a, ax=axes[0], fraction=0.046, pad=0.04)
-            fig_cmp.colorbar(im_b, ax=axes[1], fraction=0.046, pad=0.04)
-            fig_cmp.colorbar(im_c, ax=axes[2], fraction=0.046, pad=0.04)
-            fig_cmp.tight_layout()
+            fig_direct, axes = plt.subplots(2, 2, figsize=(15, 12))
+            
+            # Scatter plot of fitted vs observed
+            axes[0,0].scatter(disturbance_magnitudes, direct_fit['recon'], alpha=0.7, s=30)
+            axes[0,0].plot([disturbance_magnitudes.min(), disturbance_magnitudes.max()], 
+                        [disturbance_magnitudes.min(), disturbance_magnitudes.max()], 'r--', alpha=0.8, linewidth=2)
+            axes[0,0].set_xlabel('Observed disturbances')
+            axes[0,0].set_ylabel('Fitted disturbances')
+            axes[0,0].set_title(f'Direct Fit: Observed vs Fitted (R² = {direct_fit["r2_score"]:.4f})')
+            axes[0,0].grid(True, alpha=0.3)
+            
+            # Residual plot
+            residuals = direct_fit['recon'] - disturbance_magnitudes
+            axes[0,1].scatter(direct_fit['recon'], residuals, alpha=0.7, s=30)
+            axes[0,1].axhline(y=0, color='r', linestyle='--', alpha=0.8, linewidth=2)
+            axes[0,1].set_xlabel('Fitted disturbances')
+            axes[0,1].set_ylabel('Residuals (fitted - observed)')
+            axes[0,1].set_title(f'Residual Plot (MAE = {direct_fit["mae"]:.6f})')
+            axes[0,1].grid(True, alpha=0.3)
+            
+            # Histogram of residuals
+            axes[1,0].hist(residuals, bins=10, alpha=0.7, edgecolor='black')
+            axes[1,0].axvline(x=0, color='r', linestyle='--', alpha=0.8, linewidth=2)
+            axes[1,0].set_xlabel('Residuals')
+            axes[1,0].set_ylabel('Frequency')
+            axes[1,0].set_title(f'Residual Distribution (std = {np.std(residuals):.6f})')
+            axes[1,0].grid(True, alpha=0.3)
+            
+            # Parameter summary
+            axes[1,1].text(0.1, 0.9, f'Optimal Parameters:', fontsize=12, fontweight='bold', transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.8, f'lxy = {direct_fit["lxy"]:.4f} m', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.7, f'lz = {direct_fit["lz"]:.4f} m', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.6, f'A = {direct_fit["A"]:.6f}', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.5, f'b = {direct_fit["b"]:.6f}', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.4, f'', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.3, f'Error Metrics:', fontsize=12, fontweight='bold', transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.2, f'MSE = {direct_fit["mse"]:.8f}', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.1, f'RMSE = {direct_fit["rmse"]:.6f}', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].text(0.1, 0.0, f'R² = {direct_fit["r2_score"]:.4f}', fontsize=11, transform=axes[1,1].transAxes)
+            axes[1,1].set_xlim(0, 1)
+            axes[1,1].set_ylim(0, 1)
+            axes[1,1].set_title('Model Summary')
+            axes[1,1].axis('off')
+            
+            fig_direct.tight_layout()
+            
         except Exception as e:
-            print(f"Comparison visualization failed: {e}")
+            print(f"Direct fit diagnostic visualization failed: {e}")
     else:
-        print("Skipping extended-cause fit (no PCD points).")
+        print("Skipping direct fitting (no PCD points).")
+
+    print("Creating 3D prediction grid...")
+    Xg, Yg, Zg, grid_points, xs, ys, zs = create_3d_prediction_grid(xyz, cause_xyz, resolution_xy=0.06, resolution_z=0.06)
+
+    print("Predicting 3D disturbance field using direct fit...")
+    if direct_fit is not None:
+        mean_pred, std_pred = predict_direct_field_3d(direct_fit, grid_points, cause_points)
+    else:
+        # Fallback: use zeros if no fit available
+        mean_pred = np.zeros(grid_points.shape[0])
+        std_pred = np.zeros(grid_points.shape[0])
 
     print("Rendering 2D points visualization (XY)...")
-    fig_2d = plot_2d_points(xyz, nominal_points_used, disturbance_magnitudes, final_cause_xyz, cause)
+    fig_2d = plot_2d_points(xyz, nominal_points_used, disturbance_magnitudes, cause_xyz, cause)
 
-    print("Rendering orthogonal GP slices (XY, YZ, ZX)...")
-    fig_slices = plot_gp_orthogonal_views(xs, ys, zs, mean_pred, xyz, final_cause_xyz)
+    print("Rendering orthogonal slices (XY, YZ, ZX)...")
+    fig_slices = plot_gp_orthogonal_views(xs, ys, zs, mean_pred, xyz, cause_xyz)
 
     # 3D figures:
-    # 1) Original GP 3D view (as before)
+    # 1) Direct fit 3D view
     used_pyvista = False
     if USE_PYVISTA and _HAS_PYVISTA:
         try:
-            print("Rendering 3D (PyVista) - Original GP...")
-            plot_3d_pyvista_volume(xs, ys, zs, mean_pred, xyz, final_cause_xyz, cause)
+            print("Rendering 3D (PyVista) - Direct fit...")
+            plot_3d_pyvista_volume_with_points(xs, ys, zs, mean_pred, xyz, cause_points)
             used_pyvista = True
         except Exception as e:
-            print(f"PyVista rendering failed (original): {e}. Falling back to Matplotlib.")
+            print(f"PyVista rendering failed (direct): {e}. Falling back to Matplotlib.")
 
     if not used_pyvista:
-        print("Rendering 3D (Matplotlib) - Original GP...")
-        fig_3d_orig = plot_3d_volume_with_overlays(Xg, Yg, Zg, mean_pred, xs, ys, zs, xyz, final_cause_xyz, cause, use_isosurfaces=True)
-
-    # 2) Reconstructed superposed field + cause points
-    used_pyvista_recon = False
-    if recon_field is not None:
-        if USE_PYVISTA and _HAS_PYVISTA:
-            try:
-                print("Rendering 3D (PyVista) - Reconstructed + points...")
-                plot_3d_pyvista_volume_with_points(xs, ys, zs, recon_field, xyz, cause_points)
-                used_pyvista_recon = True
-            except Exception as e:
-                print(f"PyVista rendering failed (reconstructed): {e}. Falling back to Matplotlib.")
-        if not used_pyvista_recon:
-            print("Rendering 3D (Matplotlib) - Reconstructed + points...")
-            fig_3d_recon = plot_3d_volume_with_cause_points(Xg, Yg, Zg, recon_field, xs, ys, zs, xyz, cause_points, use_isosurfaces=True)
+        print("Rendering 3D (Matplotlib) - Direct fit...")
+        fig_3d_direct = plot_3d_volume_with_cause_points(Xg, Yg, Zg, mean_pred, xs, ys, zs, xyz, cause_points, use_isosurfaces=True)
 
     plt.show()
 
-    print("3D GP analysis complete!")
+    print("Direct 3D disturbance field analysis complete!")
 
 
 if __name__ == "__main__":
