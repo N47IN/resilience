@@ -276,7 +276,7 @@ self.declare_parameter('enable_combined_segmentation', True)
 
 ### Runtime Configuration
 ```yaml
-# config/combined_segmentation_config.yaml
+# config/main_config.yaml
 objects: ["floor", "ceiling", "wall", "person", "chair", "table"]
 segmentation:
   apply_softmax: true
@@ -315,6 +315,178 @@ def query_vlm(self, image, narration_text):
     return response.choices[0].message.content.strip()
 ```
 
+# Path Planning Configuration
+
+The resilience system now supports two unified path planning modes through the `PathManager`:
+
+## Mode 1: JSON File Mode (`json_file`)
+
+Loads the nominal path from a JSON file and publishes it to a standard ROS2 global path topic.
+
+**Configuration:**
+```yaml
+path_mode:
+  mode: "json_file"
+  global_path_topic: "/global_path"
+  json_file:
+    nominal_path_file: "adjusted_nominal_spline.json"  # Relative to assets directory
+    publish_rate: 1.0  # Hz - How often to publish the nominal path
+```
+
+**How it works:**
+1. Loads the nominal trajectory from `assets/adjusted_nominal_spline.json`
+2. Publishes the path to `/global_path` topic as `nav_msgs/Path`
+3. Uses the same path for drift detection and breach analysis
+4. Other nodes can subscribe to `/global_path` to get the nominal trajectory
+
+## Mode 2: External Planner Mode (`external_planner`)
+
+Listens to an external planner's global path topic for dynamic path updates.
+
+**Configuration:**
+```yaml
+path_mode:
+  mode: "external_planner"
+  global_path_topic: "/global_path"
+  external_planner:
+    timeout_seconds: 10.0  # How long to wait for external path before warning
+    require_path: true  # Whether to require path before starting drift detection
+    thresholds:
+      soft_threshold: 0.1  # Default soft threshold for breach detection
+      hard_threshold: 0.25  # Default hard threshold for breach detection
+```
+
+**How it works:**
+1. Subscribes to `/global_path` topic for external path updates
+2. Converts incoming `nav_msgs/Path` messages to internal format
+3. Uses the external path for drift detection and breach analysis
+4. Supports dynamic path updates from external planners
+5. **Uses configurable thresholds** since JSON calibration data is not available
+
+## Path Readiness Requirement
+
+The resilience system now **requires a valid path to be available** before starting main functionality (drift detection, breach analysis, etc.).
+
+### **JSON Mode Behavior**
+1. ✅ Loads path from `assets/adjusted_nominal_spline.json`
+2. ✅ Publishes path to `/global_path` topic
+3. ✅ Waits for path to be ready before starting functionality
+4. ✅ Uses calibrated thresholds from JSON file
+
+### **External Planner Mode Behavior**
+1. ✅ **Continuously monitors** `/global_path` topic for external path updates
+2. ✅ **Starts functionality immediately** when first path is received (no blocking)
+3. ✅ Converts incoming `nav_msgs/Path` messages to internal format
+4. ✅ Uses the external path for drift detection and breach analysis
+5. ✅ Supports dynamic path updates from external planners
+6. ✅ **Uses configurable thresholds** since JSON calibration data is not available
+
+### **Configuration Options**
+
+**Require Path** (recommended):
+```yaml
+path_mode:
+  mode: "external_planner"
+  external_planner:
+    require_path: true  # Drift detection disabled if no path
+    timeout_seconds: 30.0
+```
+
+**Allow Operation Without Path**:
+```yaml
+path_mode:
+  mode: "external_planner"
+  external_planner:
+    require_path: false  # Drift detection may be unreliable
+    timeout_seconds: 10.0
+```
+
+### **Status Messages**
+
+The system will show clear status messages:
+
+**JSON Mode:**
+```
+Waiting for path to be ready...
+✓ Path ready - starting main functionality
+Path ready: YES
+Drift detection: ENABLED
+```
+
+**External Planner Mode (initial):**
+```
+External planner mode: Will start functionality when path is received
+Path ready: NO
+Drift detection: DISABLED
+```
+
+**External Planner Mode (when path received):**
+```
+✓ External path received - enabling drift detection
+✓ Updated narration manager with external path points
+Path ready: YES
+Drift detection: ENABLED
+```
+
+## Threshold Handling
+
+**JSON Mode**: Thresholds are automatically loaded from the JSON file's `calibration` section:
+```json
+{
+  "calibration": {
+    "soft_threshold": 0.100,
+    "hard_threshold": 0.257,
+    "avg_drift": 0.05346227232031908
+  }
+}
+```
+
+**External Planner Mode**: Thresholds must be configured in the YAML config since JSON calibration data is not available:
+```yaml
+external_planner:
+  thresholds:
+    soft_threshold: 0.1  # Default soft threshold
+    hard_threshold: 0.25  # Default hard threshold
+```
+
+**Dynamic Threshold Updates**: You can also update thresholds programmatically:
+```python
+path_manager.update_thresholds(soft_threshold=0.15, hard_threshold=0.3)
+```
+
+## Unified Interface
+
+Both modes provide the same interface for drift detection:
+- `compute_drift(pos)` - Calculate drift from current position to nearest path point
+- `is_breach(drift)` - Check if drift exceeds threshold
+- `get_thresholds()` - Get soft and hard drift thresholds
+- `get_nominal_points()` - Get path points for visualization
+
+## Switching Between Modes
+
+To switch between modes, simply change the `mode` parameter in the configuration:
+
+```yaml
+# For JSON file mode
+path_mode:
+  mode: "json_file"
+  # ... other config
+
+# For external planner mode  
+path_mode:
+  mode: "external_planner"
+  # ... other config
+```
+
+## Testing
+
+Use the test script to verify both modes work correctly:
+
+```bash
+python3 resilience/scripts/test_path_manager.py
+```
+
+This will test both JSON file loading and external topic listening functionality.
 
 ### Runtime Execution
 ```bash

@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 warnings.filterwarnings('ignore')
 
-from resilience.drift_calculator import DriftCalculator
+from resilience.path_manager import PathManager
 from resilience.naradio_processor import NARadioProcessor
 from resilience.narration_manager import NarrationManager
 from resilience.risk_buffer import RiskBufferManager
@@ -38,15 +38,6 @@ class ResilienceNode(Node):
     def __init__(self):
         super().__init__('resilience_node')
 
-        self.rgb_topic = '/robot_1/sensors/front_stereo/right/image'
-        self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
-        self.pose_topic = '/robot_1/sensors/front_stereo/pose'
-        self.camera_info_topic = '/robot_1/sensors/front_stereo/right/camera_info'
-        
-        from ament_index_python.packages import get_package_share_directory
-        package_dir = get_package_share_directory('resilience')
-        self.nominal_traj_file = os.path.join(package_dir, 'assets', 'adjusted_nominal_spline.json')
-        
         # Track recent VLM answers for smart semantic processing
         self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
@@ -62,23 +53,86 @@ class ResilienceNode(Node):
             ('radio_input_resolution', 512),
             ('enable_naradio_visualization', True),
             ('enable_combined_segmentation', True),
-            ('segmentation_config_path', ''),
-            ('publish_original_mask', True),
-            ('publish_refined_mask', True)
+            ('main_config_path', ''),
+            ('mapping_config_path', ''),
+            ('enable_voxel_mapping', True)
         ])
 
         param_values = self.get_parameters([
             'flip_y_axis', 'use_tf',
             'radio_model_version', 'radio_lang_model', 'radio_input_resolution',
             'enable_naradio_visualization', 'enable_combined_segmentation',
-            'segmentation_config_path', 'publish_original_mask', 'publish_refined_mask'
+            'main_config_path', 'mapping_config_path', 'enable_voxel_mapping'
         ])
         
         (self.flip_y_axis, self.use_tf,
          self.radio_model_version, self.radio_lang_model, self.radio_input_resolution,
          self.enable_naradio_visualization, self.enable_combined_segmentation,
-         self.segmentation_config_path, self.publish_original_mask, self.publish_refined_mask
+         self.main_config_path, self.mapping_config_path, self.enable_voxel_mapping
         ) = [p.value for p in param_values]
+
+        # Load topic configuration from main config
+        self.load_topic_configuration()
+
+    def load_topic_configuration(self):
+        """Load topic configuration from main config file."""
+        try:
+            import yaml
+            if self.main_config_path:
+                config_path = self.main_config_path
+            else:
+                # Use default config path
+                from ament_index_python.packages import get_package_share_directory
+                package_dir = get_package_share_directory('resilience')
+                config_path = os.path.join(package_dir, 'config', 'main_config.yaml')
+            
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            # Extract topic configuration
+            topics = config.get('topics', {})
+            
+            # Input topics
+            self.rgb_topic = topics.get('rgb_topic', '/robot_1/sensors/front_stereo/right/image')
+            self.depth_topic = topics.get('depth_topic', '/robot_1/sensors/front_stereo/depth/depth_registered')
+            self.pose_topic = topics.get('pose_topic', '/robot_1/sensors/front_stereo/pose')
+            self.camera_info_topic = topics.get('camera_info_topic', '/robot_1/sensors/front_stereo/right/camera_info')
+            self.vlm_answer_topic = topics.get('vlm_answer_topic', '/vlm_answer')
+            
+            # Output topics
+            self.drift_narration_topic = topics.get('drift_narration_topic', '/drift_narration')
+            self.narration_text_topic = topics.get('narration_text_topic', '/narration_text')
+            self.naradio_image_topic = topics.get('naradio_image_topic', '/naradio_image')
+            self.narration_image_topic = topics.get('narration_image_topic', '/narration_image')
+            self.vlm_similarity_map_topic = topics.get('vlm_similarity_map_topic', '/vlm_similarity_map')
+            self.vlm_similarity_colored_topic = topics.get('vlm_similarity_colored_topic', '/vlm_similarity_colored')
+            self.vlm_objects_legend_topic = topics.get('vlm_objects_legend_topic', '/vlm_objects_legend')
+            
+            # Extract path configuration
+            self.path_config = config.get('path_mode', {})
+            
+            print(f"Loaded topic configuration from: {config_path}")
+            print(f"Path mode: {self.path_config.get('mode', 'json_file')}")
+            
+        except Exception as e:
+            print(f"Error loading topic configuration: {e}")
+            # Fallback to default topics
+            self.rgb_topic = '/robot_1/sensors/front_stereo/right/image'
+            self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
+            self.pose_topic = '/robot_1/sensors/front_stereo/pose'
+            self.camera_info_topic = '/robot_1/sensors/front_stereo/right/camera_info'
+            self.vlm_answer_topic = '/vlm_answer'
+            self.drift_narration_topic = '/drift_narration'
+            self.narration_text_topic = '/narration_text'
+            self.naradio_image_topic = '/naradio_image'
+            self.narration_image_topic = '/narration_image'
+            self.vlm_similarity_map_topic = '/vlm_similarity_map'
+            self.vlm_similarity_colored_topic = '/vlm_similarity_colored'
+            self.vlm_objects_legend_topic = '/vlm_objects_legend'
+            
+            # Default path configuration
+            self.path_config = {'mode': 'json_file', 'global_path_topic': '/global_path'}
+            print("Using default topic configuration")
 
         self.init_components()
         
@@ -134,17 +188,74 @@ class ResilienceNode(Node):
         self.init_risk_buffer_manager()
         self.init_semantic_bridge()
         
+        # Wait for path to be ready before starting functionality
+        self.wait_for_path_ready()
+        
         self.start_naradio_thread()
         
         self.print_initialization_status()
 
+    def wait_for_path_ready(self):
+        """Wait for path to be ready before starting main functionality."""
+        print("Waiting for path to be ready...")
+        
+        # Get timeout from config
+        timeout_seconds = 30.0  # Default timeout
+        if self.path_manager.get_mode() == 'external_planner':
+            timeout_seconds = self.path_config.get('external_planner', {}).get('timeout_seconds', 30.0)
+        
+        # For external planner mode, check periodically instead of blocking
+        if self.path_manager.get_mode() == 'external_planner':
+            print(f"External planner mode: Waiting up to {timeout_seconds}s for path...")
+            start_time = time.time()
+            
+            while not self.path_manager.is_ready() and (time.time() - start_time) < timeout_seconds:
+                time.sleep(0.5)  # Check every 0.5 seconds
+                print(f"Still waiting for external path... ({time.time() - start_time:.1f}s elapsed)")
+            
+            if self.path_manager.is_ready():
+                print("✓ External path received - starting main functionality")
+                self.path_ready = True
+                
+                # Update narration manager with path points
+                nominal_points = self.path_manager.get_nominal_points_as_numpy()
+                if len(nominal_points) > 0:
+                    self.narration_manager.update_intended_trajectory(nominal_points)
+                    print("✓ Updated narration manager with external path points")
+            else:
+                print("✗ External path not received within timeout")
+                self.path_ready = False
+                self.disable_drift_detection = True
+        else:
+            # For JSON mode, use the original blocking wait
+            if self.path_manager.wait_for_path(timeout_seconds):
+                print("✓ Path ready - starting main functionality")
+                self.path_ready = True
+                
+                # Update narration manager with path points if not already set
+                nominal_points = self.path_manager.get_nominal_points_as_numpy()
+                if len(nominal_points) > 0 and len(self.narration_manager.intended_points) == 0:
+                    self.narration_manager.update_intended_trajectory(nominal_points)
+                    print("✓ Updated narration manager with path points")
+            else:
+                print("✗ Path not ready - some functionality may be limited")
+                self.path_ready = False
+                self.disable_drift_detection = True
+
+    def can_proceed_with_drift_detection(self) -> bool:
+        """Check if drift detection can proceed."""
+        return (hasattr(self, 'path_ready') and 
+                self.path_ready and 
+                (not hasattr(self, 'disable_drift_detection') or 
+                 not self.disable_drift_detection))
+
     def init_publishers(self):
         """Initialize publishers."""
         publishers = [
-            ('/drift_narration', String, 10),
-            ('/narration_text', String, 10),
-            ('/naradio_image', Image, 10),
-            ('/narration_image', Image, 10)
+            (self.drift_narration_topic, String, 10),
+            (self.narration_text_topic, String, 10),
+            (self.naradio_image_topic, Image, 10),
+            (self.narration_image_topic, Image, 10)
         ]
         
         self.narration_pub, self.narration_text_pub, self.naradio_image_pub, \
@@ -153,9 +264,9 @@ class ResilienceNode(Node):
         
         if self.enable_combined_segmentation:
             vlm_publishers = [
-                ('/vlm_similarity_map', Image, 10),
-                ('/vlm_similarity_colored', Image, 10),
-                ('/vlm_objects_legend', String, 10)
+                (self.vlm_similarity_map_topic, Image, 10),
+                (self.vlm_similarity_colored_topic, Image, 10),
+                (self.vlm_objects_legend_topic, String, 10)
             ]
             self.original_mask_pub, self.refined_mask_pub, self.segmentation_legend_pub = \
                 [self.create_publisher(msg_type, topic, qos) for topic, msg_type, qos in vlm_publishers]
@@ -167,7 +278,7 @@ class ResilienceNode(Node):
             (self.depth_topic, Image, self.depth_callback, 1),
             (self.pose_topic, PoseStamped, self.pose_callback, 10),
             (self.camera_info_topic, CameraInfo, self.camera_info_callback, 1),
-            ('/vlm_answer', String, self.vlm_answer_callback, 10)
+            (self.vlm_answer_topic, String, self.vlm_answer_callback, 10)
         ]
         
         for topic, msg_type, callback, qos in subscriptions:
@@ -176,7 +287,13 @@ class ResilienceNode(Node):
     def print_initialization_status(self):
         """Print initialization status."""
         print(f"Resilience Node initialized")
-        print(f"Soft threshold: {self.drift_calculator.soft_threshold}")
+        print(f"Path mode: {self.path_manager.get_mode()}")
+        print(f"Path topic: {self.path_manager.get_path_topic()}")
+        print(f"Path ready: {'YES' if hasattr(self, 'path_ready') and self.path_ready else 'NO'}")
+        if hasattr(self, 'disable_drift_detection'):
+            print(f"Drift detection: {'DISABLED' if self.disable_drift_detection else 'ENABLED'}")
+        print(f"Soft threshold: {self.path_manager.get_thresholds()[0]} ({self.path_manager.get_threshold_source()})")
+        print(f"Hard threshold: {self.path_manager.get_thresholds()[1]} ({self.path_manager.get_threshold_source()})")
         print(f"NARadio processing: {'ENABLED' if self.naradio_processor.is_ready() else 'DISABLED'}")
         print(f"Voxel Mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
         
@@ -229,8 +346,11 @@ class ResilienceNode(Node):
 
     def init_components(self):
         """Initialize resilience components."""
-        self.drift_calculator = DriftCalculator(self.nominal_traj_file)
-        soft_threshold, hard_threshold = self.drift_calculator.get_thresholds()
+        # Initialize path manager with unified interface
+        self.path_manager = PathManager(self, self.path_config)
+        
+        # Get thresholds from path manager
+        soft_threshold, hard_threshold = self.path_manager.get_thresholds()
         
         try:
             self.naradio_processor = NARadioProcessor(
@@ -239,7 +359,7 @@ class ResilienceNode(Node):
                 radio_input_resolution=self.radio_input_resolution,
                 enable_visualization=self.enable_naradio_visualization,
                 enable_combined_segmentation=self.enable_combined_segmentation,
-                segmentation_config_path=self.segmentation_config_path if self.segmentation_config_path else None
+                segmentation_config_path=self.main_config_path if self.main_config_path else None
             )
             
             if not self.naradio_processor.is_ready():
@@ -253,7 +373,7 @@ class ResilienceNode(Node):
                 else:
                     print("Warning: Combined segmentation initialization failed")
             
-            # Read voxel mapping parameter from segmentation config (non-blocking)
+            # Read voxel mapping parameter from main config (non-blocking)
             self.enable_voxel_mapping = False  # Default value
             if (self.naradio_processor.is_ready() and 
                 hasattr(self.naradio_processor, 'segmentation_config')):
@@ -275,7 +395,7 @@ class ResilienceNode(Node):
                 radio_input_resolution=self.radio_input_resolution,
                 enable_visualization=self.enable_naradio_visualization,
                 enable_combined_segmentation=self.enable_combined_segmentation,
-                segmentation_config_path=self.segmentation_config_path if self.segmentation_config_path else None
+                segmentation_config_path=self.main_config_path if self.main_config_path else None
             )
         
         self.narration_manager = NarrationManager(soft_threshold, hard_threshold)
@@ -285,8 +405,12 @@ class ResilienceNode(Node):
             self.enable_voxel_mapping = False
             print("Voxel mapping parameter not set, using default: False")
         
-        nominal_points = self.drift_calculator.get_nominal_points()
-        self.narration_manager.set_intended_trajectory(nominal_points)
+        # Set nominal trajectory points if available
+        nominal_points = self.path_manager.get_nominal_points_as_numpy()
+        if len(nominal_points) > 0:
+            self.narration_manager.set_intended_trajectory(nominal_points)
+        else:
+            print("Warning: No nominal points available for narration manager")
     
     def init_risk_buffer_manager(self):
         """Initialize risk buffer manager."""
@@ -312,11 +436,11 @@ class ResilienceNode(Node):
         """Initialize semantic hotspot bridge for communication with octomap."""
         try:
             if self.enable_voxel_mapping:
-                # Load semantic bridge config from segmentation config
-                segmentation_config = getattr(self.naradio_processor, 'segmentation_config', {})
+                # Load semantic bridge config from main config
+                main_config = getattr(self.naradio_processor, 'segmentation_config', {})
                 
                 from resilience.semantic_info_bridge import SemanticHotspotPublisher
-                self.semantic_bridge = SemanticHotspotPublisher(self, segmentation_config)
+                self.semantic_bridge = SemanticHotspotPublisher(self, main_config)
                 print("Semantic bridge initialized")
             else:
                 self.semantic_bridge = None
@@ -372,10 +496,19 @@ class ResilienceNode(Node):
         
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
+        # Check if path is ready and drift detection is enabled
+        if not self.can_proceed_with_drift_detection():
+            return
+        
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         pose_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
-        drift, nearest_idx = self.drift_calculator.compute_drift(pos)
+        # Check if path manager is ready
+        if not self.path_manager.is_ready():
+            print("Path manager not ready, skipping pose processing")
+            return
+        
+        drift, nearest_idx = self.path_manager.compute_drift(pos)
         self.breach_idx = nearest_idx
         
         with self.lock:
@@ -388,7 +521,7 @@ class ResilienceNode(Node):
 
 
 
-        breach_now = self.drift_calculator.is_breach(drift)
+        breach_now = self.path_manager.is_breach(drift)
         
         breach_started = not self.last_breach_state and breach_now
         breach_ended = self.last_breach_state and not breach_now
@@ -399,7 +532,7 @@ class ResilienceNode(Node):
             self.narration_manager.reset_narration_state()
             
             print("BREACH STARTED")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
+            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
             
             # Start new buffer when breach begins
             if self.risk_buffer_manager:
@@ -412,7 +545,7 @@ class ResilienceNode(Node):
             self.current_breach_active = False
             
             print("BREACH ENDED")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
+            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
             
             # Freeze buffers when breach ends
             if self.risk_buffer_manager:
@@ -426,7 +559,7 @@ class ResilienceNode(Node):
             self.narration_manager.reset_narration_state()
             
             print("BREACH DETECTED (already in progress)")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.drift_calculator.soft_threshold:.3f})")
+            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
             
             # Start new buffer when breach is detected
             if self.risk_buffer_manager:
@@ -547,7 +680,7 @@ class ResilienceNode(Node):
     def pose_to_transform_matrix(self, pose):
         """Create transform matrix from pose to origin."""
         T = np.eye(4)
-        initial_pose = self.drift_calculator.get_initial_pose()
+        initial_pose = self.path_manager.get_initial_pose()
         
         T[0, 3] = pose[0] - initial_pose[0]
         T[1, 3] = pose[1] - initial_pose[1] 
@@ -562,7 +695,7 @@ class ResilienceNode(Node):
             t.header.stamp = stamp
             t.header.frame_id = 'map'
             t.child_frame_id = 'robot'
-            initial_pose = self.drift_calculator.get_initial_pose()
+            initial_pose = self.path_manager.get_initial_pose()
             t.transform.translation.x = float(pos[0] - initial_pose[0])
             t.transform.translation.y = float(pos[1] - initial_pose[1])
             t.transform.translation.z = float(pos[2] - initial_pose[2])

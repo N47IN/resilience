@@ -77,7 +77,8 @@ class SemanticDepthOctoMapNode(Node):
 			('sync_buffer_seconds', 2.0),
 			# New: inactivity detection and export
 			('inactivity_threshold_seconds', 2.5),
-			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers')
+			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers'),
+			('mapping_config_path', '')
 		])
 
 		params = self.get_parameters([
@@ -87,7 +88,7 @@ class SemanticDepthOctoMapNode(Node):
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate', 'stats_publish_rate',
 			'pose_is_base_link', 'apply_optical_frame_rotation', 'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim',
 			'enable_semantic_mapping', 'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval',
-			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory'
+			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory', 'mapping_config_path'
 		])
 
 		# Extract parameter values
@@ -98,7 +99,56 @@ class SemanticDepthOctoMapNode(Node):
 		 self.pose_is_base_link, self.apply_optical_frame_rotation, self.cam_to_base_rpy_deg, self.cam_to_base_xyz,
 		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
 		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval,
-		 self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds, self.semantic_export_directory) = [p.value for p in params]
+		 self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds,
+		 self.semantic_export_directory, self.mapping_config_path) = [p.value for p in params]
+
+		# Load topic configuration from mapping config
+		self.load_topic_configuration()
+
+	def load_topic_configuration(self):
+		"""Load topic configuration from mapping config file."""
+		try:
+			import yaml
+			if self.mapping_config_path:
+				config_path = self.mapping_config_path
+			else:
+				# Use default config path
+				from ament_index_python.packages import get_package_share_directory
+				package_dir = get_package_share_directory('resilience')
+				config_path = os.path.join(package_dir, 'config', 'mapping_config.yaml')
+			
+			with open(config_path, 'r') as f:
+				config = yaml.safe_load(f)
+			
+			# Extract topic configuration
+			topics = config.get('topics', {})
+			
+			# Input topics
+			self.depth_topic = topics.get('depth_topic', '/robot_1/sensors/front_stereo/depth/depth_registered')
+			self.camera_info_topic = topics.get('camera_info_topic', '/robot_1/sensors/front_stereo/left/camera_info')
+			self.pose_topic = topics.get('pose_topic', '/robot_1/sensors/front_stereo/pose')
+			self.semantic_hotspots_topic = topics.get('semantic_hotspots_topic', '/semantic_hotspots')
+			
+			# Output topics
+			self.semantic_octomap_markers_topic = topics.get('semantic_octomap_markers_topic', '/semantic_octomap_markers')
+			self.semantic_octomap_stats_topic = topics.get('semantic_octomap_stats_topic', '/semantic_octomap_stats')
+			self.semantic_octomap_colored_cloud_topic = topics.get('semantic_octomap_colored_cloud_topic', '/semantic_octomap_colored_cloud')
+			self.semantic_voxels_only_topic = topics.get('semantic_voxels_only_topic', '/semantic_voxels_only')
+			
+			self.get_logger().info(f"Loaded topic configuration from: {config_path}")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error loading topic configuration: {e}")
+			# Fallback to default topics
+			self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
+			self.camera_info_topic = '/robot_1/sensors/front_stereo/left/camera_info'
+			self.pose_topic = '/robot_1/sensors/front_stereo/pose'
+			self.semantic_hotspots_topic = '/semantic_hotspots'
+			self.semantic_octomap_markers_topic = '/semantic_octomap_markers'
+			self.semantic_octomap_stats_topic = '/semantic_octomap_stats'
+			self.semantic_octomap_colored_cloud_topic = '/semantic_octomap_colored_cloud'
+			self.semantic_voxels_only_topic = '/semantic_voxels_only'
+			self.get_logger().info("Using default topic configuration")
 
 		# State
 		self.bridge = CvBridge()
@@ -160,13 +210,13 @@ class SemanticDepthOctoMapNode(Node):
 		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
 		# Subscribe to semantic hotspots (timestamp-only bridge)
 		if self.enable_semantic_mapping and self.enable_voxel_mapping:
-			self.create_subscription(String, '/semantic_hotspots', self.semantic_hotspot_callback, 10)
+			self.create_subscription(String, self.semantic_hotspots_topic, self.semantic_hotspot_callback, 10)
 
 		# Publishers
-		self.marker_pub = self.create_publisher(MarkerArray, '/semantic_octomap_markers', 10) if self.publish_markers else None
-		self.stats_pub = self.create_publisher(String, '/semantic_octomap_stats', 10) if self.publish_stats else None
-		self.cloud_pub = self.create_publisher(PointCloud2, '/semantic_octomap_colored_cloud', 10) if self.publish_colored_cloud else None
-		self.semantic_only_pub = self.create_publisher(PointCloud2, '/semantic_voxels_only', 10) if self.publish_colored_cloud else None
+		self.marker_pub = self.create_publisher(MarkerArray, self.semantic_octomap_markers_topic, 10) if self.publish_markers else None
+		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
+		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
+		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
 
 		self.get_logger().info(
 			f"SemanticDepthOctoMapNode initialized:\n"

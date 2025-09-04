@@ -30,6 +30,12 @@ class SemanticHotspotPublisher:
         self.min_area = self.config.get('min_hotspot_area', 100)
         self.publish_rate_limit = self.config.get('publish_rate_limit', 2.0)
         
+        # Load topic configuration
+        topics_config = self.config.get('topics', {})
+        self.semantic_hotspots_topic = topics_config.get('semantic_hotspots_topic', '/semantic_hotspots')
+        self.semantic_hotspot_mask_topic = topics_config.get('semantic_hotspot_mask_topic', '/semantic_hotspot_mask')
+        self.semantic_hotspot_overlay_topic = topics_config.get('semantic_hotspot_overlay_topic', '/semantic_hotspot_overlay')
+        
         # Rate limiting
         self.last_publish_time = 0.0
         
@@ -55,9 +61,9 @@ class SemanticHotspotPublisher:
         self.color_map_lock = threading.Lock()
         
         # Publishers
-        self.hotspot_data_pub = self.node.create_publisher(String, '/semantic_hotspots', 10)
-        self.hotspot_mask_pub = self.node.create_publisher(Image, '/semantic_hotspot_mask', 10)
-        self.hotspot_overlay_pub = self.node.create_publisher(Image, '/semantic_hotspot_overlay', 10)
+        self.hotspot_data_pub = self.node.create_publisher(String, self.semantic_hotspots_topic, 10)
+        self.hotspot_mask_pub = self.node.create_publisher(Image, self.semantic_hotspot_mask_topic, 10)
+        self.hotspot_overlay_pub = self.node.create_publisher(Image, self.semantic_hotspot_overlay_topic, 10)
         
         if hasattr(self.node, 'get_logger'):
             self.node.get_logger().info(f"Semantic bridge initialized - threshold: {self.hotspot_threshold}")

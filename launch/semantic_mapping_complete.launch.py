@@ -90,7 +90,7 @@ def generate_launch_description():
                             'enable_semantic_mapping': True,
                 'semantic_similarity_threshold': LaunchConfiguration('semantic_similarity_threshold'),
                 'buffers_directory': LaunchConfiguration('buffers_directory'),
-                'segmentation_config_path': '/home/navin/ros2_ws/src/resilience/config/combined_segmentation_config.yaml'
+                'main_config_path': '/home/navin/ros2_ws/src/resilience/config/main_config.yaml'
         }],
         remappings=[
             # Remap output topics to avoid conflicts

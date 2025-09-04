@@ -592,10 +592,10 @@ class NARadioProcessor:
             try:
                 from ament_index_python.packages import get_package_share_directory
                 package_dir = get_package_share_directory('resilience')
-                config_path = os.path.join(package_dir, 'config', 'combined_segmentation_config.yaml')
+                config_path = os.path.join(package_dir, 'config', 'main_config.yaml')
             except ImportError:
                 # Fallback for non-ROS environments
-                config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'combined_segmentation_config.yaml')
+                config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'main_config.yaml')
         
         try:
             with open(config_path, 'r') as f:

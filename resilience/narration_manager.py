@@ -59,6 +59,13 @@ class NarrationManager:
         self.intended_points = [TrajectoryPoint(position=pt, time=i) for i, pt in enumerate(nominal_2d)]
         print(f"[Narration] Initialized with {len(self.intended_points)} intended points, soft_threshold={self.soft_threshold}")
     
+    def update_intended_trajectory(self, nominal_points: np.ndarray):
+        """Update the intended trajectory points (for when path becomes available later)."""
+        if len(nominal_points) > 0:
+            self.set_intended_trajectory(nominal_points)
+        else:
+            print("[Narration] Warning: No nominal points provided for trajectory update")
+    
     def add_actual_point(self, pos: np.ndarray, timestamp: float, flip_y_axis: bool = False):
         """Add actual trajectory point, keeping only the last 25 points."""
         pos_2d = np.array([pos[0], pos[1]])
@@ -74,6 +81,11 @@ class NarrationManager:
         """Generate narration during active breach using only recent pose data."""
         try:
             if not self.actual_points:
+                return None
+            
+            # Check if intended trajectory is available
+            if not self.intended_points:
+                print("[Narration] Warning: No intended trajectory available for narration")
                 return None
             
             actual_len = len(self.actual_points)

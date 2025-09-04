@@ -1,0 +1,49 @@
+# Mapping Configuration for OctoMap Voxel Mapper
+# This file contains parameters for the OctoMap-based 3D mapping system
+
+# Topic Configuration
+topics:
+  # Input topics
+  depth_topic: "/robot_1/sensors/front_stereo/depth/depth_registered"
+  camera_info_topic: "/robot_1/sensors/front_stereo/left/camera_info"
+  pose_topic: "/robot_1/sensors/front_stereo/pose"
+  semantic_hotspots_topic: "/semantic_hotspots"
+  
+  # Output topics
+  semantic_octomap_markers_topic: "/semantic_octomap_markers"
+  semantic_octomap_stats_topic: "/semantic_octomap_stats"
+  semantic_octomap_colored_cloud_topic: "/semantic_octomap_colored_cloud"
+  semantic_voxels_only_topic: "/semantic_voxels_only"
+
+# Basic mapping parameters
+voxel_resolution: 0.1          # Voxel size in meters (smaller = higher resolution, more memory)
+max_range: 10.0                # Maximum sensor range in meters
+min_range: 0.1                 # Minimum sensor range in meters
+
+# OctoMap probability parameters
+probability_hit: 0.7           # Probability for occupied voxels (0.5-1.0)
+probability_miss: 0.4          # Probability for free voxels (0.0-0.5)
+occupancy_threshold: 0.5       # Threshold for occupied voxels (0.0-1.0)
+clamping_thres_min: 0.12      # Minimum clamping threshold
+clamping_thres_max: 0.97      # Maximum clamping threshold
+
+# Frame configuration
+map_frame: "map"
+sensor_frame: "camera_link"
+
+# Visualization settings
+publish_markers: true          # Publish 3D markers for RViz
+publish_grid: true            # Publish 2D occupancy grid
+publish_colored_cloud: true   # Publish colored point cloud
+
+# Processing options
+filter_outliers: true         # Enable statistical outlier removal
+downsample_voxels: true       # Enable voxel downsampling for performance
+
+# Performance tuning
+update_frequency: 2.0         # Map update frequency in Hz
+visualization_frequency: 1.0  # Visualization publishing frequency in Hz
+
+# Storage settings
+save_maps_enabled: true
+map_save_directory: "/home/navin/ros2_ws/src/buffers/octomaps" 

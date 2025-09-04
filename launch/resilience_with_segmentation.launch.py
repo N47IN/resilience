@@ -12,8 +12,9 @@ def generate_launch_description():
     # Get package directory
     package_dir = get_package_share_directory('resilience')
     
-    # Default config path
-    default_config_path = os.path.join(package_dir, 'config', 'combined_segmentation_config.yaml')
+    # Default config paths
+    default_main_config_path = os.path.join(package_dir, 'config', 'main_config.yaml')
+    default_mapping_config_path = os.path.join(package_dir, 'config', 'mapping_config.yaml')
     
     # Launch arguments
     enable_combined_segmentation_arg = DeclareLaunchArgument(
@@ -22,22 +23,16 @@ def generate_launch_description():
         description='Enable combined segmentation processing'
     )
     
-    segmentation_config_path_arg = DeclareLaunchArgument(
-        'segmentation_config_path',
-        default_value=default_config_path,
-        description='Path to combined segmentation configuration file'
+    main_config_path_arg = DeclareLaunchArgument(
+        'main_config_path',
+        default_value=default_main_config_path,
+        description='Path to main configuration file'
     )
     
-    publish_original_mask_arg = DeclareLaunchArgument(
-        'publish_original_mask',
-        default_value='true',
-        description='Publish original segmentation mask'
-    )
-    
-    publish_refined_mask_arg = DeclareLaunchArgument(
-        'publish_refined_mask',
-        default_value='true',
-        description='Publish refined segmentation mask with DBSCAN'
+    mapping_config_path_arg = DeclareLaunchArgument(
+        'mapping_config_path',
+        default_value=default_mapping_config_path,
+        description='Path to mapping configuration file'
     )
     
     # NARadio parameters
@@ -63,25 +58,6 @@ def generate_launch_description():
         'enable_naradio_visualization',
         default_value='true',
         description='Enable NARadio visualization'
-    )
-    
-    # YOLO parameters
-    min_confidence_arg = DeclareLaunchArgument(
-        'min_confidence',
-        default_value='0.05',
-        description='Minimum confidence for YOLO detections'
-    )
-    
-    min_detection_distance_arg = DeclareLaunchArgument(
-        'min_detection_distance',
-        default_value='0.5',
-        description='Minimum detection distance'
-    )
-    
-    max_detection_distance_arg = DeclareLaunchArgument(
-        'max_detection_distance',
-        default_value='2.0',
-        description='Maximum detection distance'
     )
     
     # Topics
@@ -116,28 +92,22 @@ def generate_launch_description():
         name='resilience_node',
         output='screen',
         parameters=[{
-            # Combined Segmentation parameters
-            'enable_combined_segmentation': LaunchConfiguration('enable_combined_segmentation'),
-            'segmentation_config_path': LaunchConfiguration('segmentation_config_path'),
-            'publish_original_mask': LaunchConfiguration('publish_original_mask'),
-            'publish_refined_mask': LaunchConfiguration('publish_refined_mask'),
-            
-            # NARadio parameters
-            'radio_model_version': LaunchConfiguration('radio_model_version'),
-            'radio_lang_model': LaunchConfiguration('radio_lang_model'),
-            'radio_input_resolution': LaunchConfiguration('radio_input_resolution'),
-            'enable_naradio_visualization': LaunchConfiguration('enable_naradio_visualization'),
-            
-            # YOLO parameters
-            'min_confidence': LaunchConfiguration('min_confidence'),
-            'min_detection_distance': LaunchConfiguration('min_detection_distance'),
-            'max_detection_distance': LaunchConfiguration('max_detection_distance'),
-            
-            # Topics
-            'rgb_topic': LaunchConfiguration('rgb_topic'),
-            'depth_topic': LaunchConfiguration('depth_topic'),
-            'pose_topic': LaunchConfiguration('pose_topic'),
-            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
+    # Main Configuration parameters
+    'enable_combined_segmentation': LaunchConfiguration('enable_combined_segmentation'),
+    'main_config_path': LaunchConfiguration('main_config_path'),
+    'mapping_config_path': LaunchConfiguration('mapping_config_path'),
+    
+    # NARadio parameters
+    'radio_model_version': LaunchConfiguration('radio_model_version'),
+    'radio_lang_model': LaunchConfiguration('radio_lang_model'),
+    'radio_input_resolution': LaunchConfiguration('radio_input_resolution'),
+    'enable_naradio_visualization': LaunchConfiguration('enable_naradio_visualization'),
+    
+    # Topics
+    'rgb_topic': LaunchConfiguration('rgb_topic'),
+    'depth_topic': LaunchConfiguration('depth_topic'),
+    'pose_topic': LaunchConfiguration('pose_topic'),
+    'camera_info_topic': LaunchConfiguration('camera_info_topic'),
         }],
         remappings=[
             ('/rgb_image', LaunchConfiguration('rgb_topic')),
@@ -148,22 +118,18 @@ def generate_launch_description():
     )
     
     return LaunchDescription([
-        # Launch arguments
+            # Launch arguments
         enable_combined_segmentation_arg,
-        segmentation_config_path_arg,
-        publish_original_mask_arg,
-        publish_refined_mask_arg,
-        radio_model_version_arg,
-        radio_lang_model_arg,
-        radio_input_resolution_arg,
-        enable_naradio_visualization_arg,
-        min_confidence_arg,
-        min_detection_distance_arg,
-        max_detection_distance_arg,
-        rgb_topic_arg,
-        depth_topic_arg,
-        pose_topic_arg,
-        camera_info_topic_arg,
+        main_config_path_arg,
+        mapping_config_path_arg,
+    radio_model_version_arg,
+    radio_lang_model_arg,
+    radio_input_resolution_arg,
+    enable_naradio_visualization_arg,
+    rgb_topic_arg,
+    depth_topic_arg,
+    pose_topic_arg,
+    camera_info_topic_arg,
         
         # Nodes
         resilience_node,

@@ -1,6 +1,7 @@
 # Resilience package for integrated drift detection, YOLO, and NARadio processing
 
 from .drift_calculator import DriftCalculator
+from .path_manager import PathManager
 from .yolo_sam_detector import YOLODetector
 from .naradio_processor import NARadioProcessor
 from .narration_manager import NarrationManager
@@ -15,6 +16,7 @@ from .voxel_mapping_helper import VoxelMappingHelper
 
 __all__ = [
     'DriftCalculator',
+    'PathManager',
     'YOLODetector', 
     'NARadioProcessor',
     'NarrationManager',
