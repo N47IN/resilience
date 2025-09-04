@@ -1,506 +1,264 @@
-### Pre Req.
-Make sure to have the Yolo World model and the SAM model in the assets directory<br>
-Check Rosbag and corresponding topic names, we need pose<br>
-Run calibrate_drift to generate a nominal trajectory JSON file and breach thresholds<br>
-### We will run the primary node and secondary node ( after exporting the VLM API key ) in two terminals, get them ready and then play the ROS [bag](https://drive.google.com/file/d/1xGwocP0WNUHb9ZkYeE7lBwIxGHjkAZBY/view?usp=sharing) in the third terminal<br>
+## Resilience: Getting Started and System Overview
 
-### Primary Node: `main.py`
-Main orchestrator implementing parallel processing across 4 dedicated threads with comprehensive state management and inter-thread communication.
+This guide helps a new user get familiar with the Resilience system: how to configure topics (RGB, depth, pose), how the path is loaded (JSON file or external topic), and how the nodes fit together at a high and low level.
 
-### Secondary Node: `narration_display_node.py`  
-VLM integration node handling OpenAI API communication and image-text synchronisation.
-
-### High-Level Overview
-Main file imports the necessary modules ->
-DriftCalulator -> Handles all trajectory-related queries, loads nominal trajectory, gives current drift based on current pos, gives the breach status -> load nominal trajectory as json file<br>
-RiskBufferManager -> All the details for a breach are stored within a buffer, which contains images, lagged images, associated cause, embedding, pose and other data as well. will automatically save the buffer after the breach ends<br>
-NarrationManager -> Generates the narration as discussed, all drift values are constantly monitored and added so that we can quickly analyse the nature of the drift to produce narration and publish it<br>
-Historical Analysis -> Once we have received the VLM Answer ( this can be after or during the corresponding breach ), we start Historical Analysis, where we analyse the stored images and try to find the <br>location of the cause object using the VLM answer. This location is also stored in the buffer
-YoloSamDetector -> Straightforward, all detection and dynamic prompts functions<br>
-NaradioProcessor -> All Naradio functionalities, has dynamic embedding + segmentation function, not integrated for re-id yet<br>
+### What this system does (at a glance)
+- **Detects path drift** against a nominal/global path and narrates the event.
+- **Captures context** (images/pose/depth) into per-breach buffers.
+- **Queries a VLM** with the narration image to get a concise cause word (published as `vlm_answer`).
+- **Builds a semantic voxel map** by projecting VLM hotspot masks through depth into 3D.
 
 
-```
+## 1) Configuration: Topics and Paths
 
-### Internal Module Structure
-```python
-from resilience.drift_calculator import DriftCalculator
-from resilience.yolo_sam_detector import YOLOSAMDetector  
-from resilience.naradio_processor import NARadioProcessor
-from resilience.narration_manager import NarrationManager
-from resilience.pointcloud_manager import PointCloudManager
-from resilience.risk_buffer import RiskBufferManager
-from resilience.historical_cause_analysis import HistoricalCauseAnalyzer
-from resilience.simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
-```
+All key topics are defined in config files and can be changed without touching code.
 
-## Threading Architecture
+### 1.1 Main pipeline topics (RGB, Depth, Pose, Camera Info)
+These are read by the main node from `config/main_config.yaml`.
 
-### Thread 1: Main Thread (ResilienceNode)
-**Purpose**: ROS2 message processing, breach detection, state management
-**Key Methods**:
-- `pose_callback()`: Trajectory processing and breach detection logic
-- `rgb_callback()`: Image data buffering and active buffer management  
-- `depth_callback()`: Depth data collection during breach states
-- `vlm_answer_callback()`: VLM response processing and cause association
+- **RGB Image**: `topics.rgb_topic` (default: `/robot_1/sensors/front_stereo/right/image`)
+- **Depth Image**: `topics.depth_topic` (default: `/robot_1/sensors/front_stereo/depth/depth_registered`)
+- **Pose**: `topics.pose_topic` (default: `/robot_1/sensors/front_stereo/pose`)
+- **Camera Info**: `topics.camera_info_topic` (default: `/robot_1/sensors/front_stereo/right/camera_info`)
+- Optional I/O for narration and similarity outputs are also under `topics.*`.
 
-**State Variables**:
-```python
-self.current_breach_active: bool          # Primary breach state flag
-self.last_breach_state: bool              # Previous breach state for transition detection  
-self.detection_enabled: bool              # YOLO detection activation flag
-self.detection_prompts: List[str]         # Dynamic YOLO vocabulary
-self.latest_rgb_msg: Image               # Thread-safe image storage
-self.latest_depth_msg: Image             # Thread-safe depth storage
-self.latest_pose: np.ndarray             # Current robot position
-```
-
-### Thread 2: Detection Processing Thread
-**Purpose**: YOLO-SAM object detection and segmentation
-**Trigger**: Activated during breach states via `trigger_detection_processing()`
-**Key Operations**:
-```python
-def process_detection_async(self):
-    # Convert ROS messages to OpenCV format
-    rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')
-    depth_image = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
-    
-    # YOLO-World detection with dynamic vocabulary
-    bboxes, labels, confidences = self.yolo_sam_detector.detect_objects(rgb_image)
-    
-    # Distance-based filtering using depth data
-    filtered_bboxes = self.yolo_sam_detector.filter_detections_by_distance(...)
-    
-    # SAM segmentation on filtered detections
-    all_masks, all_scores = self.yolo_sam_detector.segment_objects(rgb_image, bbox_centers)
-```
-
-### Thread 3: NARadio Processing Thread  
-**Purpose**: Continuous semantic feature extraction and segmentation
-**Execution**: Parallel loop at 10Hz with memory management
-**Key Operations**:
-```python
-def naradio_processing_loop(self):
-    while self.naradio_running:
-        # Feature extraction using vision transformer
-        feat_map_np, naradio_vis = self.naradio_processor.process_features(rgb_image)
-        
-        # Combined segmentation with dynamic objects
-        segmentation_result = self.naradio_processor.process_combined_segmentation(rgb_image)
-        
-        # Publish visualisation and masks
-        self.naradio_image_pub.publish(naradio_msg)
-        self.original_mask_pub.publish(original_mask_msg)
-        self.refined_mask_pub.publish(refined_mask_msg)
-```
-
-### Thread 4: Historical Analysis Thread
-**Purpose**: Background historical pattern analysis
-**Trigger**: VLM answers and buffer state changes
-**Key Operations**:
-```python
-def historical_analysis_worker(self):
-    # Process queued analysis requests
-    while self.historical_analysis_queue:
-        request = self.historical_analysis_queue.pop(0)
-        self.process_historical_analysis_request(request)
-        
-def perform_parallel_vlm_analysis(self, vlm_answer):
-    # Analyze frozen buffers for cause patterns
-    frozen_results = self.historical_analyzer.analyze_all_buffers()
-    # Cross-reference with active buffers
-    active_results = self.historical_analyzer.analyze_active_buffers(active_with_cause)
-```
-
-### Thread 5: Narration Processing Thread
-**Purpose**: Spatial narration generation and image context management
-**Key Operations**:
-```python
-def narration_worker(self):
-    # Process narration requests from the queue
-    while self.narration_queue:
-        request = self.narration_queue.pop(0)
-        self.process_narration_request(request)
-
-def publish_narration_with_image(self, narration_text):
-    # Retrieve historical image (1 second offset)
-    target_time = current_time - 1.0
-    closest_image = self.find_closest_image(target_time)
-    # Publish synchronized image and text
-```
-
-## Class Architecture and Responsibilities
-
-### ResilienceNode Class
-**Primary State Machine**:
-```python
-# Breach state transitions
-breach_started = not self.last_breach_state and breach_now  # F→T
-breach_ended = self.last_breach_state and not breach_now    # T→F
-
-# Buffer lifecycle management  
-if breach_started:
-    self.risk_buffer_manager.start_buffer(pose_time)
-elif breach_ended:
-    self.risk_buffer_manager.freeze_active_buffers(pose_time)
-```
-
-**Thread Synchronization**:
-```python
-self.processing_lock = threading.Lock()           # Detection thread sync
-self.naradio_processing_lock = threading.Lock()   # NARadio thread sync  
-self.lock = threading.Lock()                      # Main state sync
-self.historical_analysis_condition = threading.Condition()  # Analysis queue
-self.narration_condition = threading.Condition()  # Narration queue
-```
-
-### DriftCalculator Class
-**Core Functionality**: Spline-based trajectory analysis
-```python
-def compute_drift(self, pos: np.ndarray) -> Tuple[float, int]:
-    # Calculate minimum distance to nominal trajectory
-    distances = np.linalg.norm(self.nominal_points - pos, axis=1)
-    nearest_idx = np.argmin(distances)
-    return distances[nearest_idx], nearest_idx
-
-def is_breach(self, drift: float) -> bool:
-    return drift > self.soft_threshold
-```
-
-### YOLOSAMDetector Class  
-**Dynamic Model Management**:
-```python
-def update_prompts(self, new_prompts: List[str]) -> bool:
-    # Update YOLO-World vocabulary dynamically
-    if new_prompts != self.current_classes:
-        self.world_model.set_classes(new_prompts)
-        self.current_classes = new_prompts
-        return True
-    return False
-
-def detect_objects(self, image: np.ndarray) -> Tuple[List, List, List]:
-    # YOLO-World inference with current vocabulary
-    results = self.world_model(image, imgsz=self.yolo_imgsz, conf=self.min_confidence)
-```
-
-### NARadioProcessor Class
-**Feature Processing Pipeline**:
-```python
-def process_features(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # Vision transformer feature extraction
-    with torch.no_grad():
-        summary = self.radio_encoder.forward(image_tensor)
-        # PCA dimensionality reduction for visualization
-        feat_map_rgb = self.pca.transform(features_2d)
-        
-def add_vlm_object(self, object_name: str) -> bool:
-    # Encode new object from VLM response
-    object_embedding = self.encode_text_batch([object_name])
-    self.dynamic_objects.append(object_name)
-    self.dynamic_features = torch.cat([self.dynamic_features, object_embedding])
-```
-
-### RiskBufferManager Class
-**State-Based Data Collection**:
-```python
-class BufferState(Enum):
-    ACTIVE = "active"    # Data collection during breach
-    FROZEN = "frozen"    # Post-breach, awaiting/assigned cause
-
-def start_buffer(self, start_time: float):
-    buffer = RiskBuffer(buffer_id=f"buffer_{timestamp}_{unique_id}", start_time=start_time)
-    buffer.state = BufferState.ACTIVE
-    self.active_buffers.append(buffer)
-
-def freeze_active_buffers(self, end_time: float):
-    for buffer in self.active_buffers:
-        buffer.end_time = end_time
-        buffer.state = BufferState.FROZEN
-        self.frozen_buffers.append(buffer)
-    self.active_buffers.clear()
-```
-**Two-State Buffer Lifecycle**: Implements ACTIVE and FROZEN states for comprehensive breach event data collection.
-
-**ACTIVE State Operations**:
-- Continuous data ingestion during breach events
-- Real-time image, pose, and depth message collection
-
-**FROZEN State Management**:
-- Automatic state transition when breach ends
-
-**Cause Association Logic**:
-- Priority-based assignment to most recent buffers
-- VLM answer correlation with temporal breach events
-
-**Data Persistence Architecture**:
-- Per-buffer subdirectories with organised data structure
-- JSON metadata files with processing timestamps
-- Image storage with original ROS message headers preserved
-- Pose trajectory data in both JSON and NumPy formats
-  
-## ROS2 Communication Interface
-
-### Subscribed Topics
-```python
-self.rgb_sub = self.create_subscription(Image, '/robot_1/sensors/front_stereo/right/image', self.rgb_callback, 1)
-self.depth_sub = self.create_subscription(Image, '/robot_1/sensors/front_stereo/depth/depth_registered', self.depth_callback, 1)  
-self.pose_sub = self.create_subscription(PoseStamped, '/robot_1/sensors/front_stereo/pose', self.pose_callback, 10)
-self.camera_info_sub = self.create_subscription(CameraInfo, '/robot_1/sensors/front_stereo/right/camera_info', self.camera_info_callback, 1)
-self.vlm_answer_sub = self.create_subscription(String, '/vlm_answer', self.vlm_answer_callback, 10)
-```
-
-### Published Topics  
-```python
-self.yolo_bbox_pub = self.create_publisher(Image, '/yolo_bbox_image', 1)
-self.sam_mask_pub = self.create_publisher(Image, '/sam_mask_image', 1)
-self.detection_cloud_pub = self.create_publisher(PointCloud2, '/detection_cloud', 10)
-self.narration_pub = self.create_publisher(String, '/drift_narration', 10)
-self.narration_text_pub = self.create_publisher(String, '/narration_text', 10)
-self.naradio_image_pub = self.create_publisher(Image, '/naradio_image', 10)
-self.narration_image_pub = self.create_publisher(Image, '/narration_image', 10)
-```
-
-## Configuration Parameters
-
-### Launch Parameters
-```python
-self.declare_parameter('min_confidence', 0.05)
-self.declare_parameter('min_detection_distance', 0.5)
-self.declare_parameter('max_detection_distance', 2.0)
-self.declare_parameter('sam_checkpoint', '/path/to/sam_vit_b_01ec64.pth')
-self.declare_parameter('yolo_model', 'yolov8l-world.pt')
-self.declare_parameter('radio_model_version', 'radio_v2.5-b')
-self.declare_parameter('radio_input_resolution', 512)
-self.declare_parameter('enable_combined_segmentation', True)
-```
-
-### Runtime Configuration
+Example snippet from `config/main_config.yaml`:
 ```yaml
-# config/main_config.yaml
-objects: ["floor", "ceiling", "wall", "person", "chair", "table"]
-segmentation:
-  apply_softmax: true
-  enable_dbscan: true
-  dbscan_eps: 0.3
-  dbscan_min_samples: 5
-processing:
-  processing_rate: 10.0
-  memory_fraction: 0.8
+topics:
+  rgb_topic: "/robot_1/sensors/front_stereo/right/image"
+  depth_topic: "/robot_1/sensors/front_stereo/depth/depth_registered"
+  pose_topic: "/robot_1/sensors/front_stereo/pose"
+  camera_info_topic: "/robot_1/sensors/front_stereo/right/camera_info"
+  # outputs
+  drift_narration_topic: "/drift_narration"
+  narration_text_topic: "/narration_text"
+  narration_image_topic: "/narration_image"
+  vlm_answer_topic: "/vlm_answer"
 ```
 
-## Data Flow and State Management
+### 1.2 Mapping topics (Depth, Pose, Camera Info, Semantic Hotspots)
+These are read by the semantic mapping node from `config/mapping_config.yaml`.
 
-### Breach Detection Pipeline
-**Continuous Monitoring**: Real-time trajectory analysis with configurable threshold-based breach detection and immediate system state transitions.
+- **Depth Image**: `topics.depth_topic` (default: `/robot_1/sensors/front_stereo/depth/depth_registered`)
+- **Camera Info**: `topics.camera_info_topic` (default: `/robot_1/sensors/front_stereo/left/camera_info`)
+- **Pose**: `topics.pose_topic` (default: `/robot_1/sensors/front_stereo/pose`)
+- **Semantic Hotspots (from bridge)**: `topics.semantic_hotspots_topic` (default: `/semantic_hotspots`)
 
-**State Transition Logic**: Automatic detection of breach start and end events with comprehensive state management across all system components.
-
-**Buffer Lifecycle Management**: Seamless transition from data collection to preservation states with automatic cause association capabilities.
-
-### VLM Integration Workflow
-```python
-# In narration_display_node.py
-def query_vlm(self, image, narration_text):
-    client = OpenAI(api_key=self.api_key)
-    image_base64 = self.encode_image_for_api(image)
-    full_prompt = f"I am a drone, after 1s {narration_text} What object do you think in this scene is the cause, give one singular word as description"
-    
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": full_prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
-        ]}]
-    )
-    return response.choices[0].message.content.strip()
+Example snippet from `config/mapping_config.yaml`:
+```yaml
+topics:
+  depth_topic: "/robot_1/sensors/front_stereo/depth/depth_registered"
+  camera_info_topic: "/robot_1/sensors/front_stereo/left/camera_info"
+  pose_topic: "/robot_1/sensors/front_stereo/pose"
+  semantic_hotspots_topic: "/semantic_hotspots"
+  semantic_octomap_markers_topic: "/semantic_octomap_markers"
+  semantic_octomap_stats_topic: "/semantic_octomap_stats"
+  semantic_octomap_colored_cloud_topic: "/semantic_octomap_colored_cloud"
+  semantic_voxels_only_topic: "/semantic_voxels_only"
 ```
 
-# Path Planning Configuration
+### 1.3 Path loading modes (defined in `config/main_config.yaml`)
+The path can be sourced in two ways and is declared in the `path_mode` section.
 
-The resilience system now supports two unified path planning modes through the `PathManager`:
+- **Mode A: JSON file (`json_file`)**
+  - Loads nominal path from a JSON file on disk
+  - Publishes it to a global path topic
+  - Uses calibrated thresholds from JSON (if present)
 
-## Mode 1: JSON File Mode (`json_file`)
+- **Mode B: External planner (`external_planner`)**
+  - Listens to a global path topic for an externally provided path
+  - Non-blocking wait; starts when the first path arrives
+  - Thresholds are configured in YAML since calibration JSON is not present
 
-Loads the nominal path from a JSON file and publishes it to a standard ROS2 global path topic.
-
-**Configuration:**
+Example `json_file` mode:
 ```yaml
 path_mode:
   mode: "json_file"
   global_path_topic: "/global_path"
   json_file:
-    nominal_path_file: "adjusted_nominal_spline.json"  # Relative to assets directory
-    publish_rate: 1.0  # Hz - How often to publish the nominal path
+    nominal_path_file: "adjusted_nominal_spline.json"  # relative to the package assets
+    publish_rate: 1.0
 ```
 
-**How it works:**
-1. Loads the nominal trajectory from `assets/adjusted_nominal_spline.json`
-2. Publishes the path to `/global_path` topic as `nav_msgs/Path`
-3. Uses the same path for drift detection and breach analysis
-4. Other nodes can subscribe to `/global_path` to get the nominal trajectory
-
-## Mode 2: External Planner Mode (`external_planner`)
-
-Listens to an external planner's global path topic for dynamic path updates.
-
-**Configuration:**
+Example `external_planner` mode:
 ```yaml
 path_mode:
   mode: "external_planner"
   global_path_topic: "/global_path"
   external_planner:
-    timeout_seconds: 10.0  # How long to wait for external path before warning
-    require_path: true  # Whether to require path before starting drift detection
-    thresholds:
-      soft_threshold: 0.1  # Default soft threshold for breach detection
-      hard_threshold: 0.25  # Default hard threshold for breach detection
-```
-
-**How it works:**
-1. Subscribes to `/global_path` topic for external path updates
-2. Converts incoming `nav_msgs/Path` messages to internal format
-3. Uses the external path for drift detection and breach analysis
-4. Supports dynamic path updates from external planners
-5. **Uses configurable thresholds** since JSON calibration data is not available
-
-## Path Readiness Requirement
-
-The resilience system now **requires a valid path to be available** before starting main functionality (drift detection, breach analysis, etc.).
-
-### **JSON Mode Behavior**
-1. ✅ Loads path from `assets/adjusted_nominal_spline.json`
-2. ✅ Publishes path to `/global_path` topic
-3. ✅ Waits for path to be ready before starting functionality
-4. ✅ Uses calibrated thresholds from JSON file
-
-### **External Planner Mode Behavior**
-1. ✅ **Continuously monitors** `/global_path` topic for external path updates
-2. ✅ **Starts functionality immediately** when first path is received (no blocking)
-3. ✅ Converts incoming `nav_msgs/Path` messages to internal format
-4. ✅ Uses the external path for drift detection and breach analysis
-5. ✅ Supports dynamic path updates from external planners
-6. ✅ **Uses configurable thresholds** since JSON calibration data is not available
-
-### **Configuration Options**
-
-**Require Path** (recommended):
-```yaml
-path_mode:
-  mode: "external_planner"
-  external_planner:
-    require_path: true  # Drift detection disabled if no path
+    require_path: true
     timeout_seconds: 30.0
+    thresholds:
+      soft_threshold: 0.10
+      hard_threshold: 0.25
 ```
 
-**Allow Operation Without Path**:
-```yaml
-path_mode:
-  mode: "external_planner"
-  external_planner:
-    require_path: false  # Drift detection may be unreliable
-    timeout_seconds: 10.0
+
+## 2) How the nodes interact (high level)
+
+```mermaid
+graph LR
+  A[Resilience Main Node<br/>resilience/scripts/main.py] -->|Publishes narration text+image| B[Narration Display Node<br/>resilience/scripts/narration_display_node.py]
+  B -->|Publishes VLM Answer (String)| A
+  A -->|Publishes Semantic Hotspots (JSON via bridge)| C[Semantic Depth OctoMap Node<br/>resilience/scripts/depth_octomap_node.py]
+  A -->|Subscribes RGB/Depth/Pose/CameraInfo| D[Sensors]
+  C -->|Subscribes Depth/Pose/CameraInfo| D
+  E[External Planner or JSON File] -->|Global Path Topic or JSON| A
+  C -->|Publishes semantic voxels/markers/stats| F[RViz / Consumers]
 ```
 
-### **Status Messages**
+- The Main node detects drift, manages buffers, creates narrations, queries VLM (via the display node), and publishes semantic hotspots through an internal bridge.
+- The Mapping node matches hotspots to depth/pose by timestamp, projects them into 3D, and builds a semantic voxel map.
 
-The system will show clear status messages:
 
-**JSON Mode:**
-```
-Waiting for path to be ready...
-✓ Path ready - starting main functionality
-Path ready: YES
-Drift detection: ENABLED
-```
+## 3) Inside the main node (low-level view)
 
-**External Planner Mode (initial):**
-```
-External planner mode: Will start functionality when path is received
-Path ready: NO
-Drift detection: DISABLED
-```
+```mermaid
+graph TD
+  subgraph Main Node
+    PM[PathManager<br/>path source + thresholds]
+    NM[NarrationManager<br/>drift→narration]
+    RB[RiskBufferManager<br/>per-breach buffers]
+    NP[NARadioProcessor<br/>features + similarity]
+    SB[SemanticHotspotPublisher<br/>topic bridge]
 
-**External Planner Mode (when path received):**
-```
-✓ External path received - enabling drift detection
-✓ Updated narration manager with external path points
-Path ready: YES
-Drift detection: ENABLED
-```
+    RGB[RGB Topic] -->|cv_bridge| NP
+    DEPTH[Depth Topic] --> RB
+    POSE[Pose Topic] --> PM
+    POSE --> NM
+    POSE --> RB
+    CAM[CameraInfo] --> A0[Camera Intrinsics]
 
-## Threshold Handling
+    PM --> NM
+    PM --> A1[Drift & breach gate]
+    A1 --> RB
 
-**JSON Mode**: Thresholds are automatically loaded from the JSON file's `calibration` section:
-```json
-{
-  "calibration": {
-    "soft_threshold": 0.100,
-    "hard_threshold": 0.257,
-    "avg_drift": 0.05346227232031908
-  }
-}
+    NM -->|text + chosen image| OUT1[Narration Text/Image Topics]
+    OUT1 --> VLM[Narration Display Node]
+    VLM -->|/vlm_answer| NP
+    VLM -->|/vlm_answer| A2[Assign cause to buffer]
+
+    NP -->|merged hotspot masks + timestamp| SB
+    SB --> MAP[Semantic Depth OctoMap Node]
+  end
 ```
 
-**External Planner Mode**: Thresholds must be configured in the YAML config since JSON calibration data is not available:
-```yaml
-external_planner:
-  thresholds:
-    soft_threshold: 0.1  # Default soft threshold
-    hard_threshold: 0.25  # Default hard threshold
+Key roles inside the main node:
+- **PathManager**: Loads/receives path and thresholds; computes drift and breach status.
+- **NarrationManager**: Produces human-readable narration during a breach.
+- **RiskBufferManager**: Stores time-synced imagery, pose, depth, VLM cause, and enhanced embeddings per breach.
+- **NARadioProcessor**: Extracts visual features and creates similarity/hotspot masks; supports dynamic object (VLM answer) monitoring.
+- **SemanticHotspotPublisher**: Serializes hotspot masks with timestamps and sends them over the semantic bridge topic.
+
+
+## 4) Inside the mapping node (low-level view)
+
+```mermaid
+graph TD
+  subgraph Semantic Depth OctoMap Node
+    Q[Bridge Queue<br/>timestamped hotspot JSON]
+    DB[Depth Buffer]
+    PB[Pose Buffer]
+    VH[VoxelMappingHelper]
+    SM[Semantic Mapper]
+
+    HOT[/semantic_hotspots/] --> Q
+    DEPTH[/depth/] --> DB
+    POSE[/pose/] --> PB
+    CAM[/camera_info/] --> A0[fx, fy, cx, cy]
+
+    Q -->|batch process| A1[Lookup closest depth & pose]
+    A1 --> A2[Project hotspot pixels using depth→3D points]
+    A2 --> VH
+    VH --> SM
+
+    VH --> OUT1[/semantic_octomap_markers/]
+    VH --> OUT2[/semantic_octomap_colored_cloud/]
+    SM --> OUT3[/semantic_voxels_only/]
+    VH --> OUT4[/semantic_octomap_stats/]
+  end
 ```
 
-**Dynamic Threshold Updates**: You can also update thresholds programmatically:
-```python
-path_manager.update_thresholds(soft_threshold=0.15, hard_threshold=0.3)
-```
+Highlights:
+- Timestamped buffers align hotspot masks (from the main node) with the closest depth frame and pose.
+- Hotspot pixels are projected into 3D and fused into the voxel map; semantic labels are applied to those voxels.
+- Outputs include voxel markers, a semantic-colored cloud, a semantic-only cloud, and stats.
 
-## Unified Interface
 
-Both modes provide the same interface for drift detection:
-- `compute_drift(pos)` - Calculate drift from current position to nearest path point
-- `is_breach(drift)` - Check if drift exceeds threshold
-- `get_thresholds()` - Get soft and hard drift thresholds
-- `get_nominal_points()` - Get path points for visualization
+### 4.1) Semantic voxel mapping: outputs and visualization
+- **Enablement**: Semantic voxel mapping is controlled by config. It must be enabled in both nodes.
+  - Main node: `segmentation_config.enable_voxel_mapping: true` (read by `main.py` via `NARadioProcessor` config)
+  - Mapping node: `enable_voxel_mapping: true` (parameter in `depth_octomap_node.py`)
+- **Coordinate frame**: All published artifacts use the `map` frame (configurable via `map_frame`).
+- **Voxel resolution**: Set via `voxel_resolution` (meters per voxel).
+- **Published topics (where you see the results)**:
+  - `topics.semantic_octomap_colored_cloud_topic` (default: `/semantic_octomap_colored_cloud`)
+    - Type: `sensor_msgs/PointCloud2`
+    - Content: Colored voxels; semantic voxels are consistently colored by VLM answer; regular voxels are gray.
+    - RViz: Add a PointCloud2 display, select this topic, and set Color Transformer to RGB.
+  - `topics.semantic_voxels_only_topic` (default: `/semantic_voxels_only`)
+    - Type: `sensor_msgs/PointCloud2`
+    - Content: XYZ-only points for semantic voxels (no RGB), useful for lightweight exports and checks.
+  - `topics.semantic_octomap_markers_topic` (default: `/semantic_octomap_markers`)
+    - Type: `visualization_msgs/MarkerArray`
+    - Content: Voxel markers (cube list or individual cubes) showing occupied voxels; semantic voxels appear emphasized (see colors in colored cloud).
+  - `topics.semantic_octomap_stats_topic` (default: `/semantic_octomap_stats`)
+    - Type: `std_msgs/String` (JSON)
+    - Content: Counts and status, including `semantic_voxel_count`, `total_voxels`, and `bridge_queue_size`.
+- **Tuning**:
+  - `semantic_similarity_threshold`: minimum similarity for accepting hotspots into semantics.
+  - `max_range` / `min_range`: distance limits for projecting depth into voxels (example run shows setting `max_range:=1.5`).
 
-## Switching Between Modes
 
-To switch between modes, simply change the `mode` parameter in the configuration:
+## 5) Running the system
 
-```yaml
-# For JSON file mode
-path_mode:
-  mode: "json_file"
-  # ... other config
+Prerequisites:
+- ROS 2 environment sourced (Humble or compatible).
+- Models and assets placed according to your configuration (e.g., `assets`, model checkpoints if used).
+- Optional: `OPENAI_API_KEY` in your shell environment to enable VLM querying in the narration display node.
 
-# For external planner mode  
-path_mode:
-  mode: "external_planner"
-  # ... other config
-```
-
-## Testing
-
-Use the test script to verify both modes work correctly:
-
+Terminals:
 ```bash
-python3 resilience/scripts/test_path_manager.py
-```
-
-This will test both JSON file loading and external topic listening functionality.
-
-### Runtime Execution
-```bash
-# Terminal 1: Main resilience system
+# 1) Main Resilience node
 ros2 run resilience main.py
 
-# Terminal 2: VLM integration node
+# 2) Narration display + VLM node
 ros2 run resilience narration_display_node.py
 
-# Terminal 3: Data source
-ros2 bag play trajectory_data.bag
-```
+# 3) Semantic depth octomap node
+ros2 run resilience depth_octomap_node.py --ros-args -p max_range:=1.5
 
 
-```bash
-export OPENAI_API_KEY=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
+# 4) Data source (e.g., rosbag)
+ros2 bag play <your_rosbag>
 ```
+
+Tips:
+- If using `path_mode.mode: json_file`, ensure the JSON path file exists and matches the config.
+- If using `external_planner`, confirm the global path topic is being published; the main node starts full functionality once the first path arrives.
+- RViz: add the marker topic and point cloud topics to visualize voxels and semantics.
+
+
+## 6) Where data is stored
+
+- Per-run buffers are stored under: `/home/navin/ros2_ws/src/buffers/run_*/*` (configurable in code for now).
+- Each breach creates a buffer containing synchronized images, lagged images, pose tracks, narration image/text, VLM cause, and optional enhanced embeddings.
+- The mapping node can export semantic voxels to PCD when input becomes inactive.
+
+
+## 7) Key topics (summary)
+- **Inputs**: RGB, Depth, Pose, Camera Info (set in configs).
+- **Main node outputs**: `/drift_narration`, `/narration_text`, `/narration_image`, `/vlm_answer`, plus internal semantic hotspot bridge.
+- **Semantic voxel mapping outputs (mapping node)**:
+  - `/semantic_octomap_colored_cloud` (PointCloud2, RGB per-voxel; semantic colored by VLM answer)
+  - `/semantic_voxels_only` (PointCloud2, XYZ only for semantic voxels)
+  - `/semantic_octomap_markers` (MarkerArray, voxel markers)
+  - `/semantic_octomap_stats` (String JSON, stats and health)
+
+
+## 8) Troubleshooting
+- “Path not ready”: check `path_mode` and that JSON exists or the global path topic is active.
+- “No camera intrinsics received”: ensure `CameraInfo` is published on the configured topic.
+- “No matching depth/pose found for timestamp”: increase `sync_buffer_seconds` in mapping config or verify clocks and topic rates.
+- VLM disabled: set `OPENAI_API_KEY` and confirm outbound connectivity.
+
