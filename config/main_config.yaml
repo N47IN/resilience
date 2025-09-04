@@ -5,7 +5,7 @@
 path_mode:
   # Mode 1: "json_file" - Load nominal path from JSON and publish to global path topic
   # Mode 2: "external_planner" - Listen to external planner's global path topic
-  mode: "json_file"  # Options: "json_file", "external_planner"
+  mode: "external_planner"  # Options: "json_file", "external_planner"
   
   # Global path topic configuration (used in both modes)
   global_path_topic: "/global_path"  # Standard nav_msgs/Path topic

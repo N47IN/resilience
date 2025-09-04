@@ -121,16 +121,14 @@ class PathManager:
             raise
     
     def _init_external_mode(self):
-        """Initialize external planner mode - listen to external path topic."""
+        """Initialize external planner mode - simple one-time listener for a path message."""
         try:
-            # Set default thresholds from config
+            # Keep thresholds simple defaults for external mode unless explicitly overridden
             thresholds_config = self.external_config.get('thresholds', {})
-            self.soft_threshold = thresholds_config.get('soft_threshold', 0.1)
-            self.hard_threshold = thresholds_config.get('hard_threshold', 0.25)
+            self.soft_threshold = float(thresholds_config.get('soft_threshold', self.soft_threshold))
+            self.hard_threshold = float(thresholds_config.get('hard_threshold', self.hard_threshold))
             
-            self.node.get_logger().info(f"External mode: Using default thresholds - soft: {self.soft_threshold}, hard: {self.hard_threshold}")
-            
-            # Create subscriber for external global path
+            # Create subscriber for external global path (one-time trigger upon first valid message)
             self.path_subscriber = self.node.create_subscription(
                 Path,
                 self.global_path_topic,
@@ -139,14 +137,6 @@ class PathManager:
             )
             
             self.node.get_logger().info(f"Listening for external path on topic: {self.global_path_topic}")
-            
-            # Set up timeout checking
-            timeout_seconds = self.external_config.get('timeout_seconds', 10.0)
-            self.timeout_timer = self.node.create_timer(
-                1.0,  # Check every second
-                lambda: self._check_external_path_timeout(timeout_seconds)
-            )
-            
         except Exception as e:
             self.node.get_logger().error(f"Failed to initialize external mode: {e}")
             raise
@@ -177,68 +167,71 @@ class PathManager:
             self.node.get_logger().error(f"Error publishing nominal path: {e}")
     
     def _external_path_callback(self, path_msg: Path):
-        """Handle external path message."""
+        """Handle external path message (one-time store and trigger)."""
         try:
+            # Ignore if we've already set a path (one-time trigger)
+            if self.path_ready:
+                return
+            
+            # Validate message contains poses
+            if path_msg is None or len(path_msg.poses) == 0:
+                self.node.get_logger().warn("Received empty path; waiting for a valid external path...")
+                return
+            
             with self.lock:
-                # Convert Path message to internal format
+                # Convert Path message to the internal simple format expected elsewhere
                 self.nominal_points = []
                 for i, pose_stamped in enumerate(path_msg.poses):
                     point = {
-                        'index': i,
                         'position': {
-                            'x': pose_stamped.pose.position.x,
-                            'y': pose_stamped.pose.position.y,
-                            'z': pose_stamped.pose.position.z
+                            'x': float(pose_stamped.pose.position.x),
+                            'y': float(pose_stamped.pose.position.y),
+                            'z': float(pose_stamped.pose.position.z)
                         }
                     }
                     self.nominal_points.append(point)
                 
-                # Convert to numpy array
+                # Convert to numpy array for fast distance checks
                 self.nominal_np = np.array([
                     np.array([p['position']['x'], p['position']['y'], p['position']['z']]) 
                     for p in self.nominal_points
                 ])
                 
+                # Initialize origin from first point
                 if len(self.nominal_np) > 0:
                     self.initial_pose = self.nominal_np[0]
                 
                 self.path_ready = True
                 self.last_path_update = time.time()
-                
-                self.node.get_logger().info(f"✓ External path received and processed with {len(self.nominal_points)} points")
-                
-                # Notify the main node that path has been updated
+            
+            self.node.get_logger().info(f"✓ External path received: {len(self.nominal_points)} points. Path ready.")
+            
+            # Notify the main node that path has been updated and enable processing
+            try:
+                setattr(self.node, 'path_ready', True)
+                setattr(self.node, 'disable_drift_detection', False)
+                self.node.get_logger().info("Notified main node: path_ready=TRUE, drift detection ENABLED")
                 if hasattr(self.node, 'narration_manager'):
                     nominal_points = self.get_nominal_points_as_numpy()
                     if len(nominal_points) > 0:
                         self.node.narration_manager.update_intended_trajectory(nominal_points)
                         self.node.get_logger().info("Updated narration manager with external path")
-                
-                # Ensure main node can proceed even if it previously timed out waiting
-                try:
-                    setattr(self.node, 'path_ready', True)
-                    setattr(self.node, 'disable_drift_detection', False)
-                except Exception:
-                    pass
+
+            except Exception:
+                pass
+            
+            # One-time listener: stop listening after first valid path
+            try:
+                if self.path_subscriber is not None:
+                    self.node.destroy_subscription(self.path_subscriber)
+                    self.path_subscriber = None
+                    self.node.get_logger().info("Stopped listening for external path (one-time trigger).")
+            except Exception:
+                pass
         except Exception as e:
             self.node.get_logger().error(f"Error processing external path: {e}")
             import traceback
             traceback.print_exc()
-    
-    def _check_external_path_timeout(self, timeout_seconds: float):
-        """Check if external path has timed out."""
-        if self.mode != 'external_planner':
-            return
-        
-        current_time = time.time()
-        if (not self.path_ready or 
-            (current_time - self.last_path_update) > timeout_seconds):
-            
-            require_path = self.external_config.get('require_path', True)
-            if require_path:
-                self.node.get_logger().warn(
-                    f"No external path received for {timeout_seconds}s on topic {self.global_path_topic}"
-                )
     
     def is_ready(self) -> bool:
         """Check if path manager is ready."""

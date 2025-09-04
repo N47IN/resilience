@@ -496,19 +496,24 @@ class ResilienceNode(Node):
         
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
-        # Check if path is ready and drift detection is enabled
-        if not self.can_proceed_with_drift_detection():
-            return
-        
+        # Always compute and print drift, even if detection is disabled
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         pose_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        
+        drift = 0.0
+        nearest_idx = -1
+        if self.path_manager.is_ready():
+            drift, nearest_idx = self.path_manager.compute_drift(pos)
+        
+        # Gate the rest of processing on readiness
+        if not self.can_proceed_with_drift_detection():
+            return
         
         # Check if path manager is ready
         if not self.path_manager.is_ready():
             print("Path manager not ready, skipping pose processing")
             return
         
-        drift, nearest_idx = self.path_manager.compute_drift(pos)
         self.breach_idx = nearest_idx
         
         with self.lock:
@@ -518,8 +523,6 @@ class ResilienceNode(Node):
             self.last_pose_time = pose_time
             
             self.narration_manager.add_actual_point(pos, pose_time, self.flip_y_axis)
-
-
 
         breach_now = self.path_manager.is_breach(drift)
         
@@ -1330,8 +1333,8 @@ class ResilienceNode(Node):
             if current_time - timestamp <= max_age_seconds
         ]
         return recent_vlm_answers
-
-
+    
+    
     
     def _get_ros_timestamp(self, msg):
         """Extract ROS timestamp as float from message header."""
@@ -1339,6 +1342,7 @@ class ResilienceNode(Node):
             return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         except Exception:
             return time.time()
+
 
 
 def main():

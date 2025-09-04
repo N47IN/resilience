@@ -24,7 +24,6 @@ install(PROGRAMS
   scripts/narration_display_node.py
   scripts/depth_octomap_node.py
   scripts/publish_plan.py
-  scripts/test_path_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
