@@ -712,7 +712,7 @@ class ResilienceNode(Node):
             # Publish through semantic bridge with original image timestamp
             success = self.semantic_bridge.publish_merged_hotspots(
                 vlm_hotspots=vlm_hotspots,
-                timestamp=original_image_timestamp,  # Use original image timestamp
+                timestamp=original_image_timestamp, narration=True,  # Use original image timestamp
                 original_image=narration_image
             )
             

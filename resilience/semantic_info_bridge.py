@@ -77,7 +77,7 @@ class SemanticHotspotPublisher:
             return self.vlm_color_map[vlm_answer]
     
     def publish_merged_hotspots(self, vlm_hotspots: Dict[str, np.ndarray], 
-                               timestamp: float, original_image: Optional[np.ndarray] = None) -> bool:
+                               timestamp: float, narration : Optional[bool] = False, original_image: Optional[np.ndarray] = None) -> bool:
         """
         Publish merged hotspot mask with different colors for different VLM answers.
         
@@ -142,7 +142,8 @@ class SemanticHotspotPublisher:
                 'mask_data': merged_mask.flatten().tolist(),  # Colored mask as list
                 'vlm_info': vlm_info,
                 'total_vlm_answers': len(vlm_info),
-                'threshold_used': float(self.hotspot_threshold)
+                'threshold_used': float(self.hotspot_threshold),
+                'is_narration' : narration
             }
             
             # Publish structured data
@@ -285,20 +286,3 @@ class SemanticHotspotSubscriber:
             if hasattr(self.node, 'get_logger'):
                 self.node.get_logger().info("Subscribed to semantic hotspots")
     
-    def hotspot_callback(self, msg: String):
-        """Process incoming binary hotspot masks."""
-        try:
-            if not self.enable_semantic:
-                return
-                
-            data = json.loads(msg.data)
-            
-            if data.get('type') != 'similarity_hotspots':
-                return
-            
-            # This subscriber remains available for direct application if needed by a helper.
-            # The octomap node will primarily consume the JSON via its own subscriber.
-            
-        except Exception as e:
-            if hasattr(self.node, 'get_logger'):
-                self.node.get_logger().error(f"Error processing hotspots: {e}") 

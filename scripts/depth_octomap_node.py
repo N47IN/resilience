@@ -231,7 +231,6 @@ class SemanticDepthOctoMapNode(Node):
 		)
 
 		# Timer for inactivity detection (non-intrusive)
-		self.inactivity_timer = self.create_timer(0.5, self._check_inactivity_timer_cb)
 
 	def camera_info_callback(self, msg: CameraInfo):
 		if self.camera_intrinsics is None:
@@ -327,8 +326,6 @@ class SemanticDepthOctoMapNode(Node):
 			
 			if data.get('type') == 'merged_similarity_hotspots':
 				return self._process_merged_hotspot_message(data)
-			elif data.get('type') == 'similarity_hotspots':
-				return self._process_single_hotspot_message(data)
 			else:
 				return False
 			
@@ -340,6 +337,7 @@ class SemanticDepthOctoMapNode(Node):
 		"""Process merged hotspot message with color-based VLM answer association."""
 		try:
 			mask_shape = data.get('mask_shape')
+			is_narration = data.get('is_narration')
 			mask_data = data.get('mask_data')
 			vlm_info = data.get('vlm_info', {})
 			rgb_timestamp = float(data.get('timestamp', 0.0))
@@ -370,7 +368,7 @@ class SemanticDepthOctoMapNode(Node):
 						vlm_mask, pose_msg, depth_image, vlm_answer, 
 						info.get('hotspot_threshold', 0.6), 
 						{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
-						rgb_timestamp, used_ts
+						rgb_timestamp, used_ts, is_narration
 					)
 					if success:
 						processed_count += 1
@@ -383,36 +381,6 @@ class SemanticDepthOctoMapNode(Node):
 			
 		except Exception as e:
 			self.get_logger().error(f"Error processing merged hotspot message: {e}")
-			return False
-
-	def _process_single_hotspot_message(self, data: dict) -> bool:
-		"""Process single hotspot message (legacy support)."""
-		try:
-			vlm_answer = data.get('vlm_answer')
-			mask_shape = data.get('mask_shape')
-			mask_data = data.get('mask_data')
-			threshold_used = float(data.get('threshold_used', 0.6))
-			stats = data.get('stats', {})
-			rgb_timestamp = float(data.get('timestamp', 0.0))
-			
-			if not vlm_answer or not mask_data or not mask_shape or rgb_timestamp <= 0.0:
-				self.get_logger().warn(f"Incomplete hotspot data: vlm_answer={vlm_answer}, mask_shape={mask_shape}, ts={rgb_timestamp}")
-				return False
-			
-			# Reconstruct binary mask
-			mask = np.array(mask_data, dtype=np.uint8).reshape(tuple(mask_shape))
-			
-			# Lookup closest depth frame and pose by timestamp
-			depth_image, pose_msg, used_ts = self._lookup_depth_and_pose(rgb_timestamp)
-			if depth_image is None or pose_msg is None:
-				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
-				return False
-			
-			# Process hotspot mask with retrieved depth and pose
-			return self._process_hotspot_with_depth(mask, pose_msg, depth_image, vlm_answer, threshold_used, stats, rgb_timestamp, used_ts)
-			
-		except Exception as e:
-			self.get_logger().error(f"Error processing single hotspot message: {e}")
 			return False
 
 	def _lookup_depth_and_pose(self, target_ts: float):
@@ -448,7 +416,7 @@ class SemanticDepthOctoMapNode(Node):
 			return None, None, (None, None)
 
 	def _process_hotspot_with_depth(self, mask: np.ndarray, pose: PoseStamped, depth_m: np.ndarray,
-								   vlm_answer: str, threshold: float, stats: dict, rgb_ts: float, used_ts: tuple) -> bool:
+								   vlm_answer: str, threshold: float, stats: dict, rgb_ts: float, used_ts: tuple, is_narration: bool) -> bool:
 		"""Project hotspot mask using matched depth and pose; update voxel map and semantics."""
 		try:
 			if self.camera_intrinsics is None:
@@ -488,9 +456,11 @@ class SemanticDepthOctoMapNode(Node):
 				return False
 			
 			# Update voxel map with hotspot points
+			if is_narration:
+				self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers",points_world)
+
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
-			
-			# Apply semantic labels to voxels
+
 			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
 			
 			self.get_logger().info(
@@ -505,6 +475,55 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 			return False
 	
+	def save_points_to_latest_nested_subfolder(self, known_folder: str,
+                                           points_world: np.ndarray,
+                                           filename: str = "points.pcd"):
+		"""
+    	Find the latest subfolder1 inside known_folder, then the latest subfolder2 inside it,
+    	and save points_world as a binary PCD file in subfolder2.
+    	"""
+    	# Helper to save PCD
+		def _save_pcd(points: np.ndarray, out_path: str):
+			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+			mask = np.isfinite(pts).all(axis=1)
+			pts = pts[mask]
+			header = (
+    	        "# .PCD v0.7 - Point Cloud Data file format\n"
+    	        "VERSION 0.7\n"
+    	        "FIELDS x y z\n"
+    	        "SIZE 4 4 4\n"
+    	        "TYPE F F F\n"
+    	        "COUNT 1 1 1\n"
+    	        f"WIDTH {pts.shape[0]}\n"
+    	        "HEIGHT 1\n"
+    	        "VIEWPOINT 0 0 0 1 0 0 0\n"
+    	        f"POINTS {pts.shape[0]}\n"
+    	        "DATA binary\n"
+    	    )
+			with open(out_path, "wb") as f:
+				f.write(header.encode("ascii"))
+				f.write(pts.astype("<f4").tobytes())
+			print(f"✅ Saved {pts.shape[0]} points to {out_path}")
+
+    	# Step 1: find latest subfolder1
+		subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
+		               if os.path.isdir(os.path.join(known_folder, d))]
+		if not subfolders1:
+			print(f"⚠️ No subfolders found inside {known_folder}")
+			return
+		latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
+    	# Step 2: find latest subfolder2 inside latest_subfolder1
+		subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
+		               if os.path.isdir(os.path.join(latest_subfolder1, d))]
+		if not subfolders2:
+			print(f"⚠️ No subfolders found inside {latest_subfolder1}")
+			return
+		latest_subfolder2 = max(subfolders2, key=os.path.getmtime)		
+		# Step 3: save PCD inside latest_subfolder2
+		save_path = os.path.join(latest_subfolder2, filename)
+		_save_pcd(points_world, save_path)
+
+
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 										 threshold: float, stats: dict):
 		"""Apply semantic labels to voxels based on hotspot points."""
@@ -990,87 +1009,7 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception:
 			return np.eye(3, dtype=np.float32)
 
-	# ==== Inactivity detection and PCD export ====
-	def _check_inactivity_timer_cb(self):
-		try:
-			now = time.time()
-			inactivity = now - self.last_data_time
-			threshold = float(self.inactivity_threshold_seconds)
-			# Export only once per node lifetime
-			if (not self.semantic_pcd_exported) and inactivity >= threshold:
-				export_dir = self._resolve_export_directory()
-				os.makedirs(export_dir, exist_ok=True)
-				ts_str = time.strftime('%Y%m%d_%H%M%S')
-				filename = f"semantic_voxels_{ts_str}.pcd"
-				filepath = os.path.join(export_dir, filename)
-				count = self._save_semantic_voxels_to_pcd(filepath)
-				if count > 0:
-					self.get_logger().info(f"✓ Exported {count} semantic voxel points to PCD: {filepath}")
-				else:
-					self.get_logger().warn(f"No semantic voxels to export (skipped writing): {filepath}")
-				
-				self.semantic_pcd_exported = True
-		except Exception as e:
-			self.get_logger().error(f"Inactivity check error: {e}")
 
-	def _save_semantic_voxels_to_pcd(self, filepath: str) -> int:
-		"""Write accumulated semantic voxels as PCD using Open3D (XYZ)."""
-		try:
-			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
-				return 0
-			semantic_mapper = self.voxel_helper.semantic_mapper
-			with semantic_mapper.voxel_semantics_lock:
-				voxel_keys = list(semantic_mapper.voxel_semantics.keys())
-			if not voxel_keys:
-				return 0
-			points = []
-			for key in voxel_keys:
-				center = self._get_voxel_center_from_key(key)
-				if center is not None:
-					points.append(center)
-			if not points:
-				return 0
-			pts = np.array(points, dtype=np.float32)
-			try:
-				import open3d as o3d
-				pcd = o3d.geometry.PointCloud()
-				pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-				ok = o3d.io.write_point_cloud(filepath, pcd, write_ascii=True)
-				return int(pts.shape[0] if ok else 0)
-			except Exception:
-				# Fallback to simple ASCII PCD header if Open3D not available
-				with open(filepath, 'w') as f:
-					f.write("# .PCD v0.7 - Point Cloud Data file\n")
-					f.write("VERSION 0.7\n")
-					f.write("FIELDS x y z\n")
-					f.write("SIZE 4 4 4\n")
-					f.write("TYPE F F F\n")
-					f.write("COUNT 1 1 1\n")
-					f.write(f"WIDTH {pts.shape[0]}\n")
-					f.write("HEIGHT 1\n")
-					f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-					f.write(f"POINTS {pts.shape[0]}\n")
-					f.write("DATA ascii\n")
-					for p in pts:
-						f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
-				return pts.shape[0]
-		except Exception as e:
-			self.get_logger().error(f"Failed to save semantic voxels to PCD: {e}")
-			return 0
-
-	def _resolve_export_directory(self) -> str:
-		"""Return latest run_* dir under buffers if available; else configured directory."""
-		try:
-			base_dir = str(self.semantic_export_directory or '').strip()
-			root = base_dir
-			if base_dir.endswith('/buffers') and os.path.isdir(base_dir):
-				candidates = [os.path.join(base_dir, d) for d in os.listdir(base_dir) if d.startswith('run_')]
-				if candidates:
-					candidates.sort(key=lambda p: os.path.getmtime(p))
-					return candidates[-1]
-			return root
-		except Exception:
-			return str(self.semantic_export_directory)
 
 
 
