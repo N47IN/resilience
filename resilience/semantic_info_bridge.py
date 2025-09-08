@@ -28,7 +28,7 @@ class SemanticHotspotPublisher:
         self.config = config.get('semantic_bridge', {}) if config else {}
         self.hotspot_threshold = self.config.get('hotspot_similarity_threshold', 0.6)
         self.min_area = self.config.get('min_hotspot_area', 100)
-        self.publish_rate_limit = self.config.get('publish_rate_limit', 2.0)
+        self.publish_rate_limit = self.config.get('publish_rate_limit', 100.0)
         
         # Load topic configuration
         topics_config = self.config.get('topics', {})

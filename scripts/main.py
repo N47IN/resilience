@@ -304,45 +304,13 @@ class ResilienceNode(Node):
         
         if vlm_enabled:
             all_objects = self.naradio_processor.get_all_objects()
-            print(f"  - Total objects: {len(all_objects)}")
-            
-            # Print embedding method configuration
-            self.print_embedding_method_config()
-            
-            self.publish_vlm_objects_legend()
-        
+        print(f"  - Total objects: {len(all_objects)}")
         print(f"RGB buffer size: {self.max_rgb_buffer}")
+        config = self.naradio_processor.segmentation_config
+        prefer_enhanced = config['segmentation'].get('prefer_enhanced_embeddings', True)
+        
+        print(f"Embedding method: {'ENHANCED' if prefer_enhanced else 'TEXT'}")
 
-    def print_embedding_method_config(self):
-        """Print information about embedding method configuration and availability."""
-        try:
-            if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
-                return
-            
-            # Get config preference
-            config = self.naradio_processor.segmentation_config
-            prefer_enhanced = config['segmentation'].get('prefer_enhanced_embeddings', True)
-            
-            print(f"Embedding method: {'ENHANCED' if prefer_enhanced else 'TEXT'}")
-            
-        except Exception as e:
-            print(f"Error printing embedding method config: {e}")
-
-    def publish_vlm_objects_legend(self):
-        """Publish VLM objects legend."""
-        if (hasattr(self, 'segmentation_legend_pub') and 
-            hasattr(self, 'naradio_processor') and 
-            self.naradio_processor.is_segmentation_ready()):
-            
-            try:
-                all_objects = self.naradio_processor.get_all_objects()
-                legend_text = "VLM Objects Available for Similarity:\n"
-                for i, obj in enumerate(all_objects):
-                    legend_text += f"{i}: {obj}\n"
-                
-                self.segmentation_legend_pub.publish(String(data=legend_text))
-            except Exception as e:
-                print(f"Error publishing VLM objects legend: {e}")
 
     def init_components(self):
         """Initialize resilience components."""
@@ -577,136 +545,12 @@ class ResilienceNode(Node):
             if self.risk_buffer_manager and len(self.risk_buffer_manager.active_buffers) > 0 and self.current_breach_active:
                 self.risk_buffer_manager.add_pose(pose_time, pos, drift)
                 
-                self.save_lagged_image_for_pose(pose_time, drift)
 
         if self.current_breach_active and not self.narration_manager.get_narration_sent():
             narration = self.narration_manager.check_for_narration(pose_time, self.breach_idx)
             if narration:
                 self.publish_narration_with_image(narration)
                 self.narration_pub.publish(String(data=narration))
-
-        with self.processing_lock:
-            if (self.latest_rgb_msg is not None and 
-                self.latest_depth_msg is not None and 
-                self.current_breach_active and
-                not self.is_processing):
-                self.trigger_detection_processing()
-
-        if self.use_tf:
-            self.publish_tf(pos, msg.header.stamp)
-
-    def trigger_detection_processing(self):
-        """Trigger detection processing in a separate thread."""
-        if not self.is_processing:
-            self.is_processing = True
-            processing_thread = threading.Thread(target=self.process_detection_async, daemon=True)
-            processing_thread.start()
-
-    def process_detection_async(self):
-        """Process detection asynchronously to prevent blocking."""
-        try:
-            with self.processing_lock:
-                if (self.latest_rgb_msg is None or 
-                    self.latest_depth_msg is None or 
-                    self.detection_pose is None):
-                    return
-                
-                rgb_msg = self.latest_rgb_msg
-                depth_msg = self.latest_depth_msg
-                pose = self.detection_pose
-                pose_time = self.detection_pose_time
-            
-            if not self.naradio_processor.is_ready():
-                return
-                
-            if not self.camera_info_received:
-                return
-            
-            self.process_detection(rgb_msg, depth_msg, pose, pose_time)
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.is_processing = False
-
-    def process_detection(self, rgb_msg, depth_msg, pose, pose_time):
-        """Process NARadio detection with latest messages."""
-        try:
-            rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
-            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-
-            transform_matrix = self.pose_to_transform_matrix(pose)
-
-            # Process features and get similarity maps
-            feat_map_np, naradio_vis = self.naradio_processor.process_features_optimized(
-                rgb_image, 
-                need_visualization=False,  # Disabled for speed
-                reuse_features=True
-            )
-            
-            # Get dynamic VLM objects and their similarity maps
-            if (self.enable_combined_segmentation and 
-                self.naradio_processor.is_segmentation_ready() and
-                self.naradio_processor.dynamic_objects and
-                feat_map_np is not None):
-                
-                try:
-                    # Create merged hotspot masks for all VLM answers
-                    vlm_answers = self.naradio_processor.dynamic_objects
-                    vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers)
-                    
-                    if vlm_hotspots and len(vlm_hotspots) > 0:
-                        # Get RGB timestamp for this image
-                        rgb_timestamp = self._get_ros_timestamp(rgb_msg)
-                        
-                        # Publish merged hotspots with color-based association
-                        self.semantic_bridge.publish_merged_hotspots(
-                            vlm_hotspots=vlm_hotspots,
-                            timestamp=rgb_timestamp,
-                            original_image=rgb_image
-                        )
-                
-                except Exception as seg_e:
-                    pass  # Silent error handling
-            
-            # Publish NARadio image if visualization is enabled
-            if self.enable_naradio_visualization and naradio_vis is not None:
-                naradio_msg = self.bridge.cv2_to_imgmsg(naradio_vis, encoding='rgb8')
-                naradio_msg.header = rgb_msg.header
-                self.naradio_image_pub.publish(naradio_msg)
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-
-    def pose_to_transform_matrix(self, pose):
-        """Create transform matrix from pose to origin."""
-        T = np.eye(4)
-        initial_pose = self.path_manager.get_initial_pose()
-        
-        T[0, 3] = pose[0] - initial_pose[0]
-        T[1, 3] = pose[1] - initial_pose[1] 
-        T[2, 3] = pose[2] - initial_pose[2]
-        
-        return T
-
-    def publish_tf(self, pos, stamp):
-        """Publish transform."""
-        if self.use_tf and self.tf_broadcaster:
-            t = TransformStamped()
-            t.header.stamp = stamp
-            t.header.frame_id = 'map'
-            t.child_frame_id = 'robot'
-            initial_pose = self.path_manager.get_initial_pose()
-            t.transform.translation.x = float(pos[0] - initial_pose[0])
-            t.transform.translation.y = float(pos[1] - initial_pose[1])
-            t.transform.translation.z = float(pos[2] - initial_pose[2])
-            t.transform.rotation.x = 0.0
-            t.transform.rotation.y = 0.0
-            t.transform.rotation.z = 0.0
-            t.transform.rotation.w = 1.0
-            self.tf_broadcaster.sendTransform(t)
 
     def publish_narration_with_image(self, narration_text):
         """Publish both narration text and accompanying image together"""
@@ -795,63 +639,6 @@ class ResilienceNode(Node):
             print(f"Error loading enhanced embedding: {e}")
             return None
 
-    def save_lagged_image_for_pose(self, pose_time, drift):
-        """Extracted lagged image saving logic for pose callback."""
-        if not self.image_buffer:
-            return
-            
-        newest_timestamp = self.image_buffer[-1][1]
-        current_time = newest_timestamp
-        
-        target_time_offset = 1.0
-        target_time = current_time - target_time_offset
-        
-        oldest_timestamp = self.image_buffer[0][1] if self.image_buffer else current_time
-        available_time_back = current_time - oldest_timestamp
-        
-        if available_time_back < target_time_offset:
-            target_time = oldest_timestamp
-            actual_offset = available_time_back
-        else:
-            actual_offset = target_time_offset
-        
-        closest_image = None
-        closest_msg = None
-        min_time_diff = float('inf')
-        
-        for image, timestamp, msg in self.image_buffer:
-            time_diff = abs(timestamp - target_time)
-            if time_diff < min_time_diff:
-                min_time_diff = time_diff
-                closest_image = image
-                closest_msg = msg
-        
-        if closest_image is not None and closest_msg is not None:
-            current_buffer_id = None
-            if len(self.risk_buffer_manager.active_buffers) > 0:
-                current_buffer_id = self.risk_buffer_manager.active_buffers[-1].buffer_id
-            
-            image_timestamp = closest_msg.header.stamp.sec + closest_msg.header.stamp.nanosec * 1e-9
-            self.save_lagged_image_to_buffer(closest_image, image_timestamp, closest_msg, current_time, actual_offset, current_buffer_id)
-
-    def save_lagged_image_to_buffer(self, image, image_timestamp, msg, current_time, time_lag, buffer_id):
-        """Save a lagged image with reduced verbose logging."""
-        try:
-            if buffer_id is None:
-                return
-            
-            buffer_dir = os.path.join(self.current_run_dir, buffer_id)
-            lagged_dir = os.path.join(buffer_dir, 'lagged_images')
-            os.makedirs(lagged_dir, exist_ok=True)
-            
-            image_filename = f"lagged_image_{current_time:.3f}_{image_timestamp:.3f}.png"
-            image_path = os.path.join(lagged_dir, image_filename)
-            cv2.imwrite(image_path, image)
-            
-        except Exception as e:
-            print(f"Error saving lagged image to buffer: {e}")
-            import traceback
-            traceback.print_exc()
 
     def save_narration_image_to_buffer(self, image, narration_text, current_time):
         """Save narration image to the current buffer directory."""
@@ -945,11 +732,6 @@ class ResilienceNode(Node):
             traceback.print_exc()
             return False
 
-    # NOTE: Complex hotspot extraction removed - using clean semantic bridge instead
-
-
-
-
 
     def _get_ros_timestamp(self, msg):
         """Extract ROS timestamp as float from message header."""
@@ -957,8 +739,6 @@ class ResilienceNode(Node):
             return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         except Exception:
             return time.time()
-
-
 
 
     def naradio_processing_loop(self):
@@ -1041,14 +821,6 @@ class ResilienceNode(Node):
                         
                         except Exception as seg_e:
                             pass  # SPEED OPTIMIZATION: Silent error handling
-                    
-                    # SPEED OPTIMIZATION: Skip NARadio image publishing to reduce overhead
-                    # if naradio_vis is not None:
-                    #     naradio_msg = self.bridge.cv2_to_imgmsg(naradio_vis, encoding='rgb8')
-                    #     naradio_msg.header = rgb_msg.header
-                    #     self.naradio_image_pub.publish(naradio_msg)
-                    
-                    # NOTE: Old continuous similarity processing removed - using smart semantic regions instead
                         
                 except Exception as e:
                     time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced sleep on error
@@ -1078,9 +850,7 @@ class ResilienceNode(Node):
             
             # Track this VLM answer as recent for smart semantic processing
             self.recent_vlm_answers[vlm_answer] = time.time()
-            
-            # Clean up old VLM answers periodically
-            self._cleanup_old_vlm_answers(max_age_seconds=300.0)
+
             
             # Add VLM answer to NARadio processor for continuous monitoring
             if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
@@ -1306,16 +1076,6 @@ class ResilienceNode(Node):
         except Exception as e:
             print(f"Error associating VLM answer with buffer: {e}")
 
-    def _cleanup_old_vlm_answers(self, max_age_seconds: float):
-        """Clean up old VLM answers to prevent memory buildup."""
-        try:
-            current_time = time.time()
-            self.recent_vlm_answers = {
-                vlm_answer: timestamp for vlm_answer, timestamp in self.recent_vlm_answers.items()
-                if current_time - timestamp <= max_age_seconds
-            }
-        except Exception as e:
-            print(f"Error cleaning up old VLM answers: {e}")
 
     def _get_recent_vlm_answers(self, max_age_seconds: float) -> List[str]:
         """
@@ -1333,8 +1093,6 @@ class ResilienceNode(Node):
             if current_time - timestamp <= max_age_seconds
         ]
         return recent_vlm_answers
-    
-    
     
     def _get_ros_timestamp(self, msg):
         """Extract ROS timestamp as float from message header."""
