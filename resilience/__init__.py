@@ -13,6 +13,7 @@ from .semantic_info_bridge import SemanticHotspotPublisher, SemanticHotspotSubsc
 from .semantic_hotspot_helper import SemanticHotspotHelper
 from .semantic_voxel_mapper import SemanticVoxelMapper
 from .voxel_mapping_helper import VoxelMappingHelper
+from .voxel_gp_helper import DisturbanceFieldHelper
 
 __all__ = [
     'DriftCalculator',
@@ -29,5 +30,6 @@ __all__ = [
     'SemanticHotspotSubscriber',
     'SemanticHotspotHelper',
     'SemanticVoxelMapper',
-    'VoxelMappingHelper'
+    'VoxelMappingHelper',
+    'DisturbanceFieldHelper'
 ] 

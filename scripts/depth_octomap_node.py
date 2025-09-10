@@ -37,6 +37,20 @@ try:
 except ImportError:
 	HELPERS_AVAILABLE = False
 
+# Optional GP helper
+try:
+	from resilience.voxel_gp_helper import DisturbanceFieldHelper
+	GP_HELPER_AVAILABLE = True
+except ImportError:
+	GP_HELPER_AVAILABLE = False
+
+# Optional PathManager for global path access
+try:
+	from resilience.path_manager import PathManager
+	PATH_MANAGER_AVAILABLE = True
+except ImportError:
+	PATH_MANAGER_AVAILABLE = False
+
 
 class SemanticDepthOctoMapNode(Node):
 	"""Simplified semantic depth octomap node using helpers."""
@@ -78,7 +92,9 @@ class SemanticDepthOctoMapNode(Node):
 			# New: inactivity detection and export
 			('inactivity_threshold_seconds', 2.5),
 			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers'),
-			('mapping_config_path', '')
+			('mapping_config_path', ''),
+			('nominal_path', '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json'),
+			('main_config_path', '')
 		])
 
 		params = self.get_parameters([
@@ -88,7 +104,7 @@ class SemanticDepthOctoMapNode(Node):
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate', 'stats_publish_rate',
 			'pose_is_base_link', 'apply_optical_frame_rotation', 'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim',
 			'enable_semantic_mapping', 'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval',
-			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory', 'mapping_config_path'
+			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory', 'mapping_config_path', 'nominal_path', 'main_config_path'
 		])
 
 		# Extract parameter values
@@ -100,7 +116,11 @@ class SemanticDepthOctoMapNode(Node):
 		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
 		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval,
 		 self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds,
-		 self.semantic_export_directory, self.mapping_config_path) = [p.value for p in params]
+		 self.semantic_export_directory, self.mapping_config_path, self.nominal_path, self.main_config_path) = [p.value for p in params]
+
+		# Read nominal path separately (optional for GP)
+		self.nominal_path = self.get_parameter('nominal_path').value
+		self.main_config_path = self.get_parameter('main_config_path').value
 
 		# Load topic configuration from mapping config
 		self.load_topic_configuration()
@@ -128,6 +148,7 @@ class SemanticDepthOctoMapNode(Node):
 			self.camera_info_topic = topics.get('camera_info_topic', '/robot_1/sensors/front_stereo/left/camera_info')
 			self.pose_topic = topics.get('pose_topic', '/robot_1/sensors/front_stereo/pose')
 			self.semantic_hotspots_topic = topics.get('semantic_hotspots_topic', '/semantic_hotspots')
+			self.semantic_hotspot_mask_topic = topics.get('semantic_hotspot_mask_topic', '/semantic_hotspot_mask')
 			
 			# Output topics
 			self.semantic_octomap_markers_topic = topics.get('semantic_octomap_markers_topic', '/semantic_octomap_markers')
@@ -144,6 +165,7 @@ class SemanticDepthOctoMapNode(Node):
 			self.camera_info_topic = '/robot_1/sensors/front_stereo/left/camera_info'
 			self.pose_topic = '/robot_1/sensors/front_stereo/pose'
 			self.semantic_hotspots_topic = '/semantic_hotspots'
+			self.semantic_hotspot_mask_topic = '/semantic_hotspot_mask'
 			self.semantic_octomap_markers_topic = '/semantic_octomap_markers'
 			self.semantic_octomap_stats_topic = '/semantic_octomap_stats'
 			self.semantic_octomap_colored_cloud_topic = '/semantic_octomap_colored_cloud'
@@ -163,8 +185,55 @@ class SemanticDepthOctoMapNode(Node):
 		# Timestamped buffers for sync
 		self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters)
 		self.pose_buffer = []   # list of tuples (timestamp_float, PoseStamped)
+		self.mask_buffer = []   # list of tuples (timestamp_float, merged_mask_rgb_uint8)
 		self.sync_buffer_duration = float(self.sync_buffer_seconds)
 		self.sync_lock = threading.Lock()
+
+		# GP fitting state
+		self.gp_fit_lock = threading.Lock()
+		self.gp_fitting_active = False
+
+		# Optional: initialize PathManager for accessing global path (non-blocking)
+		self.path_manager = None
+		if PATH_MANAGER_AVAILABLE:
+			try:
+				# Load path_mode config from main config
+				path_config = None
+				if isinstance(self.main_config_path, str) and len(self.main_config_path) > 0:
+					import yaml
+					with open(self.main_config_path, 'r') as f:
+						cfg = yaml.safe_load(f)
+					path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
+				else:
+					try:
+						from ament_index_python.packages import get_package_share_directory
+						package_dir = get_package_share_directory('resilience')
+						default_main = os.path.join(package_dir, 'config', 'main_config.yaml')
+						import yaml
+						with open(default_main, 'r') as f:
+							cfg = yaml.safe_load(f)
+						path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
+					except Exception:
+						path_config = {}
+				self.path_manager = PathManager(self, path_config)
+				self.get_logger().info("PathManager initialized for nominal path access (non-blocking)")
+				# Announce nominal source preference at startup
+				if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
+					self.get_logger().info(f"Nominal source preference: GLOBAL PATH via PathManager when available; fallback FILE: {self.nominal_path}")
+				else:
+					self.get_logger().info("Nominal source preference: GLOBAL PATH via PathManager; no file fallback provided")
+			except Exception as e:
+				self.get_logger().warn(f"Failed to initialize PathManager: {e}")
+				if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
+					self.get_logger().info(f"Nominal source: FILE only: {self.nominal_path}")
+				else:
+					self.get_logger().warn("Nominal source: NONE available (no PathManager, no file)")
+		else:
+			# No PathManager available
+			if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
+				self.get_logger().info(f"Nominal source: FILE only: {self.nominal_path}")
+			else:
+				self.get_logger().warn("Nominal source: NONE available (PathManager not available, no file path)")
 
 		# Queue system for bridge messages
 		self.bridge_message_queue = []
@@ -208,9 +277,10 @@ class SemanticDepthOctoMapNode(Node):
 		self.create_subscription(Image, self.depth_topic, self.depth_callback, sensor_qos)
 		self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
 		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
-		# Subscribe to semantic hotspots (timestamp-only bridge)
+		# Subscribe to semantic hotspots and mask image
 		if self.enable_semantic_mapping and self.enable_voxel_mapping:
 			self.create_subscription(String, self.semantic_hotspots_topic, self.semantic_hotspot_callback, 10)
+			self.create_subscription(Image, self.semantic_hotspot_mask_topic, self.semantic_hotspot_mask_callback, 10)
 
 		# Publishers
 		self.marker_pub = self.create_publisher(MarkerArray, self.semantic_octomap_markers_topic, 10) if self.publish_markers else None
@@ -252,8 +322,21 @@ class SemanticDepthOctoMapNode(Node):
 		# Update activity
 		self.last_data_time = time.time()
 
+	def semantic_hotspot_mask_callback(self, msg: Image):
+		"""Buffer the merged hotspot mask image keyed by its stamp time."""
+		try:
+			mask_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+			mask_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+			with self.sync_lock:
+				self.mask_buffer.append((mask_time, mask_rgb))
+				self._prune_sync_buffers()
+			# Update activity
+			self.last_data_time = time.time()
+		except Exception as e:
+			self.get_logger().warn(f"Failed to buffer hotspot mask image: {e}")
+
 	def semantic_hotspot_callback(self, msg: String):
-		"""Queue incoming semantic hotspot messages for batch processing."""
+		"""Queue incoming semantic hotspot metadata for batch processing."""
 		try:
 			if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
 				return
@@ -332,22 +415,23 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().error(f"Error processing single bridge message: {e}")
 			return False
-
+	
 	def _process_merged_hotspot_message(self, data: dict) -> bool:
-		"""Process merged hotspot message with color-based VLM answer association."""
+		"""Process merged hotspot metadata; fetch mask image by timestamp and apply."""
 		try:
-			mask_shape = data.get('mask_shape')
 			is_narration = data.get('is_narration')
-			mask_data = data.get('mask_data')
 			vlm_info = data.get('vlm_info', {})
 			rgb_timestamp = float(data.get('timestamp', 0.0))
 			
-			if not mask_data or not mask_shape or rgb_timestamp <= 0.0:
-				self.get_logger().warn(f"Incomplete merged hotspot data")
+			if rgb_timestamp <= 0.0:
+				self.get_logger().warn(f"Incomplete hotspot data (no timestamp)")
 				return False
 			
-			# Reconstruct colored mask
-			merged_mask = np.array(mask_data, dtype=np.uint8).reshape(tuple(mask_shape))
+			# Lookup merged mask image by timestamp
+			merged_mask = self._lookup_mask(rgb_timestamp)
+			if merged_mask is None:
+				self.get_logger().warn(f"No matching hotspot mask found for timestamp {rgb_timestamp:.6f}")
+				return False
 			
 			# Lookup closest depth frame and pose by timestamp
 			depth_image, pose_msg, used_ts = self._lookup_depth_and_pose(rgb_timestamp)
@@ -359,10 +443,8 @@ class SemanticDepthOctoMapNode(Node):
 			processed_count = 0
 			for vlm_answer, info in vlm_info.items():
 				color = info.get('color', [0, 0, 0])
-				
 				# Create binary mask for this VLM answer based on color
 				vlm_mask = np.all(merged_mask == color, axis=2)
-				
 				if np.any(vlm_mask):
 					success = self._process_hotspot_with_depth(
 						vlm_mask, pose_msg, depth_image, vlm_answer, 
@@ -372,17 +454,15 @@ class SemanticDepthOctoMapNode(Node):
 					)
 					if success:
 						processed_count += 1
-						# NEW: Special logging for narration hotspots
-						if len(vlm_info) == 1:  # Single VLM answer (likely narration)
+						if len(vlm_info) == 1:
 							self.get_logger().info(f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels")
-			
 			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots")
 			return processed_count > 0
 			
 		except Exception as e:
 			self.get_logger().error(f"Error processing merged hotspot message: {e}")
 			return False
-
+	
 	def _lookup_depth_and_pose(self, target_ts: float):
 		"""Find closest depth frame and pose to target timestamp within buffer window."""
 		with self.sync_lock:
@@ -414,7 +494,19 @@ class SemanticDepthOctoMapNode(Node):
 				return best_depth, best_pose, (best_depth_ts, best_pose_ts)
 			
 			return None, None, (None, None)
-
+	
+	def _lookup_mask(self, target_ts: float) -> Optional[np.ndarray]:
+		"""Find closest merged mask image to target timestamp within buffer window."""
+		with self.sync_lock:
+			best_mask = None
+			best_dt = float('inf')
+			for ts, mask in self.mask_buffer:
+				dt = abs(ts - target_ts)
+				if dt < best_dt and dt <= self.sync_buffer_duration:
+					best_dt = dt
+					best_mask = mask
+			return best_mask
+	
 	def _process_hotspot_with_depth(self, mask: np.ndarray, pose: PoseStamped, depth_m: np.ndarray,
 								   vlm_answer: str, threshold: float, stats: dict, rgb_ts: float, used_ts: tuple, is_narration: bool) -> bool:
 		"""Project hotspot mask using matched depth and pose; update voxel map and semantics."""
@@ -457,7 +549,12 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Update voxel map with hotspot points
 			if is_narration:
-				self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers",points_world)
+				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world)
+				# Kick off background GP fit using voxelized points and buffer trajectories
+				if buffer_dir is not None and GP_HELPER_AVAILABLE:
+					# Use voxelized points for GP fitting to avoid memory issues
+					voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
+					self._start_background_gp_fit(buffer_dir, voxelized_points)
 
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
 
@@ -475,12 +572,51 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 			return False
 	
+	def _voxelize_pointcloud(self, points: np.ndarray, voxel_size: float, max_points: int = 200) -> np.ndarray:
+		"""
+		Voxelize a point cloud by taking the centroid of points within each voxel.
+		This reduces the number of points while preserving the spatial distribution.
+		If still too many points after voxelization, randomly sample down to max_points.
+		"""
+		if len(points) == 0:
+			return points
+		
+		# Convert points to voxel coordinates
+		voxel_coords = np.floor(points / voxel_size).astype(np.int32)
+		
+		# Find unique voxels and their indices
+		unique_voxels, inverse_indices = np.unique(voxel_coords, axis=0, return_inverse=True)
+		
+		# Compute centroids for each voxel
+		voxelized_points = []
+		for i in range(len(unique_voxels)):
+			# Find all points belonging to this voxel
+			voxel_mask = inverse_indices == i
+			voxel_points = points[voxel_mask]
+			
+			# Take centroid
+			centroid = np.mean(voxel_points, axis=0)
+			voxelized_points.append(centroid)
+		
+		voxelized_points = np.array(voxelized_points)
+		
+		# If still too many points, randomly sample down
+		if len(voxelized_points) > max_points:
+			indices = np.random.choice(len(voxelized_points), size=max_points, replace=False)
+			voxelized_points = voxelized_points[indices]
+			self.get_logger().info(f"Voxelized {len(points)} points to {len(voxelized_points)} points (voxel_size={voxel_size:.3f}m, sampled to max {max_points})")
+		else:
+			self.get_logger().info(f"Voxelized {len(points)} points to {len(voxelized_points)} points (voxel_size={voxel_size:.3f}m)")
+		
+		return voxelized_points
+
 	def save_points_to_latest_nested_subfolder(self, known_folder: str,
-                                           points_world: np.ndarray,
-                                           filename: str = "points.pcd"):
+	                                      points_world: np.ndarray,
+	                                      filename: str = "points.pcd"):
 		"""
     	Find the latest subfolder1 inside known_folder, then the latest subfolder2 inside it,
     	and save points_world as a binary PCD file in subfolder2.
+    	Voxelizes the points first to reduce density for GP fitting.
     	"""
     	# Helper to save PCD
 		def _save_pcd(points: np.ndarray, out_path: str):
@@ -503,29 +639,110 @@ class SemanticDepthOctoMapNode(Node):
 			with open(out_path, "wb") as f:
 				f.write(header.encode("ascii"))
 				f.write(pts.astype("<f4").tobytes())
-			print(f"✅ Saved {pts.shape[0]} points to {out_path}")
+			print(f"Saved {pts.shape[0]} voxelized points to {out_path}")
+
+		# Voxelize points before saving to reduce density for GP fitting
+		voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
 
     	# Step 1: find latest subfolder1
 		subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
 		               if os.path.isdir(os.path.join(known_folder, d))]
 		if not subfolders1:
-			print(f"⚠️ No subfolders found inside {known_folder}")
-			return
+			print(f"No subfolders found inside {known_folder}")
+			return None, None
 		latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
     	# Step 2: find latest subfolder2 inside latest_subfolder1
 		subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
 		               if os.path.isdir(os.path.join(latest_subfolder1, d))]
 		if not subfolders2:
-			print(f"⚠️ No subfolders found inside {latest_subfolder1}")
-			return
+			print(f"No subfolders found inside {latest_subfolder1}")
+			return None, None
 		latest_subfolder2 = max(subfolders2, key=os.path.getmtime)		
-		# Step 3: save PCD inside latest_subfolder2
+		# Step 3: save voxelized PCD inside latest_subfolder2
 		save_path = os.path.join(latest_subfolder2, filename)
-		_save_pcd(points_world, save_path)
+		_save_pcd(voxelized_points, save_path)
+		return latest_subfolder2, save_path
 
+	def _start_background_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+		"""Start GP fitting in a background thread if not already running."""
+		try:
+			with self.gp_fit_lock:
+				if self.gp_fitting_active:
+					self.get_logger().info("GP fit already running; skipping new request")
+					return
+				self.gp_fitting_active = True
+			args = (buffer_dir, np.array(pointcloud_xyz, dtype=np.float32))
+			threading.Thread(target=self._run_gp_fit_task, args=args, daemon=True).start()
+		except Exception as e:
+			self.get_logger().warn(f"Failed to start GP fit thread: {e}")
+
+	def _run_gp_fit_task(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+		"""Run GP fitting and save parameters to buffer directory."""
+		try:
+			self.get_logger().info(f"Starting GP fit for buffer: {buffer_dir}")
+			helper = DisturbanceFieldHelper()
+			# Try to get nominal XYZ from PathManager if available and ready
+			nominal_xyz = None
+			try:
+				if self.path_manager is not None and hasattr(self.path_manager, 'get_nominal_points_as_numpy'):
+					nominal_xyz = self.path_manager.get_nominal_points_as_numpy()
+					if nominal_xyz is not None and len(nominal_xyz) == 0:
+						nominal_xyz = None
+			except Exception:
+				pass
+			# Announce which nominal will be used for this GP fit
+			if nominal_xyz is not None:
+				self.get_logger().info(f"GP nominal source: GLOBAL PATH (points={len(nominal_xyz)})")
+			elif isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
+				self.get_logger().info(f"GP nominal source: FILE {self.nominal_path}")
+			else:
+				self.get_logger().warn("GP nominal source: NONE (using actual-only baseline)")
+			result = helper.fit_from_pointcloud_and_buffer(
+				pointcloud_xyz=pointcloud_xyz,
+				buffer_dir=buffer_dir,
+				nominal_path=(None if nominal_xyz is not None else (self.nominal_path if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0 else None)),
+				nominal_xyz=nominal_xyz
+			)
+			fit = result.get('fit', {})
+			opt = fit.get('optimization_result') if isinstance(fit, dict) else None
+			o = {
+				'fit_params': {
+					'lxy': fit.get('lxy'),
+					'lz': fit.get('lz'),
+					'A': fit.get('A'),
+					'b': fit.get('b'),
+					'mse': fit.get('mse'),
+					'rmse': fit.get('rmse'),
+					'mae': fit.get('mae'),
+					'r2_score': fit.get('r2_score')
+				},
+				'optimization': ({
+					'nit': getattr(opt, 'nit', None),
+					'nfev': getattr(opt, 'nfev', None),
+					'success': getattr(opt, 'success', None),
+					'message': getattr(opt, 'message', None)
+				} if opt is not None else None),
+				'metadata': {
+					'timestamp': time.time(),
+					'buffer_dir': buffer_dir,
+					'nominal_path': self.nominal_path,
+					'used_nominal_source': ('path_manager' if nominal_xyz is not None else 'file' if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0 else 'none')
+				}
+			}
+			out_path = os.path.join(buffer_dir, 'voxel_gp_fit.json')
+			with open(out_path, 'w') as f:
+				json.dump(o, f, indent=2)
+			self.get_logger().info(f"Saved GP fit parameters to {out_path}")
+		except Exception as e:
+			self.get_logger().error(f"GP fit task failed: {e}")
+			import traceback
+			traceback.print_exc()
+		finally:
+			with self.gp_fit_lock:
+				self.gp_fitting_active = False
 
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
-										 threshold: float, stats: dict):
+									 threshold: float, stats: dict):
 		"""Apply semantic labels to voxels based on hotspot points."""
 		try:
 			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
@@ -560,7 +777,7 @@ class SemanticDepthOctoMapNode(Node):
 			
 		except Exception as e:
 			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
-	
+		
 	def depth_callback(self, msg: Image):
 		if self.camera_intrinsics is None:
 			self.get_logger().warn("No camera intrinsics received yet")
@@ -607,12 +824,14 @@ class SemanticDepthOctoMapNode(Node):
 	def _prune_sync_buffers(self):
 		"""Keep only recent entries within sync window."""
 		cutoff = time.time() - self.sync_buffer_duration
-		# Depth buffer is keyed by message stamps; we cannot use wall time; simply limit by length and by age heuristics
+		# Depth/mask/pose buffers capped by length (heuristic) to bound memory
 		max_entries = 200
 		if len(self.depth_buffer) > max_entries:
 			self.depth_buffer = self.depth_buffer[-max_entries:]
 		if len(self.pose_buffer) > max_entries:
 			self.pose_buffer = self.pose_buffer[-max_entries:]
+		if len(self.mask_buffer) > max_entries:
+			self.mask_buffer = self.mask_buffer[-max_entries:]
 
 	def _depth_to_meters(self, depth, encoding: str):
 		try:
@@ -625,7 +844,7 @@ class SemanticDepthOctoMapNode(Node):
 				return depth.astype(np.float32) / 1000.0
 		except Exception:
 			return None
-
+	
 	def _depth_to_world_points(self, depth_m: np.ndarray, intrinsics, pose: PoseStamped):
 		try:
 			fx, fy, cx, cy = intrinsics
@@ -674,7 +893,7 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Check if semantic mapper is available
 			has_semantic_mapper = (hasattr(self.voxel_helper, 'semantic_mapper') and 
-						  self.voxel_helper.semantic_mapper is not None)
+					  self.voxel_helper.semantic_mapper is not None)
 			
 			if has_semantic_mapper:
 				semantic_mapper = self.voxel_helper.semantic_mapper
@@ -780,7 +999,7 @@ class SemanticDepthOctoMapNode(Node):
 			import traceback
 			traceback.print_exc()
 			return None
-
+	
 	def _get_vlm_answer_color(self, vlm_answer: str) -> List[int]:
 		"""Get consistent color for VLM answer (same as bridge)."""
 		# Use same color palette as semantic bridge
@@ -805,7 +1024,7 @@ class SemanticDepthOctoMapNode(Node):
 		# Simple hash-based color assignment
 		hash_val = hash(vlm_answer) % len(color_palette)
 		return color_palette[hash_val]
-
+	
 	def _get_voxel_center_from_key(self, voxel_key: tuple) -> Optional[np.ndarray]:
 		"""Get voxel center position from voxel key."""
 		try:
@@ -821,7 +1040,7 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().warn(f"Error getting voxel center for key {voxel_key}: {e}")
 			return None
-
+	
 	def _create_semantic_only_cloud(self) -> Optional[PointCloud2]:
 		"""Create a point cloud containing all accumulated semantic voxels (red)."""
 		try:

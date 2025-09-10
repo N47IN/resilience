@@ -76,18 +76,21 @@ class SemanticHotspotPublisher:
                 self.vlm_color_map[vlm_answer] = self.color_palette[color_idx]
             return self.vlm_color_map[vlm_answer]
     
+    def _set_msg_stamp_from_float(self, ros_img_msg: Image, timestamp: float):
+        """Set ROS2 header.stamp on an Image message from a float seconds timestamp."""
+        try:
+            sec = int(timestamp)
+            nsec = int((timestamp - sec) * 1e9)
+            ros_img_msg.header.stamp.sec = sec
+            ros_img_msg.header.stamp.nanosec = nsec
+        except Exception:
+            ros_img_msg.header.stamp = self.node.get_clock().now().to_msg()
+    
     def publish_merged_hotspots(self, vlm_hotspots: Dict[str, np.ndarray], 
                                timestamp: float, narration : Optional[bool] = False, original_image: Optional[np.ndarray] = None) -> bool:
         """
         Publish merged hotspot mask with different colors for different VLM answers.
-        
-        Args:
-            vlm_hotspots: Dict mapping vlm_answer -> hotspot_mask (binary)
-            timestamp: Original RGB image timestamp
-            original_image: Original RGB image for overlay visualization
-            
-        Returns:
-            True if hotspots were published, False otherwise
+        Now sends mask as sensor_msgs/Image and a slim JSON for metadata.
         """
         try:
             # Rate limiting
@@ -127,26 +130,25 @@ class SemanticHotspotPublisher:
             if not np.any(merged_mask):
                 return False  # No hotspots
             
-            # Publish merged mask image
+            # Publish merged mask image stamped with original timestamp
             self._publish_merged_hotspot_mask_image(merged_mask, timestamp)
             
-            # Publish overlay image if original image provided
+            # Publish overlay image if original image provided (stamped with original timestamp)
             if original_image is not None:
                 self._publish_merged_hotspot_overlay(original_image, merged_mask, timestamp)
             
-            # Create structured data message
+            # Create slim structured data message (no flattened mask payload)
             hotspot_data = {
+                'schema_version': 1,
                 'type': 'merged_similarity_hotspots',
                 'timestamp': float(timestamp),
-                'mask_shape': list(merged_mask.shape),
-                'mask_data': merged_mask.flatten().tolist(),  # Colored mask as list
                 'vlm_info': vlm_info,
                 'total_vlm_answers': len(vlm_info),
                 'threshold_used': float(self.hotspot_threshold),
                 'is_narration' : narration
             }
             
-            # Publish structured data
+            # Publish structured metadata
             msg = String(data=json.dumps(hotspot_data))
             self.hotspot_data_pub.publish(msg)
             
@@ -178,7 +180,7 @@ class SemanticHotspotPublisher:
             
             # Convert to ROS Image message
             mask_msg = self.bridge.cv2_to_imgmsg(mask_rgb, encoding='rgb8')
-            mask_msg.header.stamp = self.node.get_clock().now().to_msg()
+            self._set_msg_stamp_from_float(mask_msg, timestamp)
             mask_msg.header.frame_id = 'camera_link'
             
             self.hotspot_mask_pub.publish(mask_msg)
@@ -192,7 +194,7 @@ class SemanticHotspotPublisher:
         try:
             # Convert to ROS Image message
             mask_msg = self.bridge.cv2_to_imgmsg(merged_mask, encoding='rgb8')
-            mask_msg.header.stamp = self.node.get_clock().now().to_msg()
+            self._set_msg_stamp_from_float(mask_msg, timestamp)
             mask_msg.header.frame_id = 'camera_link'
             
             self.hotspot_mask_pub.publish(mask_msg)
@@ -223,7 +225,7 @@ class SemanticHotspotPublisher:
             
             # Convert to ROS Image message
             overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding='rgb8')
-            overlay_msg.header.stamp = self.node.get_clock().now().to_msg()
+            self._set_msg_stamp_from_float(overlay_msg, timestamp)
             overlay_msg.header.frame_id = 'camera_link'
             
             self.hotspot_overlay_pub.publish(overlay_msg)
@@ -254,7 +256,7 @@ class SemanticHotspotPublisher:
             
             # Convert to ROS Image message
             overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding='rgb8')
-            overlay_msg.header.stamp = self.node.get_clock().now().to_msg()
+            self._set_msg_stamp_from_float(overlay_msg, timestamp)
             overlay_msg.header.frame_id = 'camera_link'
             
             self.hotspot_overlay_pub.publish(overlay_msg)
