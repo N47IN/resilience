@@ -192,6 +192,13 @@ class SemanticDepthOctoMapNode(Node):
 		# GP fitting state
 		self.gp_fit_lock = threading.Lock()
 		self.gp_fitting_active = False
+		
+		# Per-voxel GP visualization system
+		self.gp_library = {}  # cause_name -> gp_params (per-voxel parameters)
+		self.semantic_voxels_gp = {}  # voxel_key -> (cause_name, gp_value)
+		self.gp_viz_lock = threading.Lock()
+		self.last_gp_viz_update = 0.0
+		self.gp_viz_update_interval = 1.0  # 1 Hz updates
 
 		# Optional: initialize PathManager for accessing global path (non-blocking)
 		self.path_manager = None
@@ -287,6 +294,9 @@ class SemanticDepthOctoMapNode(Node):
 		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
 		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
 		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
+		# New GP visualization publishers
+		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
+		self.per_voxel_gp_visualization_pub = self.create_publisher(PointCloud2, '/per_voxel_gp_visualization', 10)
 
 		self.get_logger().info(
 			f"SemanticDepthOctoMapNode initialized:\n"
@@ -826,6 +836,9 @@ class SemanticDepthOctoMapNode(Node):
 			with open(out_path, 'w') as f:
 				json.dump(o, f, indent=2)
 			self.get_logger().info(f"Saved GP fit parameters to {out_path}")
+			
+			# Update GP library with new parameters
+			self._update_gp_library(fit, buffer_dir)
 		except Exception as e:
 			self.get_logger().error(f"GP fit task failed: {e}")
 			import traceback
@@ -833,6 +846,379 @@ class SemanticDepthOctoMapNode(Node):
 		finally:
 			with self.gp_fit_lock:
 				self.gp_fitting_active = False
+			
+			# After GP fitting is complete, create and publish visualization
+			self._create_and_publish_gp_visualization(buffer_dir)
+
+	def _create_and_publish_gp_visualization(self, buffer_dir: str):
+		"""Create and publish GP field visualization as colored point cloud."""
+		try:
+			if not GP_HELPER_AVAILABLE:
+				return
+			
+			# Load GP fit parameters
+			gp_fit_path = os.path.join(buffer_dir, 'voxel_gp_fit.json')
+			if not os.path.exists(gp_fit_path):
+				self.get_logger().warn(f"GP fit file not found: {gp_fit_path}")
+				return
+			
+			with open(gp_fit_path, 'r') as f:
+				gp_data = json.load(f)
+			
+			fit_params = gp_data.get('fit_params', {})
+			if not fit_params:
+				self.get_logger().warn("No GP fit parameters found")
+				return
+			
+			# Load cause points from PCD
+			pcd_path = os.path.join(buffer_dir, 'points.pcd')
+			if not os.path.exists(pcd_path):
+				self.get_logger().warn(f"PCD file not found: {pcd_path}")
+				return
+			
+			cause_points = self._load_pcd_points(pcd_path)
+			if cause_points.size == 0:
+				self.get_logger().warn("No cause points loaded from PCD")
+				return
+			
+			# Create prediction grid around cause location
+			grid_points = self._create_gp_prediction_grid(cause_points)
+			
+			# Predict GP field values
+			gp_values = self._predict_gp_field(grid_points, cause_points, fit_params)
+			
+			# Create colored point cloud
+			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_values)
+			
+			if colored_cloud:
+				self.gp_visualization_pub.publish(colored_cloud)
+				self.get_logger().info(f"Published GP field visualization with {len(grid_points)} points")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating GP visualization: {e}")
+			import traceback
+			traceback.print_exc()
+	
+	def _load_pcd_points(self, pcd_path: str) -> np.ndarray:
+		"""Load points from PCD file."""
+		try:
+			# Simple PCD loader for binary format
+			with open(pcd_path, 'rb') as f:
+				# Skip header
+				header_lines = []
+				while True:
+					line = f.readline().decode('ascii')
+					header_lines.append(line)
+					if line.startswith('DATA binary'):
+						break
+				
+				# Find POINTS count
+				points_count = 0
+				for line in header_lines:
+					if line.startswith('POINTS'):
+						points_count = int(line.split()[1])
+						break
+				
+				if points_count == 0:
+					return np.array([])
+				
+				# Read binary data (3 floats per point: x, y, z)
+				points_data = f.read(points_count * 3 * 4)  # 4 bytes per float
+				points = np.frombuffer(points_data, dtype=np.float32).reshape(-1, 3)
+				
+				return points
+				
+		except Exception as e:
+			self.get_logger().error(f"Error loading PCD points: {e}")
+			return np.array([])
+	
+	def _create_gp_prediction_grid(self, cause_points: np.ndarray, grid_size: float = 2.0, resolution: float = 0.1) -> np.ndarray:
+		"""Create a 3D grid around the cause points for GP prediction."""
+		try:
+			# Find bounding box of cause points
+			min_coords = np.min(cause_points, axis=0)
+			max_coords = np.max(cause_points, axis=0)
+			center = (min_coords + max_coords) / 2.0
+			
+			# Extend bounding box by grid_size
+			extent = np.max(max_coords - min_coords) + grid_size
+			half_extent = extent / 2.0
+			
+			# Create grid
+			x_range = np.arange(center[0] - half_extent, center[0] + half_extent, resolution)
+			y_range = np.arange(center[1] - half_extent, center[1] + half_extent, resolution)
+			z_range = np.arange(center[2] - half_extent, center[2] + half_extent, resolution)
+			
+			# Create meshgrid
+			X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
+			grid_points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1)
+			
+			self.get_logger().info(f"Created GP prediction grid: {len(grid_points)} points around cause center {center}")
+			return grid_points
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating GP prediction grid: {e}")
+			return np.array([])
+	
+	def _predict_gp_field(self, grid_points: np.ndarray, cause_points: np.ndarray, fit_params: dict) -> np.ndarray:
+		"""Predict GP field values at grid points."""
+		try:
+			# Extract GP parameters
+			lxy = fit_params.get('lxy', 0.5)
+			lz = fit_params.get('lz', 0.5)
+			A = fit_params.get('A', 1.0)
+			b = fit_params.get('b', 0.0)
+			
+			# Simple RBF prediction (sum of anisotropic RBFs)
+			predictions = np.zeros(len(grid_points))
+			
+			for i, grid_point in enumerate(grid_points):
+				# Compute distances to all cause points
+				distances = np.linalg.norm(cause_points - grid_point, axis=1)
+				
+				# Apply anisotropic scaling
+				# For simplicity, use isotropic RBF with average length scale
+				avg_length = (lxy + lz) / 2.0
+				
+				# Sum of RBF contributions
+				rbf_contributions = A * np.exp(-(distances**2) / (2 * avg_length**2))
+				predictions[i] = np.sum(rbf_contributions) + b
+			
+			self.get_logger().info(f"GP field prediction: min={predictions.min():.3f}, max={predictions.max():.3f}")
+			return predictions
+			
+		except Exception as e:
+			self.get_logger().error(f"Error predicting GP field: {e}")
+			return np.zeros(len(grid_points))
+	
+	def _create_gp_colored_pointcloud(self, grid_points: np.ndarray, gp_values: np.ndarray) -> Optional[PointCloud2]:
+		"""Create colored point cloud from GP field predictions."""
+		try:
+			if len(grid_points) == 0 or len(gp_values) == 0:
+				return None
+			
+			# Normalize GP values to [0, 1] for coloring
+			gp_min, gp_max = gp_values.min(), gp_values.max()
+			if gp_max > gp_min:
+				normalized_values = (gp_values - gp_min) / (gp_max - gp_min)
+			else:
+				normalized_values = np.zeros_like(gp_values)
+			
+			# Create color map (blue to red: low to high intensity)
+			colors = np.zeros((len(grid_points), 3), dtype=np.uint8)
+			
+			# Blue (low) to Red (high) color mapping
+			colors[:, 0] = (normalized_values * 255).astype(np.uint8)  # Red channel
+			colors[:, 2] = ((1 - normalized_values) * 255).astype(np.uint8)  # Blue channel
+			# Green channel for smooth transition
+			colors[:, 1] = (128 * (1 - np.abs(normalized_values - 0.5) * 2)).astype(np.uint8)
+			
+			# Create PointCloud2 message
+			header = Header()
+			header.stamp = self.get_clock().now().to_msg()
+			header.frame_id = self.map_frame
+			
+			# Create structured array with XYZ + RGB
+			cloud_data_combined = np.empty(len(grid_points), dtype=[
+				('x', np.float32), ('y', np.float32), ('z', np.float32), 
+				('rgb', np.uint32)
+			])
+			
+			# Fill in the data
+			cloud_data_combined['x'] = grid_points[:, 0]
+			cloud_data_combined['y'] = grid_points[:, 1]
+			cloud_data_combined['z'] = grid_points[:, 2]
+			
+			# Pack RGB values as UINT32 (standard for PointCloud2 RGB)
+			rgb_packed = np.zeros(len(colors), dtype=np.uint32)
+			for i, c in enumerate(colors):
+				rgb_packed[i] = (int(c[0]) << 16) | (int(c[1]) << 8) | int(c[2])
+			cloud_data_combined['rgb'] = rgb_packed
+			
+			# Create PointCloud2 message
+			cloud_msg = PointCloud2()
+			cloud_msg.header = header
+			
+			# Define the fields
+			cloud_msg.fields = [
+				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='rgb', offset=12, datatype=pc2.PointField.UINT32, count=1)
+			]
+			
+			# Set the message properties
+			cloud_msg.point_step = 16  # 4 bytes per float * 4 fields (x, y, z, rgb)
+			cloud_msg.width = len(grid_points)
+			cloud_msg.height = 1
+			cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
+			cloud_msg.is_dense = True
+			
+			# Set the data
+			cloud_msg.data = cloud_data_combined.tobytes()
+			
+			return cloud_msg
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating GP colored point cloud: {e}")
+			import traceback
+			traceback.print_exc()
+			return None
+	
+	def _update_gp_library(self, fit_params: dict, buffer_dir: str):
+		"""Update GP library with per-voxel parameters learned from narration hotspots."""
+		try:
+			# Extract cause name from buffer directory metadata
+			metadata_path = os.path.join(buffer_dir, 'metadata.json')
+			if not os.path.exists(metadata_path):
+				self.get_logger().warn(f"Metadata file not found: {metadata_path}")
+				return
+			
+			with open(metadata_path, 'r') as f:
+				metadata = json.load(f)
+			
+			cause_name = metadata.get('cause')
+			if not cause_name:
+				self.get_logger().warn("No cause found in metadata")
+				return
+			
+			# Store per-voxel GP parameters learned from narration hotspots
+			with self.gp_viz_lock:
+				self.gp_library[cause_name] = {
+					'lxy': fit_params.get('lxy', 0.5),
+					'lz': fit_params.get('lz', 0.5),
+					'A': fit_params.get('A', 1.0),
+					'b': fit_params.get('b', 0.0),
+					'fit_time': time.time(),
+					'fit_quality': fit_params.get('r2_score', 0.0),
+					'voxel_resolution': float(self.voxel_resolution),
+					'learned_from': 'narration_hotspots'
+				}
+			
+			self.get_logger().info(f"Updated per-voxel GP library for cause '{cause_name}' - learned from narration hotspots")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error updating GP library: {e}")
+	
+	def _compute_per_voxel_gp_values(self, voxel_keys: set, vlm_answer: str):
+		"""Compute GP values for semantic voxels using learned per-voxel parameters."""
+		try:
+			with self.gp_viz_lock:
+				# Get per-voxel GP parameters for this cause (learned from narration hotspots)
+				gp_params = self.gp_library.get(vlm_answer)
+				if not gp_params:
+					self.get_logger().debug(f"No per-voxel GP parameters available for cause '{vlm_answer}'")
+					return
+				
+				# Compute GP value for each voxel using the learned per-voxel parameters
+				for voxel_key in voxel_keys:
+					voxel_center = self._get_voxel_center_from_key(voxel_key)
+					if voxel_center is not None:
+						# Use the learned per-voxel parameters for this semantic label
+						gp_value = self._predict_gp_at_voxel(voxel_center, gp_params)
+						self.semantic_voxels_gp[voxel_key] = (vlm_answer, gp_value)
+				
+				self.get_logger().info(f"Applied per-voxel GP parameters to {len(voxel_keys)} voxels of cause '{vlm_answer}'")
+				
+		except Exception as e:
+			self.get_logger().error(f"Error computing per-voxel GP values: {e}")
+	
+	def _predict_gp_at_voxel(self, voxel_center: np.ndarray, gp_params: dict) -> float:
+		"""Predict GP value at a voxel using learned per-voxel parameters."""
+		try:
+			# Use the per-voxel parameters learned from narration hotspots
+			lxy = gp_params.get('lxy', 0.5)
+			lz = gp_params.get('lz', 0.5)
+			A = gp_params.get('A', 1.0)
+			b = gp_params.get('b', 0.0)
+			voxel_resolution = gp_params.get('voxel_resolution', 0.1)
+			
+			# The per-voxel GP represents the local disturbance field strength
+			# This is the amplitude learned from narration hotspots at voxel resolution
+			voxel_gp_value = A + b
+			
+			return voxel_gp_value
+			
+		except Exception as e:
+			self.get_logger().error(f"Error predicting GP at voxel: {e}")
+			return 0.0
+	
+	def _update_per_voxel_gp_visualization(self):
+		"""Update per-voxel GP visualization with superposition of all semantic voxels."""
+		try:
+			with self.gp_viz_lock:
+				if not self.semantic_voxels_gp:
+					return
+				
+				# Create visualization grid around all semantic voxels
+				all_voxel_centers = []
+				for voxel_key in self.semantic_voxels_gp.keys():
+					center = self._get_voxel_center_from_key(voxel_key)
+					if center is not None:
+						all_voxel_centers.append(center)
+				
+				if not all_voxel_centers:
+					return
+				
+				all_voxel_centers = np.array(all_voxel_centers)
+				
+				# Create prediction grid around all semantic voxels
+				grid_points = self._create_gp_prediction_grid(all_voxel_centers, grid_size=1.0, resolution=0.05)
+				
+				if len(grid_points) == 0:
+					return
+				
+				# Compute superposed GP field
+				superposed_field = self._compute_superposed_gp_field(grid_points)
+				
+				# Create and publish colored point cloud
+				colored_cloud = self._create_gp_colored_pointcloud(grid_points, superposed_field)
+				
+				if colored_cloud:
+					self.per_voxel_gp_visualization_pub.publish(colored_cloud)
+					self.get_logger().debug(f"Published per-voxel GP visualization with {len(grid_points)} points, {len(self.semantic_voxels_gp)} semantic voxels")
+			
+		except Exception as e:
+			self.get_logger().error(f"Error updating per-voxel GP visualization: {e}")
+	
+	def _compute_superposed_gp_field(self, grid_points: np.ndarray) -> np.ndarray:
+		"""Compute superposed GP field from all semantic voxels using per-voxel parameters."""
+		try:
+			superposed_field = np.zeros(len(grid_points))
+			
+			with self.gp_viz_lock:
+				for voxel_key, (cause_name, voxel_gp_value) in self.semantic_voxels_gp.items():
+					voxel_center = self._get_voxel_center_from_key(voxel_key)
+					if voxel_center is None:
+						continue
+					
+					# Get per-voxel GP parameters for this cause (learned from narration hotspots)
+					gp_params = self.gp_library.get(cause_name)
+					if not gp_params:
+						continue
+					
+					# Compute RBF contribution from this voxel to all grid points
+					# Use the per-voxel parameters learned from narration hotspots
+					distances = np.linalg.norm(grid_points - voxel_center, axis=1)
+					lxy = gp_params.get('lxy', 0.5)
+					lz = gp_params.get('lz', 0.5)
+					A = gp_params.get('A', 1.0)
+					b = gp_params.get('b', 0.0)
+					
+					# Use average length scale from learned parameters
+					avg_length = (lxy + lz) / 2.0
+					
+					# RBF contribution using per-voxel parameters
+					rbf_contributions = A * np.exp(-(distances**2) / (2 * avg_length**2)) + b
+					
+					# Add to superposed field
+					superposed_field += rbf_contributions
+			
+			return superposed_field
+			
+		except Exception as e:
+			self.get_logger().error(f"Error computing superposed GP field: {e}")
+			return np.zeros(len(grid_points))
 
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 									 threshold: float, stats: dict):
@@ -867,6 +1253,9 @@ class SemanticDepthOctoMapNode(Node):
 					semantic_mapper.voxel_semantics[voxel_key] = semantic_info
 			
 			self.get_logger().info(f"✓ Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' - these will appear RED in the colored cloud")
+			
+			# Compute per-voxel GP values for new semantic voxels
+			self._compute_per_voxel_gp_values(voxel_keys, vlm_answer)
 			
 		except Exception as e:
 			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
@@ -910,6 +1299,11 @@ class SemanticDepthOctoMapNode(Node):
 		if (current_time - self.last_queue_process_time) >= self.queue_processing_interval:
 			self._process_bridge_message_queue()
 			self.last_queue_process_time = current_time
+
+		# Periodic per-voxel GP visualization update (1 Hz)
+		if (current_time - self.last_gp_viz_update) >= self.gp_viz_update_interval:
+			self._update_per_voxel_gp_visualization()
+			self.last_gp_viz_update = current_time
 
 		# Periodic publishing
 		self._periodic_publishing()
