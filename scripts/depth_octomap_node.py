@@ -422,6 +422,7 @@ class SemanticDepthOctoMapNode(Node):
 			is_narration = data.get('is_narration')
 			vlm_info = data.get('vlm_info', {})
 			rgb_timestamp = float(data.get('timestamp', 0.0))
+			buffer_id = data.get('buffer_id')  # Extract buffer_id
 			
 			if rgb_timestamp <= 0.0:
 				self.get_logger().warn(f"Incomplete hotspot data (no timestamp)")
@@ -450,7 +451,7 @@ class SemanticDepthOctoMapNode(Node):
 						vlm_mask, pose_msg, depth_image, vlm_answer, 
 						info.get('hotspot_threshold', 0.6), 
 						{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
-						rgb_timestamp, used_ts, is_narration
+						rgb_timestamp, used_ts, is_narration, buffer_id
 					)
 					if success:
 						processed_count += 1
@@ -508,7 +509,7 @@ class SemanticDepthOctoMapNode(Node):
 			return best_mask
 	
 	def _process_hotspot_with_depth(self, mask: np.ndarray, pose: PoseStamped, depth_m: np.ndarray,
-								   vlm_answer: str, threshold: float, stats: dict, rgb_ts: float, used_ts: tuple, is_narration: bool) -> bool:
+								   vlm_answer: str, threshold: float, stats: dict, rgb_ts: float, used_ts: tuple, is_narration: bool, buffer_id: str = None) -> bool:
 		"""Project hotspot mask using matched depth and pose; update voxel map and semantics."""
 		try:
 			if self.camera_intrinsics is None:
@@ -549,12 +550,17 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Update voxel map with hotspot points
 			if is_narration:
-				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world)
-				# Kick off background GP fit using voxelized points and buffer trajectories
+				# Save PCD to the specific buffer directory if buffer_id is provided
+				if buffer_id:
+					buffer_dir = self._save_narration_pcd_to_specific_buffer(buffer_id, points_world)
+				else:
+					buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world)
+				
+				# Check if poses.npy is available before starting GP fit
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
 					# Use voxelized points for GP fitting to avoid memory issues
 					voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
-					self._start_background_gp_fit(buffer_dir, voxelized_points)
+					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points)
 
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
 
@@ -662,6 +668,93 @@ class SemanticDepthOctoMapNode(Node):
 		save_path = os.path.join(latest_subfolder2, filename)
 		_save_pcd(voxelized_points, save_path)
 		return latest_subfolder2, save_path
+
+	def _save_narration_pcd_to_specific_buffer(self, buffer_id: str, points_world: np.ndarray) -> str:
+		"""Save narration PCD to a specific buffer directory."""
+		try:
+			# Find the buffer directory by looking for the buffer_id in the buffers directory
+			buffers_base_dir = "/home/navin/ros2_ws/src/buffers"
+			
+			# Look for the latest run directory
+			run_dirs = [d for d in os.listdir(buffers_base_dir) if os.path.isdir(os.path.join(buffers_base_dir, d)) and d.startswith('run_')]
+			if not run_dirs:
+				self.get_logger().warn(f"No run directories found in {buffers_base_dir}")
+				return None
+			
+			latest_run_dir = max(run_dirs, key=lambda d: os.path.getmtime(os.path.join(buffers_base_dir, d)))
+			run_path = os.path.join(buffers_base_dir, latest_run_dir)
+			
+			# Look for the specific buffer directory
+			buffer_dir = os.path.join(run_path, buffer_id)
+			if not os.path.exists(buffer_dir):
+				self.get_logger().warn(f"Buffer directory {buffer_dir} not found")
+				return None
+			
+			# Voxelize points before saving to reduce density for GP fitting
+			voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
+			
+			# Save PCD to the specific buffer directory
+			pcd_path = os.path.join(buffer_dir, "points.pcd")
+			self._save_pcd_file(voxelized_points, pcd_path)
+			
+			self.get_logger().info(f"Saved narration PCD to specific buffer: {buffer_dir}")
+			return buffer_dir
+			
+		except Exception as e:
+			self.get_logger().error(f"Error saving narration PCD to specific buffer: {e}")
+			return None
+	
+	def _save_pcd_file(self, points: np.ndarray, out_path: str):
+		"""Save points as a binary PCD file."""
+		try:
+			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+			mask = np.isfinite(pts).all(axis=1)
+			pts = pts[mask]
+			header = (
+				"# .PCD v0.7 - Point Cloud Data file format\n"
+				"VERSION 0.7\n"
+				"FIELDS x y z\n"
+				"SIZE 4 4 4\n"
+				"TYPE F F F\n"
+				"COUNT 1 1 1\n"
+				f"WIDTH {pts.shape[0]}\n"
+				"HEIGHT 1\n"
+				"VIEWPOINT 0 0 0 1 0 0 0\n"
+				f"POINTS {pts.shape[0]}\n"
+				"DATA binary\n"
+			)
+			with open(out_path, "wb") as f:
+				f.write(header.encode("ascii"))
+				f.write(pts.astype("<f4").tobytes())
+			self.get_logger().info(f"Saved {pts.shape[0]} voxelized points to {out_path}")
+		except Exception as e:
+			self.get_logger().error(f"Error saving PCD file: {e}")
+
+	def _check_and_start_gp_fit_if_ready(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+		"""Check if poses.npy is available and start GP fitting if ready."""
+		try:
+			# Check if poses.npy exists in the buffer directory
+			poses_path = os.path.join(buffer_dir, 'poses.npy')
+			if not os.path.exists(poses_path):
+				self.get_logger().info(f"poses.npy not yet available in {buffer_dir}, skipping GP fit for now")
+				return
+			
+			# Check if poses.npy has data
+			try:
+				poses_data = np.load(poses_path)
+				if len(poses_data) == 0:
+					self.get_logger().info(f"poses.npy is empty in {buffer_dir}, skipping GP fit for now")
+					return
+			except Exception as e:
+				self.get_logger().warn(f"Error reading poses.npy from {buffer_dir}: {e}")
+				return
+			
+			# Both PCD and poses are available, start GP fitting
+			self.get_logger().info(f"Both PCD and poses.npy available in {buffer_dir}, starting GP fit")
+			self._start_background_gp_fit(buffer_dir, pointcloud_xyz)
+			
+		except Exception as e:
+			self.get_logger().warn(f"Error checking GP fit readiness: {e}")
 
 	def _start_background_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
 		"""Start GP fitting in a background thread if not already running."""

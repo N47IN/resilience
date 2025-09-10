@@ -87,7 +87,7 @@ class SemanticHotspotPublisher:
             ros_img_msg.header.stamp = self.node.get_clock().now().to_msg()
     
     def publish_merged_hotspots(self, vlm_hotspots: Dict[str, np.ndarray], 
-                               timestamp: float, narration : Optional[bool] = False, original_image: Optional[np.ndarray] = None) -> bool:
+                               timestamp: float, narration : Optional[bool] = False, original_image: Optional[np.ndarray] = None, buffer_id: Optional[str] = None) -> bool:
         """
         Publish merged hotspot mask with different colors for different VLM answers.
         Now sends mask as sensor_msgs/Image and a slim JSON for metadata.
@@ -145,7 +145,8 @@ class SemanticHotspotPublisher:
                 'vlm_info': vlm_info,
                 'total_vlm_answers': len(vlm_info),
                 'threshold_used': float(self.hotspot_threshold),
-                'is_narration' : narration
+                'is_narration' : narration,
+                'buffer_id': buffer_id
             }
             
             # Publish structured metadata

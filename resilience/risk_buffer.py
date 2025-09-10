@@ -164,6 +164,26 @@ class RiskBuffer:
             return self.save(directory)
         return False
     
+    def save_poses_continuously(self, directory: str) -> bool:
+        """Save poses continuously during breach so poses.npy is always available"""
+        try:
+            if not self.poses:
+                return False
+                
+            # Create buffer directory
+            buffer_dir = os.path.join(directory, self.buffer_id)
+            os.makedirs(buffer_dir, exist_ok=True)
+            
+            # Save poses array
+            poses_array = np.array([(t, p[0], p[1], p[2], d) for t, p, d in self.poses])
+            np.save(os.path.join(buffer_dir, 'poses.npy'), poses_array)
+            
+            return True
+            
+        except Exception as e:
+            print(f"[RiskBuffer] Error saving poses for {self.buffer_id}: {e}")
+            return False
+    
     def freeze(self, end_time: float):
         """Freeze buffer when breach ends"""
         if self.state != BufferState.ACTIVE:
@@ -311,7 +331,7 @@ class RiskBufferManager:
             return added
     
     def add_pose(self, timestamp: float, pose, drift: float) -> bool:
-        """Add pose to all active buffers"""
+        """Add pose to all active buffers and save poses continuously"""
         with self.lock:
             if not self.active_buffers:
                 return False
@@ -320,6 +340,9 @@ class RiskBufferManager:
             for buffer in self.active_buffers:
                 if buffer.add_pose(timestamp, pose, drift):
                     added = True
+                    # Save poses continuously so poses.npy is always available
+                    if self.save_directory:
+                        buffer.save_poses_continuously(self.save_directory)
             
             return added
     
