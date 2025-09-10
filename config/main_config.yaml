@@ -10,6 +10,12 @@ path_mode:
   # Global path topic configuration (used in both modes)
   global_path_topic: "/global_path"  # Standard nav_msgs/Path topic
   
+  # Trajectory discretization configuration (used in both modes)
+  discretization:
+    sampling_distance: 0.1  # meters - Distance between discretized points
+    lookback_window_size: 20  # number of points - Size of lookback window for analysis
+    default_soft_threshold: 0.3  # meters - Default soft threshold (30cm)
+  
   # JSON file configuration (only used when mode is "json_file")
   json_file:
     nominal_path_file: "adjusted_nominal_spline.json"  # Relative to assets directory

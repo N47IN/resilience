@@ -15,18 +15,20 @@ from .simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
 class NarrationManager:
     """Manages trajectory narration and breach event processing."""
     
-    def __init__(self, soft_threshold: float, hard_threshold: float):
+    def __init__(self, soft_threshold: float, hard_threshold: float, lookback_window_size: int = 20, sampling_distance: float = 0.1):
         """Initialize narration manager."""
         self.soft_threshold = soft_threshold
         self.hard_threshold = hard_threshold
+        self.lookback_window_size = lookback_window_size
+        self.sampling_distance = sampling_distance
         
         # Narration logic
         self.descriptor = XYSpatialDescriptor(soft_threshold=self.soft_threshold, hard_threshold=self.hard_threshold)
-        self.intended_points = []  # List[TrajectoryPoint]
+        self.intended_points = []  # List[TrajectoryPoint] - discretized points
         self.actual_points = []    # List[TrajectoryPoint]
         
-        # MODIFIED: Limit to last 25 pose messages
-        self.max_actual_points = 25
+        # MODIFIED: Limit to lookback window size for actual points
+        self.max_actual_points = lookback_window_size
         
         # Thread management
         self.narration_thread = None
@@ -53,11 +55,11 @@ class NarrationManager:
             print(f"Narration thread already running")
     
     def set_intended_trajectory(self, nominal_points: np.ndarray):
-        """Set the intended trajectory points."""
-        # Convert nominal points to 2D for narration
+        """Set the intended trajectory points from discretized data."""
+        # Convert nominal points to 2D for narration (X=forward, Y=left)
         nominal_2d = np.array([[p[0], p[1]] for p in nominal_points])  # Only X,Y
         self.intended_points = [TrajectoryPoint(position=pt, time=i) for i, pt in enumerate(nominal_2d)]
-        print(f"[Narration] Initialized with {len(self.intended_points)} intended points, soft_threshold={self.soft_threshold}")
+        print(f"[Narration] Initialized with {len(self.intended_points)} discretized intended points, soft_threshold={self.soft_threshold}")
     
     def update_intended_trajectory(self, nominal_points: np.ndarray):
         """Update the intended trajectory points (for when path becomes available later)."""
@@ -67,18 +69,18 @@ class NarrationManager:
             print("[Narration] Warning: No nominal points provided for trajectory update")
     
     def add_actual_point(self, pos: np.ndarray, timestamp: float, flip_y_axis: bool = False):
-        """Add actual trajectory point, keeping only the last 25 points."""
-        pos_2d = np.array([pos[0], pos[1]])
+        """Add actual trajectory point, keeping only the last lookback_window_size points."""
+        pos_2d = np.array([pos[0], pos[1]])  # X=forward, Y=left
         if flip_y_axis:
             pos_2d[1] = -pos_2d[1]
         self.actual_points.append(TrajectoryPoint(position=pos_2d, time=timestamp))
         
-        # MODIFIED: Keep only the last 25 points instead of historical accumulation
+        # Keep only the last lookback_window_size points
         if len(self.actual_points) > self.max_actual_points:
             self.actual_points.pop(0)
     
     def check_for_narration(self, current_time: float, breach_idx: Optional[int] = None) -> Optional[str]:
-        """Generate narration during active breach using only recent pose data."""
+        """Generate narration during active breach using discretized path with proper lookback."""
         try:
             if not self.actual_points:
                 return None
@@ -90,32 +92,44 @@ class NarrationManager:
             
             actual_len = len(self.actual_points)
             
-            # MODIFIED: Use the most recent actual point index instead of breach_idx
-            # This ensures we're always looking at the most recent data within our 25-point window
+            # Use the most recent actual point index
             robot_idx = actual_len - 1
             
-            # MODIFIED: For intended points, take a window around the current position
-            # Since we only have 25 actual points, we'll use a similar window for intended
-            intended_start = max(0, robot_idx - actual_len + 1)
-            intended_end = min(len(self.intended_points), intended_start + actual_len)
-            intended = self.intended_points[intended_start:intended_end]
+            # Get lookback window from discretized intended trajectory
+            # Find the corresponding position in the discretized trajectory
+            intended_start = max(0, robot_idx - self.lookback_window_size + 1)
+            intended_end = min(len(self.intended_points), intended_start + self.lookback_window_size)
+            intended_lookback = self.intended_points[intended_start:intended_end]
             
-            # Use all available actual points (up to 25)
-            actual = self.actual_points
+            # Use all available actual points (up to lookback_window_size)
+            actual_lookback = self.actual_points
             
-            if len(intended) == 0 or len(actual) == 0:
+            if len(intended_lookback) == 0 or len(actual_lookback) == 0:
                 return None
             
-            # MODIFIED: Use the most recent actual point for narration generation
-            narration = self.descriptor.generate_description(intended, actual, robot_idx)
+            # Ensure we have matching lengths for comparison
+            min_len = min(len(intended_lookback), len(actual_lookback))
+            if min_len == 0:
+                return None
+            
+            # Clip trajectories to matching length
+            intended_clipped = intended_lookback[:min_len]
+            actual_clipped = actual_lookback[:min_len]
+            
+            # Use the most recent point for narration generation
+            narration_idx = min_len - 1
+            
+            # Generate narration using clipped trajectories
+            narration = self.descriptor.generate_description(intended_clipped, actual_clipped, narration_idx)
             
             if narration:  # Only return if there's actual narration
                 print("=" * 50)
-                print("NARRATION GENERATED (Last 25 poses)")
+                print("NARRATION GENERATED (Discretized Path with Lookback)")
                 print("=" * 50)
                 print(f"Content: {narration}")
-                print(f"Using {len(actual)} actual points (max 25)")
-                print(f"Using {len(intended)} intended points")
+                print(f"Using {len(actual_clipped)} actual points (max {self.lookback_window_size})")
+                print(f"Using {len(intended_clipped)} intended points from discretized trajectory")
+                print(f"Sampling distance: {self.sampling_distance}m")
                 print("=" * 50)
                 
                 # Mark that we've sent narration for this breach (ONLY ONE PER BREACH)

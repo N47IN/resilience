@@ -19,8 +19,82 @@ import numpy as np
 import json
 import os
 import time
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 from threading import Lock
+
+
+@dataclass
+class DiscretizedPoint:
+    """Discretized trajectory point"""
+    position: np.ndarray  # 3D position [x, y, z]
+    index: int
+    distance_from_start: float
+
+
+class TrajectoryDiscretizer:
+    """Discretizes trajectory based on sampling length"""
+    
+    def __init__(self, sampling_length: float = 0.1):
+        self.sampling_length = sampling_length
+    
+    def discretize_trajectory(self, points: List[dict]) -> List[DiscretizedPoint]:
+        """Discretize trajectory from JSON points"""
+        if not points:
+            return []
+        
+        # Convert to numpy array with coordinate convention: forward->X, left->Y, up->Z
+        positions = np.array([[p['position']['x'], p['position']['y'], p['position']['z']] 
+                             for p in points])
+        
+        discretized = []
+        current_distance = 0.0
+        discretized.append(DiscretizedPoint(
+            position=positions[0],
+            index=0,
+            distance_from_start=0.0
+        ))
+        
+        # Walk along trajectory and sample at regular intervals
+        for i in range(1, len(positions)):
+            segment_length = np.linalg.norm(positions[i] - positions[i-1])
+            current_distance += segment_length
+            
+            # Add points at sampling_length intervals
+            while current_distance >= self.sampling_length:
+                # Interpolate position along the segment
+                alpha = self.sampling_length / segment_length
+                interpolated_pos = positions[i-1] + alpha * (positions[i] - positions[i-1])
+                
+                discretized.append(DiscretizedPoint(
+                    position=interpolated_pos,
+                    index=len(discretized),
+                    distance_from_start=len(discretized) * self.sampling_length
+                ))
+                
+                current_distance -= self.sampling_length
+                segment_length -= self.sampling_length
+        
+        return discretized
+    
+    def discretize_path_message(self, path_msg) -> List[DiscretizedPoint]:
+        """Discretize trajectory from ROS Path message"""
+        if not path_msg or len(path_msg.poses) == 0:
+            return []
+        
+        # Convert Path message to discretized points
+        points = []
+        for i, pose_stamped in enumerate(path_msg.poses):
+            point = {
+                'position': {
+                    'x': float(pose_stamped.pose.position.x),
+                    'y': float(pose_stamped.pose.position.y),
+                    'z': float(pose_stamped.pose.position.z)
+                }
+            }
+            points.append(point)
+        
+        return self.discretize_trajectory(points)
 
 
 class PathManager:
@@ -38,10 +112,20 @@ class PathManager:
         self.config = config
         self.lock = Lock()
         
+        # Discretization configuration
+        discretization_config = config.get('discretization', {})
+        self.sampling_distance = discretization_config.get('sampling_distance', 0.1)
+        self.lookback_window_size = discretization_config.get('lookback_window_size', 20)
+        self.default_soft_threshold = discretization_config.get('default_soft_threshold', 0.3)
+        
+        # Initialize discretizer
+        self.discretizer = TrajectoryDiscretizer(self.sampling_distance)
+        
         # Path state
         self.nominal_points = []
+        self.discretized_nominal = []  # List[DiscretizedPoint]
         self.nominal_np = None  # Initialize as None
-        self.soft_threshold = 0.1
+        self.soft_threshold = self.default_soft_threshold  # Use default from config
         self.hard_threshold = 0.5
         self.initial_pose = np.array([0.0, 0.0, 0.0])
         self.path_ready = False
@@ -84,20 +168,42 @@ class PathManager:
                 data = json.load(f)
             
             self.nominal_points = data['points']
-            self.soft_threshold = data['calibration']['soft_threshold']
-            self.hard_threshold = data['calibration']['hard_threshold']
             
-            # Convert to numpy array for efficient computation
-            self.nominal_np = np.array([
-                np.array([p['position']['x'], p['position']['y'], p['position']['z']]) 
-                for p in self.nominal_points
-            ])
+            # Use thresholds from JSON if available, otherwise use config defaults
+            if 'calibration' in data:
+                self.soft_threshold = data['calibration'].get('soft_threshold', self.default_soft_threshold)
+                self.hard_threshold = data['calibration'].get('hard_threshold', 0.5)
+            else:
+                self.soft_threshold = self.default_soft_threshold
+                self.hard_threshold = 0.5
             
-            if len(self.nominal_np) > 0:
+            # Discretize the trajectory
+            self.discretized_nominal = self.discretizer.discretize_trajectory(self.nominal_points)
+            
+            # Convert discretized points to numpy array for efficient computation
+            if self.discretized_nominal:
+                self.nominal_np = np.array([point.position for point in self.discretized_nominal])
                 self.initial_pose = self.nominal_np[0]
+            else:
+                self.nominal_np = np.array([])
+                self.initial_pose = np.array([0.0, 0.0, 0.0])
             
             self.path_ready = True
             self.node.get_logger().info(f"Loaded nominal path from {json_path} with {len(self.nominal_points)} points")
+            self.node.get_logger().info(f"Discretized to {len(self.discretized_nominal)} points with {self.sampling_distance}m sampling")
+            
+            # Print detailed discretization status
+            print("=" * 60)
+            print("JSON PATH DISCRETIZATION STATUS")
+            print("=" * 60)
+            print(f"JSON file: {json_path}")
+            print(f"Original path points: {len(self.nominal_points)}")
+            print(f"Discretized points: {len(self.discretized_nominal)}")
+            print(f"Sampling distance: {self.sampling_distance:.3f}m")
+            print(f"Lookback window: {self.lookback_window_size} points")
+            print(f"Soft threshold: {self.soft_threshold:.3f}m")
+            print(f"Hard threshold: {self.hard_threshold:.3f}m")
+            print("=" * 60)
             
             # Create publisher for global path topic
             self.path_publisher = self.node.create_publisher(
@@ -123,10 +229,10 @@ class PathManager:
     def _init_external_mode(self):
         """Initialize external planner mode - simple one-time listener for a path message."""
         try:
-            # Keep thresholds simple defaults for external mode unless explicitly overridden
+            # Use thresholds from external config, fallback to defaults
             thresholds_config = self.external_config.get('thresholds', {})
-            self.soft_threshold = float(thresholds_config.get('soft_threshold', self.soft_threshold))
-            self.hard_threshold = float(thresholds_config.get('hard_threshold', self.hard_threshold))
+            self.soft_threshold = float(thresholds_config.get('soft_threshold', self.default_soft_threshold))
+            self.hard_threshold = float(thresholds_config.get('hard_threshold', 0.5))
             
             # Create subscriber for external global path (one-time trigger upon first valid message)
             self.path_subscriber = self.node.create_subscription(
@@ -137,6 +243,7 @@ class PathManager:
             )
             
             self.node.get_logger().info(f"Listening for external path on topic: {self.global_path_topic}")
+            self.node.get_logger().info(f"Using discretization: {self.sampling_distance}m sampling, {self.lookback_window_size} point lookback")
         except Exception as e:
             self.node.get_logger().error(f"Failed to initialize external mode: {e}")
             raise
@@ -191,20 +298,34 @@ class PathManager:
                     }
                     self.nominal_points.append(point)
                 
-                # Convert to numpy array for fast distance checks
-                self.nominal_np = np.array([
-                    np.array([p['position']['x'], p['position']['y'], p['position']['z']]) 
-                    for p in self.nominal_points
-                ])
+                # Discretize the external path
+                self.discretized_nominal = self.discretizer.discretize_path_message(path_msg)
                 
-                # Initialize origin from first point
-                if len(self.nominal_np) > 0:
+                # Convert discretized points to numpy array for fast distance checks
+                if self.discretized_nominal:
+                    self.nominal_np = np.array([point.position for point in self.discretized_nominal])
                     self.initial_pose = self.nominal_np[0]
+                else:
+                    self.nominal_np = np.array([])
+                    self.initial_pose = np.array([0.0, 0.0, 0.0])
                 
                 self.path_ready = True
                 self.last_path_update = time.time()
             
             self.node.get_logger().info(f"✓ External path received: {len(self.nominal_points)} points. Path ready.")
+            self.node.get_logger().info(f"Discretized to {len(self.discretized_nominal)} points with {self.sampling_distance}m sampling")
+            
+            # Print detailed discretization status
+            print("=" * 60)
+            print("EXTERNAL PATH DISCRETIZATION STATUS")
+            print("=" * 60)
+            print(f"Original path points: {len(self.nominal_points)}")
+            print(f"Discretized points: {len(self.discretized_nominal)}")
+            print(f"Sampling distance: {self.sampling_distance:.3f}m")
+            print(f"Lookback window: {self.lookback_window_size} points")
+            print(f"Soft threshold: {self.soft_threshold:.3f}m")
+            print(f"Hard threshold: {self.hard_threshold:.3f}m")
+            print("=" * 60)
             
             # Notify the main node that path has been updated and enable processing
             try:
@@ -258,6 +379,27 @@ class PathManager:
             self.node.get_logger().error(f"Path not ready after {timeout_seconds}s timeout")
             return False
     
+    def get_discretized_nominal_points(self) -> List[DiscretizedPoint]:
+        """Get discretized nominal trajectory points."""
+        with self.lock:
+            return self.discretized_nominal.copy()
+    
+    def get_discretized_nominal_as_numpy(self) -> np.ndarray:
+        """Get discretized nominal trajectory as numpy array for narration manager."""
+        with self.lock:
+            if self.discretized_nominal and len(self.discretized_nominal) > 0:
+                return np.array([point.position for point in self.discretized_nominal])
+            else:
+                return np.array([])
+    
+    def get_lookback_window_size(self) -> int:
+        """Get lookback window size."""
+        return self.lookback_window_size
+    
+    def get_sampling_distance(self) -> float:
+        """Get sampling distance."""
+        return self.sampling_distance
+
     def get_nominal_points(self) -> List[Dict]:
         """Get nominal trajectory points."""
         with self.lock:

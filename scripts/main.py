@@ -317,8 +317,27 @@ class ResilienceNode(Node):
         # Initialize path manager with unified interface
         self.path_manager = PathManager(self, self.path_config)
         
+        # Print discretization status
+        print("=" * 60)
+        print("PATH MANAGER INITIALIZATION STATUS")
+        print("=" * 60)
+        print(f"Path mode: {self.path_manager.get_mode()}")
+        print(f"Sampling distance: {self.path_manager.get_sampling_distance():.3f}m")
+        print(f"Lookback window size: {self.path_manager.get_lookback_window_size()} points")
+        
         # Get thresholds from path manager
         soft_threshold, hard_threshold = self.path_manager.get_thresholds()
+        print(f"Soft threshold: {soft_threshold:.3f}m")
+        print(f"Hard threshold: {hard_threshold:.3f}m")
+        
+        # Wait for path to be ready and print discretization results
+        if self.path_manager.wait_for_path(timeout_seconds=10.0):
+            discretized_points = self.path_manager.get_discretized_nominal_points()
+            print(f"✓ Path loaded and discretized: {len(discretized_points)} points")
+            print(f"✓ Discretization complete with {self.path_manager.get_sampling_distance():.3f}m sampling")
+        else:
+            print("⚠ Path not ready within timeout - will retry during operation")
+        print("=" * 60)
         
         try:
             self.naradio_processor = NARadioProcessor(
@@ -366,19 +385,37 @@ class ResilienceNode(Node):
                 segmentation_config_path=self.main_config_path if self.main_config_path else None
             )
         
-        self.narration_manager = NarrationManager(soft_threshold, hard_threshold)
+        # Initialize narration manager with discretization parameters
+        lookback_window_size = self.path_manager.get_lookback_window_size()
+        sampling_distance = self.path_manager.get_sampling_distance()
+        self.narration_manager = NarrationManager(
+            soft_threshold, 
+            hard_threshold, 
+            lookback_window_size=lookback_window_size,
+            sampling_distance=sampling_distance
+        )
+        
+        print("=" * 60)
+        print("NARRATION MANAGER INITIALIZATION STATUS")
+        print("=" * 60)
+        print(f"Soft threshold: {soft_threshold:.3f}m")
+        print(f"Hard threshold: {hard_threshold:.3f}m")
+        print(f"Lookback window: {lookback_window_size} points")
+        print(f"Sampling distance: {sampling_distance:.3f}m")
+        print("=" * 60)
         
         # Ensure voxel mapping parameter is always set (final fallback)
         if not hasattr(self, 'enable_voxel_mapping'):
             self.enable_voxel_mapping = False
             print("Voxel mapping parameter not set, using default: False")
         
-        # Set nominal trajectory points if available
-        nominal_points = self.path_manager.get_nominal_points_as_numpy()
+        # Set nominal trajectory points if available (use discretized data)
+        nominal_points = self.path_manager.get_discretized_nominal_as_numpy()
         if len(nominal_points) > 0:
             self.narration_manager.set_intended_trajectory(nominal_points)
+            print(f"✓ Narration manager initialized with {len(nominal_points)} discretized points")
         else:
-            print("Warning: No nominal points available for narration manager")
+            print("⚠ Warning: No discretized nominal points available for narration manager")
     
     def init_risk_buffer_manager(self):
         """Initialize risk buffer manager."""

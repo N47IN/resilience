@@ -37,6 +37,14 @@ try:
 except Exception:
     _HAS_PYVISTA = False
 
+# NEW: Additional sklearn kernels and CV utilities for kernel learning
+try:
+    from sklearn.gaussian_process.kernels import Matern, RationalQuadratic, WhiteKernel
+    from sklearn.model_selection import KFold
+    _HAS_SKLEARN_ADV = True
+except Exception:
+    _HAS_SKLEARN_ADV = False
+
 BUFFER_DIR = "/home/navin/ros2_ws/src/buffers/run_20250828_093052_931_2e959586/buffer2"
 NOMINAL_PATH = "/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json"
 
@@ -201,6 +209,134 @@ def fit_cause_centric_gp(features: np.ndarray, drift_magnitudes: np.ndarray):
     print(f"GP score: {gp.score(features, drift_magnitudes):.4f}")
 
     return gp
+
+
+# NEW: Kernel learning with ARD and candidate search
+def _build_candidate_kernels(input_dim: int):
+    """Return a list of candidate kernels to try. Uses ARD where possible."""
+    if not _HAS_SKLEARN_ADV:
+        return []
+    ard_len = np.ones(input_dim)
+    candidates = []
+    # RBF (ARD)
+    candidates.append(ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=ard_len, length_scale_bounds=(1e-2, 1e2)) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e1)))
+    # Matern family (ARD)
+    for nu in (0.5, 1.5, 2.5):
+        candidates.append(ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=ard_len, length_scale_bounds=(1e-2, 1e2), nu=nu) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e1)))
+    # RationalQuadratic
+    candidates.append(ConstantKernel(1.0, (1e-3, 1e3)) * RationalQuadratic(length_scale=1.0, alpha=1.0) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e1)))
+    # Sum of RBF (distance vs xyz) like original but ARD
+    candidates.append(
+        (ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2))) +
+        (ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=ard_len, length_scale_bounds=(1e-2, 1e2))) +
+        WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e1))
+    )
+    return candidates
+
+
+def fit_gp_with_kernel_learning(
+    features: np.ndarray,
+    targets: np.ndarray,
+    kernel_mode: str = "auto",
+    n_restarts_optimizer: int = 8,
+    alpha: float = 1e-6,
+    cv_folds: int = 0,
+    normalize_y: bool = False,
+):
+    """Fit a GP with either a specified kernel or automatic kernel selection.
+
+    kernel_mode:
+      - 'auto': try several kernels and pick best by log-marginal likelihood or CV score
+      - 'rbf', 'matern12', 'matern32', 'matern52', 'rq': force specific family
+      - 'original': use the legacy kernel structure
+    """
+    kernel_mode = (kernel_mode or "auto").lower()
+    input_dim = features.shape[1]
+
+    def _legacy_kernel():
+        kd = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2))
+        kp = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=np.ones(input_dim), length_scale_bounds=(1e-2, 1e2))
+        return kd + kp
+
+    def _named_kernel(name: str):
+        if name == 'rbf':
+            return ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=np.ones(input_dim), length_scale_bounds=(1e-2, 1e2)) + (WhiteKernel(1e-3, (1e-6, 1e1)) if _HAS_SKLEARN_ADV else 0)
+        if name == 'matern12':
+            return ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=np.ones(input_dim), length_scale_bounds=(1e-2, 1e2), nu=0.5) + (WhiteKernel(1e-3, (1e-6, 1e1)) if _HAS_SKLEARN_ADV else 0)
+        if name == 'matern32':
+            return ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=np.ones(input_dim), length_scale_bounds=(1e-2, 1e2), nu=1.5) + (WhiteKernel(1e-3, (1e-6, 1e1)) if _HAS_SKLEARN_ADV else 0)
+        if name == 'matern52':
+            return ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=np.ones(input_dim), length_scale_bounds=(1e-2, 1e2), nu=2.5) + (WhiteKernel(1e-3, (1e-6, 1e1)) if _HAS_SKLEARN_ADV else 0)
+        if name == 'rq':
+            return ConstantKernel(1.0, (1e-3, 1e3)) * RationalQuadratic(length_scale=1.0, alpha=1.0) + (WhiteKernel(1e-3, (1e-6, 1e1)) if _HAS_SKLEARN_ADV else 0)
+        if name == 'original':
+            return _legacy_kernel()
+        return _legacy_kernel()
+
+    if kernel_mode != 'auto':
+        kernel = _named_kernel(kernel_mode)
+        gp = GaussianProcessRegressor(kernel=kernel, alpha=alpha, n_restarts_optimizer=n_restarts_optimizer, normalize_y=normalize_y, random_state=42)
+        gp.fit(features, targets)
+        print(f"Fitted GP kernel ({kernel_mode}): {gp.kernel_}")
+        print(f"GP score: {gp.score(features, targets):.4f}")
+        return gp
+
+    # Auto selection
+    candidates = _build_candidate_kernels(input_dim)
+    if not candidates:
+        print("Advanced kernels unavailable; falling back to legacy kernel")
+        return fit_cause_centric_gp(features, targets)
+
+    best_gp = None
+    best_score = -np.inf
+    best_desc = None
+
+    if cv_folds and cv_folds >= 2:
+        kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        for ker in candidates:
+            try:
+                cv_scores = []
+                for train_idx, val_idx in kf.split(features):
+                    Xtr, Xval = features[train_idx], features[val_idx]
+                    ytr, yval = targets[train_idx], targets[val_idx]
+                    gp = GaussianProcessRegressor(kernel=ker, alpha=alpha, n_restarts_optimizer=max(2, n_restarts_optimizer // 2), normalize_y=normalize_y, random_state=42)
+                    gp.fit(Xtr, ytr)
+                    cv_scores.append(gp.score(Xval, yval))
+                mean_cv = float(np.mean(cv_scores))
+                if mean_cv > best_score:
+                    best_score = mean_cv
+                    best_desc = f"CV R2={mean_cv:.4f}"
+                    best_gp = GaussianProcessRegressor(kernel=ker, alpha=alpha, n_restarts_optimizer=n_restarts_optimizer, normalize_y=normalize_y, random_state=42)
+            except Exception as e:
+                print(f"Kernel {ker} failed in CV: {e}")
+        if best_gp is None:
+            print("All candidate kernels failed in CV; using legacy kernel")
+            return fit_cause_centric_gp(features, targets)
+        best_gp.fit(features, targets)
+        print(f"Selected kernel (auto via CV): {best_gp.kernel_} [{best_desc}]")
+        print(f"Train R2: {best_gp.score(features, targets):.4f}")
+        return best_gp
+
+    # No CV: pick by log-marginal likelihood on full data
+    for ker in candidates:
+        try:
+            gp = GaussianProcessRegressor(kernel=ker, alpha=alpha, n_restarts_optimizer=n_restarts_optimizer, normalize_y=normalize_y, random_state=42)
+            gp.fit(features, targets)
+            lml = gp.log_marginal_likelihood(gp.kernel_.theta)
+            if lml > best_score:
+                best_score = lml
+                best_desc = f"LML={lml:.3f}"
+                best_gp = gp
+        except Exception as e:
+            print(f"Kernel {ker} failed: {e}")
+
+    if best_gp is None:
+        print("All candidate kernels failed; using legacy kernel")
+        return fit_cause_centric_gp(features, targets)
+
+    print(f"Selected kernel (auto): {best_gp.kernel_} [{best_desc}]")
+    print(f"Train R2: {best_gp.score(features, targets):.4f}")
+    return best_gp
 
 
 def clip_nominal_to_actual_segment(nominal_xyz: np.ndarray, actual_xyz: np.ndarray, plane: str = 'xy'):
@@ -533,6 +669,25 @@ def main():
     print(f"Cause: {cause}")
     print(f"Cause location: {cause_xyz}")
 
+    # NEW: CLI flags for kernel selection
+    try:
+        import argparse as _argparse
+        parser = _argparse.ArgumentParser(description="3D GP disturbance field with kernel learning")
+        parser.add_argument('--kernel', type=str, default='auto', help="Kernel mode: auto|rbf|matern12|matern32|matern52|rq|original")
+        parser.add_argument('--cv-folds', type=int, default=0, help="If >1, use K-fold CV to select kernel (slower)")
+        parser.add_argument('--alpha', type=float, default=1e-6, help="Gaussian noise added to the diagonal of the kernel matrix")
+        parser.add_argument('--restarts', type=int, default=8, help="Number of optimizer restarts for kernel hyperparameters")
+        parser.add_argument('--normalize-y', action='store_true', help="Normalize targets in GP")
+        args, _unknown = parser.parse_known_args()
+    except Exception:
+        class _Args:
+            kernel = 'auto'
+            cv_folds = 0
+            alpha = 1e-6
+            restarts = 8
+            normalize_y = False
+        args = _Args()
+
     clipped_nominal_xyz = None
     if nominal_xyz is not None:
         clipped_nominal_xyz = clip_nominal_to_actual_segment(nominal_xyz, xyz, plane='xy')
@@ -565,7 +720,19 @@ def main():
     features, final_cause_xyz = create_cause_centric_features_nominal(nominal_points_used, cause_xyz)
 
     print("Fitting Gaussian Process (3D)...")
-    gp = fit_cause_centric_gp(features, disturbance_magnitudes)
+    try:
+        gp = fit_gp_with_kernel_learning(
+            features,
+            disturbance_magnitudes,
+            kernel_mode=args.kernel,
+            n_restarts_optimizer=args.restarts,
+            alpha=args.alpha,
+            cv_folds=args.cv_folds,
+            normalize_y=args.normalize_y,
+        )
+    except Exception as e:
+        print(f"Kernel learning failed ({e}); falling back to legacy GP")
+        gp = fit_cause_centric_gp(features, disturbance_magnitudes)
 
     print("Creating 3D prediction grid...")
     Xg, Yg, Zg, grid_points, xs, ys, zs = create_3d_prediction_grid(xyz, final_cause_xyz, resolution_xy=0.06, resolution_z=0.06)
