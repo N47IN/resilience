@@ -44,6 +44,14 @@ try:
 except ImportError:
 	GP_HELPER_AVAILABLE = False
 
+# GP Superposition Manager
+try:
+	from resilience.gp_superposition_manager import GPSuperpositionManager
+	from resilience.gp_evolution_visualizer import GPEvolutionVisualizer
+	GP_SUPERPOSITION_AVAILABLE = True
+except ImportError:
+	GP_SUPERPOSITION_AVAILABLE = False
+
 # Optional PathManager for global path access
 try:
 	from resilience.path_manager import PathManager
@@ -192,9 +200,11 @@ class SemanticDepthOctoMapNode(Node):
 		# GP fitting state
 		self.gp_fit_lock = threading.Lock()
 		self.gp_fitting_active = False
-		# Initialize GP parameter library used by _update_gp_library
-		self.gp_library = {}
-		
+
+		# GP Superposition Manager (will be initialized after voxel_helper)
+		self.gp_superposition_manager = None
+		self.gp_evolution_visualizer = None
+
 		# Optional: initialize PathManager for accessing global path (non-blocking)
 		self.path_manager = None
 		if PATH_MANAGER_AVAILABLE:
@@ -267,6 +277,25 @@ class SemanticDepthOctoMapNode(Node):
 			if loaded > 0:
 				self.get_logger().info(f"Loaded {loaded} VLM embeddings from buffers")
 
+		# Initialize GP Superposition Manager now that voxel_helper is ready
+		if GP_SUPERPOSITION_AVAILABLE:
+			try:
+				self.gp_superposition_manager = GPSuperpositionManager(
+					self, 
+					self.map_frame, 
+					update_interval=1.0, 
+					voxel_helper=self.voxel_helper,
+					grid_extension=1.5,  # Extend grid 1.5m from voxels
+					grid_resolution=0.15,  # 15cm resolution
+					max_grid_distance=2.0  # Max 2m distance from voxels
+				)
+				self.gp_evolution_visualizer = GPEvolutionVisualizer(self, self.map_frame)
+				self.get_logger().info("GP Superposition Manager and Evolution Visualizer initialized")
+			except Exception as e:
+				self.get_logger().warn(f"Failed to initialize GP Superposition Manager: {e}")
+				self.gp_superposition_manager = None
+				self.gp_evolution_visualizer = None
+
 		# Precompute transforms
 		self.R_opt_to_base = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float32)
 		self.R_cam_to_base_extra = self._rpy_deg_to_rot(self.cam_to_base_rpy_deg)
@@ -289,8 +318,8 @@ class SemanticDepthOctoMapNode(Node):
 		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
 		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
 		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
-		# GP field cloud publisher
-		self.gp_field_cloud_pub = self.create_publisher(PointCloud2, '/gp_field_cloud', 10)
+		# New GP visualization publishers
+		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
 
 		self.get_logger().info(
 			f"SemanticDepthOctoMapNode initialized:\n"
@@ -565,6 +594,7 @@ class SemanticDepthOctoMapNode(Node):
 					# Use voxelized points for GP fitting to avoid memory issues
 					voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
 					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points)
+
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
 
 			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
@@ -830,8 +860,6 @@ class SemanticDepthOctoMapNode(Node):
 				json.dump(o, f, indent=2)
 			self.get_logger().info(f"Saved GP fit parameters to {out_path}")
 			
-			# Update GP library with new parameters
-			self._update_gp_library(fit, buffer_dir)
 		except Exception as e:
 			self.get_logger().error(f"GP fit task failed: {e}")
 			import traceback
@@ -842,6 +870,10 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# After GP fitting is complete, create and publish visualization
 			self._create_and_publish_gp_visualization(buffer_dir)
+			
+			# Add to superposition manager if available
+			if self.gp_superposition_manager is not None:
+				self._add_gp_to_superposition_manager(buffer_dir, pointcloud_xyz, result)
 
 	def _create_and_publish_gp_visualization(self, buffer_dir: str):
 		"""Create and publish GP field visualization as colored point cloud."""
@@ -884,8 +916,8 @@ class SemanticDepthOctoMapNode(Node):
 			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_values)
 			
 			if colored_cloud:
-				self.gp_field_cloud_pub.publish(colored_cloud)
-				self.get_logger().info(f"Published GP field cloud with {len(grid_points)} points")
+				self.gp_visualization_pub.publish(colored_cloud)
+				self.get_logger().info(f"Published GP field visualization with {len(grid_points)} points")
 			
 		except Exception as e:
 			self.get_logger().error(f"Error creating GP visualization: {e}")
@@ -1058,71 +1090,69 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 			return None
 	
-	def _update_gp_library(self, fit_params: dict, buffer_dir: str):
-		"""Update GP library with per-voxel parameters learned from narration hotspots."""
+	def _add_gp_to_superposition_manager(self, buffer_dir: str, pointcloud_xyz: np.ndarray, gp_result: dict):
+		"""Add GP parameters to the superposition manager for real-time superposition."""
 		try:
-			# Extract cause name from buffer directory metadata
-			metadata_path = os.path.join(buffer_dir, 'metadata.json')
-			if not os.path.exists(metadata_path):
-				self.get_logger().warn(f"Metadata file not found: {metadata_path}")
+			if self.gp_superposition_manager is None:
 				return
 			
-			with open(metadata_path, 'r') as f:
-				metadata = json.load(f)
-			
-			cause_name = metadata.get('cause')
-			if not cause_name:
-				self.get_logger().warn("No cause found in metadata")
-				return
-			
-			# Store per-voxel GP parameters learned from narration hotspots
-			self.gp_library[cause_name] = {
-				'lxy': fit_params.get('lxy', 0.5),
-				'lz': fit_params.get('lz', 0.5),
-				'A': fit_params.get('A', 1.0),
-				'b': fit_params.get('b', 0.0),
-				'fit_time': time.time(),
-				'fit_quality': fit_params.get('r2_score', 0.0),
-				'voxel_resolution': float(self.voxel_resolution),
-				'learned_from': 'narration_hotspots'
+			# Extract GP parameters from result
+			fit = gp_result.get('fit', {})
+			gp_params = {
+				'lxy': fit.get('lxy', 0.5),
+				'lz': fit.get('lz', 0.5),
+				'A': fit.get('A', 1.0),
+				'b': fit.get('b', 0.0),
+				'mse': fit.get('mse', 0.0),
+				'rmse': fit.get('rmse', 0.0),
+				'mae': fit.get('mae', 0.0),
+				'r2_score': fit.get('r2_score', 0.0)
 			}
 			
-			self.get_logger().info(f"Updated per-voxel GP library for cause '{cause_name}' - learned from narration hotspots")
+			# Calculate voxel position (centroid of pointcloud)
+			voxel_position = np.mean(pointcloud_xyz, axis=0)
+			
+			# Use a generic cause name for all semantic voxels
+			cause_name = "semantic_disturbance"
+			
+			# Add to superposition manager
+			self.gp_superposition_manager.add_voxel_gp(
+				voxel_position=voxel_position,
+				gp_params=gp_params,
+				cause_name=cause_name,
+				buffer_dir=buffer_dir
+			)
+			
+			# Update evolution visualizer
+			if self.gp_evolution_visualizer is not None:
+				gp_stats = {
+					'voxel_count': len(pointcloud_xyz),
+					'gp_params': gp_params,
+					'buffer_dir': buffer_dir
+				}
+				self.gp_evolution_visualizer.update_evolution(cause_name, 1, gp_stats)
+			
+			self.get_logger().info(f"Added GP to superposition manager for cause '{cause_name}' at position {voxel_position}")
 			
 		except Exception as e:
-			self.get_logger().error(f"Error updating GP library: {e}")
+			self.get_logger().error(f"Error adding GP to superposition manager: {e}")
+			import traceback
+			traceback.print_exc()
 	
-	
-	def _predict_gp_at_voxel(self, voxel_center: np.ndarray, gp_params: dict) -> float:
-		"""Predict GP value at a voxel using learned per-voxel parameters."""
+	def _extract_cause_name_from_buffer(self, buffer_dir: str) -> str:
+		"""Extract cause name from buffer directory path."""
 		try:
-			# Use the per-voxel parameters learned from narration hotspots
-			lxy = gp_params.get('lxy', 0.5)
-			lz = gp_params.get('lz', 0.5)
-			A = gp_params.get('A', 1.0)
-			b = gp_params.get('b', 0.0)
-			voxel_resolution = gp_params.get('voxel_resolution', 0.1)
+			# Extract buffer ID from path (e.g., /path/to/buffers/run_123/buffer_456 -> buffer_456)
+			buffer_id = os.path.basename(buffer_dir)
 			
-			# The per-voxel GP represents the local disturbance field strength
-			# This is the amplitude learned from narration hotspots at voxel resolution
-			voxel_gp_value = A + b
-			
-			return voxel_gp_value
+			# For now, use buffer_id as cause name
+			# In the future, this could be enhanced to extract semantic cause from buffer metadata
+			return buffer_id
 			
 		except Exception as e:
-			self.get_logger().error(f"Error predicting GP at voxel: {e}")
-			return 0.0
-	
-	
-	def _compute_superposed_gp_field(self, grid_points: np.ndarray) -> np.ndarray:
-		"""Compute superposed GP field from semantic data (per-voxel visualization removed)."""
-		try:
-			# Per-voxel GP visualization has been removed; return zeros by default
-			return np.zeros(len(grid_points))
-		except Exception as e:
-			self.get_logger().error(f"Error computing superposed GP field: {e}")
-			return np.zeros(len(grid_points))
-	
+			self.get_logger().warn(f"Error extracting cause name from buffer: {e}")
+			return "unknown_cause"
+
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 									 threshold: float, stats: dict):
 		"""Apply semantic labels to voxels based on hotspot points."""
@@ -1156,7 +1186,6 @@ class SemanticDepthOctoMapNode(Node):
 					semantic_mapper.voxel_semantics[voxel_key] = semantic_info
 			
 			self.get_logger().info(f"✓ Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' - these will appear RED in the colored cloud")
-			
 			
 		except Exception as e:
 			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
@@ -1616,7 +1645,6 @@ class SemanticDepthOctoMapNode(Node):
 
 
 
-
 def main():
 	rclpy.init()
 	node = SemanticDepthOctoMapNode()
@@ -1625,6 +1653,9 @@ def main():
 	except KeyboardInterrupt:
 		pass
 	finally:
+		# Cleanup superposition manager
+		if hasattr(node, 'gp_superposition_manager') and node.gp_superposition_manager is not None:
+			node.gp_superposition_manager.shutdown()
 		node.destroy_node()
 		rclpy.shutdown()
 

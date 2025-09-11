@@ -200,13 +200,22 @@ class ResilienceNode(Node):
         
         self.print_initialization_status()
 
-        # PointCloud worker thread state
-        self.pc_queue = []  # list of dicts: {'mask': np.ndarray, 'timestamp': float}
-        self.pc_queue_max_size = 50
-        self.pc_cond = threading.Condition()
-        self.pc_thread = threading.Thread(target=self._pointcloud_worker_loop, daemon=True)
-        self.pc_thread_running = True
-        self.pc_thread.start()
+        # PointCloud worker thread state (only if direct_mapping is enabled)
+        if self.direct_mapping:
+            self.pc_queue = []  # list of dicts: {'mask': np.ndarray, 'timestamp': float}
+            self.pc_queue_max_size = 50
+            self.pc_cond = threading.Condition()
+            self.pc_thread = threading.Thread(target=self._pointcloud_worker_loop, daemon=True)
+            self.pc_thread_running = True
+            self.pc_thread.start()
+            print("PointCloud worker thread started (direct_mapping enabled)")
+        else:
+            self.pc_queue = None
+            self.pc_queue_max_size = None
+            self.pc_cond = None
+            self.pc_thread = None
+            self.pc_thread_running = False
+            print("PointCloud worker thread disabled (direct_mapping disabled)")
 
     def wait_for_path_ready(self):
         """Wait for path to be ready before starting main functionality."""
@@ -298,14 +307,28 @@ class ResilienceNode(Node):
             self.create_subscription(msg_type, topic, callback, qos)
 
         # After init_subscriptions
-        # Timestamped buffers for sync (similar to depth_octomap_node)
-        self.rgb_buffer = []    # list of tuples (timestamp_float, rgb_np_uint8, rgb_msg)
-        self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters, depth_msg)
-        self.pose_buffer = []   # list of tuples (timestamp_float, PoseStamped)
-        self.sync_buffer_duration = 2.0
-        # Direct semantic point cloud publisher
-        self.direct_semantic_cloud_pub = self.create_publisher(PointCloud2, '/direct_semantic_cloud', 10)
-        self.direct_points_accum = []  # accumulate all semantic voxels over time
+        # Timestamped buffers for sync (similar to depth_octomap_node) - only if direct_mapping is enabled
+        if self.direct_mapping:
+            self.rgb_buffer = []    # list of tuples (timestamp_float, rgb_np_uint8, rgb_msg)
+            self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters, depth_msg)
+            self.pose_buffer = []   # list of tuples (timestamp_float, PoseStamped)
+            self.sync_buffer_duration = 2.0
+            print("Triplet buffer handling enabled (direct_mapping enabled)")
+        else:
+            self.rgb_buffer = None
+            self.depth_buffer = None
+            self.pose_buffer = None
+            self.sync_buffer_duration = None
+            print("Triplet buffer handling disabled (direct_mapping disabled)")
+        # Direct semantic point cloud publisher (only if direct_mapping is enabled)
+        if self.direct_mapping:
+            self.direct_semantic_cloud_pub = self.create_publisher(PointCloud2, '/direct_semantic_cloud', 10)
+            self.direct_points_accum = []  # accumulate all semantic voxels over time
+            print("Direct semantic cloud publisher enabled (direct_mapping enabled)")
+        else:
+            self.direct_semantic_cloud_pub = None
+            self.direct_points_accum = None
+            print("Direct semantic cloud publisher disabled (direct_mapping disabled)")
 
     def print_initialization_status(self):
         """Print initialization status."""
@@ -319,6 +342,7 @@ class ResilienceNode(Node):
         print(f"Hard threshold: {self.path_manager.get_thresholds()[1]} ({self.path_manager.get_threshold_source()})")
         print(f"NARadio processing: {'ENABLED' if self.naradio_processor.is_ready() else 'DISABLED'}")
         print(f"Voxel Mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
+        print(f"Direct Mapping: {'ENABLED' if self.direct_mapping else 'DISABLED'}")
         
         vlm_enabled = (self.enable_combined_segmentation and 
                       hasattr(self, 'naradio_processor') and 
@@ -383,17 +407,20 @@ class ResilienceNode(Node):
                 else:
                     print("Warning: Combined segmentation initialization failed")
             
-            # Read voxel mapping parameter from main config (non-blocking)
+            # Read voxel mapping parameters from main config (non-blocking)
             self.enable_voxel_mapping = False  # Default value
+            self.direct_mapping = False  # Default value
             if (self.naradio_processor.is_ready() and 
                 hasattr(self.naradio_processor, 'segmentation_config')):
                 try:
                     self.enable_voxel_mapping = self.naradio_processor.segmentation_config.get('enable_voxel_mapping', False)
+                    self.direct_mapping = self.naradio_processor.segmentation_config.get('direct_mapping', False)
                 except Exception as e:
-                    print(f"Warning: Could not read voxel mapping parameter from config: {e}")
+                    print(f"Warning: Could not read voxel mapping parameters from config: {e}")
                     self.enable_voxel_mapping = False
+                    self.direct_mapping = False
             else:
-                print("Warning: NARadio processor not ready, using default voxel mapping: False")
+                print("Warning: NARadio processor not ready, using default voxel mapping: False, direct mapping: False")
                 
         except Exception as e:
             print(f"Error initializing NARadio processor: {e}")
@@ -427,10 +454,13 @@ class ResilienceNode(Node):
         print(f"Sampling distance: {sampling_distance:.3f}m")
         print("=" * 60)
         
-        # Ensure voxel mapping parameter is always set (final fallback)
+        # Ensure voxel mapping parameters are always set (final fallback)
         if not hasattr(self, 'enable_voxel_mapping'):
             self.enable_voxel_mapping = False
             print("Voxel mapping parameter not set, using default: False")
+        if not hasattr(self, 'direct_mapping'):
+            self.direct_mapping = False
+            print("Direct mapping parameter not set, using default: False")
         
         # Set nominal trajectory points if available (use discretized data)
         nominal_points = self.path_manager.get_discretized_nominal_as_numpy()
@@ -498,10 +528,11 @@ class ResilienceNode(Node):
         self.rgb_images_with_timestamps.append((msg, msg_timestamp))
         if len(self.rgb_images_with_timestamps) > self.max_rgb_buffer:
             self.rgb_images_with_timestamps.pop(0)
-        # Push into RGB buffer
-        self.rgb_buffer.append((msg_timestamp, cv_image, msg))
-        if len(self.rgb_buffer) > 50:
-            self.rgb_buffer = self.rgb_buffer[-50:]
+        # Push into RGB buffer (only if direct_mapping is enabled)
+        if self.direct_mapping and self.rgb_buffer is not None:
+            self.rgb_buffer.append((msg_timestamp, cv_image, msg))
+            if len(self.rgb_buffer) > 50:
+                self.rgb_buffer = self.rgb_buffer[-50:]
         
         with self.processing_lock:
             self.latest_rgb_msg = msg
@@ -532,9 +563,10 @@ class ResilienceNode(Node):
         except Exception:
             return
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        self.depth_buffer.append((ts, depth_m, msg))
-        if len(self.depth_buffer) > 50:
-            self.depth_buffer = self.depth_buffer[-50:]
+        if self.direct_mapping and self.depth_buffer is not None:
+            self.depth_buffer.append((ts, depth_m, msg))
+            if len(self.depth_buffer) > 50:
+                self.depth_buffer = self.depth_buffer[-50:]
 
 
     def pose_callback(self, msg):
@@ -566,13 +598,14 @@ class ResilienceNode(Node):
             self.last_pose_time = pose_time
             
             self.narration_manager.add_actual_point(pos, pose_time, self.flip_y_axis)
-        # Push pose message into pose buffer for timestamp-based sync
-        try:
-            self.pose_buffer.append((pose_time, msg))
-            if len(self.pose_buffer) > 50:
-                self.pose_buffer = self.pose_buffer[-50:]
-        except Exception:
-            pass
+        # Push pose message into pose buffer for timestamp-based sync (only if direct_mapping is enabled)
+        if self.direct_mapping and self.pose_buffer is not None:
+            try:
+                self.pose_buffer.append((pose_time, msg))
+                if len(self.pose_buffer) > 50:
+                    self.pose_buffer = self.pose_buffer[-50:]
+            except Exception:
+                pass
 
         breach_now = self.path_manager.is_breach(drift)
         
@@ -817,6 +850,9 @@ class ResilienceNode(Node):
 
 
     def _lookup_depth_and_pose_by_ts(self, target_ts: float):
+        if not self.direct_mapping or self.depth_buffer is None or self.pose_buffer is None:
+            return None, None
+        
         best_depth = None
         best_pose = None
         best_depth_dt = float('inf')
@@ -836,6 +872,9 @@ class ResilienceNode(Node):
         return best_depth, best_pose
 
     def publish_direct_mask_pointcloud(self, mask: np.ndarray, original_image_timestamp: float):
+        if not self.direct_mapping or self.direct_semantic_cloud_pub is None:
+            return False
+        
         try:
             depth_pair, pose_msg = self._lookup_depth_and_pose_by_ts(original_image_timestamp)
             if depth_pair is None or pose_msg is None:
@@ -1168,16 +1207,17 @@ class ResilienceNode(Node):
                 print(f"  Original timestamp: {original_image_timestamp:.6f}")
                 print(f"  Hotspot pixels: {int(np.sum(hotspot_mask))}")
                 print(f"  Threshold: {threshold:.3f}")
-                # Enqueue for asynchronous direct semantic cloud publishing
-                try:
-                    if np.any(hotspot_mask):
-                        with self.pc_cond:
-                            if len(self.pc_queue) >= self.pc_queue_max_size:
-                                self.pc_queue.pop(0)
-                            self.pc_queue.append({'mask': hotspot_mask.copy(), 'timestamp': original_image_timestamp})
-                            self.pc_cond.notify()
-                except Exception:
-                    pass
+                # Enqueue for asynchronous direct semantic cloud publishing (only if direct_mapping is enabled)
+                if self.direct_mapping and self.pc_queue is not None and self.pc_cond is not None:
+                    try:
+                        if np.any(hotspot_mask):
+                            with self.pc_cond:
+                                if len(self.pc_queue) >= self.pc_queue_max_size:
+                                    self.pc_queue.pop(0)
+                                self.pc_queue.append({'mask': hotspot_mask.copy(), 'timestamp': original_image_timestamp})
+                                self.pc_cond.notify()
+                    except Exception:
+                        pass
                 return True
             
             # STEP 4: Process enhanced embedding in background (non-blocking)
@@ -1258,6 +1298,10 @@ class ResilienceNode(Node):
 
     def _pointcloud_worker_loop(self):
         """Worker thread to process pointcloud publishing asynchronously."""
+        if not self.direct_mapping:
+            print("PointCloud worker thread not started (direct_mapping disabled)")
+            return
+            
         print("PointCloud worker thread started")
         while True:
             # Wait for work or shutdown
@@ -1298,14 +1342,14 @@ def main():
             if hasattr(node, 'naradio_thread') and node.naradio_thread and node.naradio_thread.is_alive():
                 node.naradio_thread.join(timeout=2.0)
         
-        # Stop pointcloud worker thread
+        # Stop pointcloud worker thread (only if direct_mapping was enabled)
         try:
-            if hasattr(node, 'pc_thread_running'):
+            if hasattr(node, 'pc_thread_running') and node.pc_thread_running:
                 node.pc_thread_running = False
-                if hasattr(node, 'pc_cond'):
+                if hasattr(node, 'pc_cond') and node.pc_cond is not None:
                     with node.pc_cond:
                         node.pc_cond.notify_all()
-                if hasattr(node, 'pc_thread') and node.pc_thread and node.pc_thread.is_alive():
+                if hasattr(node, 'pc_thread') and node.pc_thread is not None and node.pc_thread.is_alive():
                     node.pc_thread.join(timeout=2.0)
         except Exception:
             pass

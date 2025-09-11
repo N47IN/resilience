@@ -60,6 +60,7 @@ objects:
 
 # Voxel Mapping Control
 enable_voxel_mapping: true  # Master switch for voxel mapping functionality
+direct_mapping: false  # Enable direct semantic voxel publishing and triplet buffer handling (default: false)
 
 # NARadio Model Configuration
 naradio:
