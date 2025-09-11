@@ -82,6 +82,10 @@ class NarrationManager:
     def check_for_narration(self, current_time: float, breach_idx: Optional[int] = None) -> Optional[str]:
         """Generate narration during active breach using discretized path with proper lookback."""
         try:
+            # CRITICAL: Only generate ONE narration per breach
+            if self.narration_sent_for_current_breach:
+                return None
+            
             if not self.actual_points:
                 return None
             
@@ -96,12 +100,13 @@ class NarrationManager:
             robot_idx = actual_len - 1
             
             # Get lookback window from discretized intended trajectory
-            # Find the corresponding position in the discretized trajectory
+            # Use same logic as trajectory comparison tool
             intended_start = max(0, robot_idx - self.lookback_window_size + 1)
-            intended_end = min(len(self.intended_points), intended_start + self.lookback_window_size)
+            intended_end = robot_idx + 1  # Include current point
             intended_lookback = self.intended_points[intended_start:intended_end]
             
-            # Use all available actual points (up to lookback_window_size)
+            # Use same lookback window for actual points
+            # Since actual_points is limited to lookback_window_size, use all available points
             actual_lookback = self.actual_points
             
             if len(intended_lookback) == 0 or len(actual_lookback) == 0:
@@ -116,7 +121,7 @@ class NarrationManager:
             intended_clipped = intended_lookback[:min_len]
             actual_clipped = actual_lookback[:min_len]
             
-            # Use the most recent point for narration generation
+            # Use the most recent point for narration generation (same as comparison tool)
             narration_idx = min_len - 1
             
             # Generate narration using clipped trajectories

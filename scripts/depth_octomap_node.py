@@ -192,14 +192,9 @@ class SemanticDepthOctoMapNode(Node):
 		# GP fitting state
 		self.gp_fit_lock = threading.Lock()
 		self.gp_fitting_active = False
+		# Initialize GP parameter library used by _update_gp_library
+		self.gp_library = {}
 		
-		# Per-voxel GP visualization system
-		self.gp_library = {}  # cause_name -> gp_params (per-voxel parameters)
-		self.semantic_voxels_gp = {}  # voxel_key -> (cause_name, gp_value)
-		self.gp_viz_lock = threading.Lock()
-		self.last_gp_viz_update = 0.0
-		self.gp_viz_update_interval = 1.0  # 1 Hz updates
-
 		# Optional: initialize PathManager for accessing global path (non-blocking)
 		self.path_manager = None
 		if PATH_MANAGER_AVAILABLE:
@@ -294,9 +289,8 @@ class SemanticDepthOctoMapNode(Node):
 		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
 		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
 		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
-		# New GP visualization publishers
-		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
-		self.per_voxel_gp_visualization_pub = self.create_publisher(PointCloud2, '/per_voxel_gp_visualization', 10)
+		# GP field cloud publisher
+		self.gp_field_cloud_pub = self.create_publisher(PointCloud2, '/gp_field_cloud', 10)
 
 		self.get_logger().info(
 			f"SemanticDepthOctoMapNode initialized:\n"
@@ -571,7 +565,6 @@ class SemanticDepthOctoMapNode(Node):
 					# Use voxelized points for GP fitting to avoid memory issues
 					voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
 					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points)
-
 			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
 
 			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
@@ -891,8 +884,8 @@ class SemanticDepthOctoMapNode(Node):
 			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_values)
 			
 			if colored_cloud:
-				self.gp_visualization_pub.publish(colored_cloud)
-				self.get_logger().info(f"Published GP field visualization with {len(grid_points)} points")
+				self.gp_field_cloud_pub.publish(colored_cloud)
+				self.get_logger().info(f"Published GP field cloud with {len(grid_points)} points")
 			
 		except Exception as e:
 			self.get_logger().error(f"Error creating GP visualization: {e}")
@@ -1083,45 +1076,22 @@ class SemanticDepthOctoMapNode(Node):
 				return
 			
 			# Store per-voxel GP parameters learned from narration hotspots
-			with self.gp_viz_lock:
-				self.gp_library[cause_name] = {
-					'lxy': fit_params.get('lxy', 0.5),
-					'lz': fit_params.get('lz', 0.5),
-					'A': fit_params.get('A', 1.0),
-					'b': fit_params.get('b', 0.0),
-					'fit_time': time.time(),
-					'fit_quality': fit_params.get('r2_score', 0.0),
-					'voxel_resolution': float(self.voxel_resolution),
-					'learned_from': 'narration_hotspots'
-				}
+			self.gp_library[cause_name] = {
+				'lxy': fit_params.get('lxy', 0.5),
+				'lz': fit_params.get('lz', 0.5),
+				'A': fit_params.get('A', 1.0),
+				'b': fit_params.get('b', 0.0),
+				'fit_time': time.time(),
+				'fit_quality': fit_params.get('r2_score', 0.0),
+				'voxel_resolution': float(self.voxel_resolution),
+				'learned_from': 'narration_hotspots'
+			}
 			
 			self.get_logger().info(f"Updated per-voxel GP library for cause '{cause_name}' - learned from narration hotspots")
 			
 		except Exception as e:
 			self.get_logger().error(f"Error updating GP library: {e}")
 	
-	def _compute_per_voxel_gp_values(self, voxel_keys: set, vlm_answer: str):
-		"""Compute GP values for semantic voxels using learned per-voxel parameters."""
-		try:
-			with self.gp_viz_lock:
-				# Get per-voxel GP parameters for this cause (learned from narration hotspots)
-				gp_params = self.gp_library.get(vlm_answer)
-				if not gp_params:
-					self.get_logger().debug(f"No per-voxel GP parameters available for cause '{vlm_answer}'")
-					return
-				
-				# Compute GP value for each voxel using the learned per-voxel parameters
-				for voxel_key in voxel_keys:
-					voxel_center = self._get_voxel_center_from_key(voxel_key)
-					if voxel_center is not None:
-						# Use the learned per-voxel parameters for this semantic label
-						gp_value = self._predict_gp_at_voxel(voxel_center, gp_params)
-						self.semantic_voxels_gp[voxel_key] = (vlm_answer, gp_value)
-				
-				self.get_logger().info(f"Applied per-voxel GP parameters to {len(voxel_keys)} voxels of cause '{vlm_answer}'")
-				
-		except Exception as e:
-			self.get_logger().error(f"Error computing per-voxel GP values: {e}")
 	
 	def _predict_gp_at_voxel(self, voxel_center: np.ndarray, gp_params: dict) -> float:
 		"""Predict GP value at a voxel using learned per-voxel parameters."""
@@ -1143,83 +1113,16 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error predicting GP at voxel: {e}")
 			return 0.0
 	
-	def _update_per_voxel_gp_visualization(self):
-		"""Update per-voxel GP visualization with superposition of all semantic voxels."""
-		try:
-			with self.gp_viz_lock:
-				if not self.semantic_voxels_gp:
-					return
-				
-				# Create visualization grid around all semantic voxels
-				all_voxel_centers = []
-				for voxel_key in self.semantic_voxels_gp.keys():
-					center = self._get_voxel_center_from_key(voxel_key)
-					if center is not None:
-						all_voxel_centers.append(center)
-				
-				if not all_voxel_centers:
-					return
-				
-				all_voxel_centers = np.array(all_voxel_centers)
-				
-				# Create prediction grid around all semantic voxels
-				grid_points = self._create_gp_prediction_grid(all_voxel_centers, grid_size=1.0, resolution=0.05)
-				
-				if len(grid_points) == 0:
-					return
-				
-				# Compute superposed GP field
-				superposed_field = self._compute_superposed_gp_field(grid_points)
-				
-				# Create and publish colored point cloud
-				colored_cloud = self._create_gp_colored_pointcloud(grid_points, superposed_field)
-				
-				if colored_cloud:
-					self.per_voxel_gp_visualization_pub.publish(colored_cloud)
-					self.get_logger().debug(f"Published per-voxel GP visualization with {len(grid_points)} points, {len(self.semantic_voxels_gp)} semantic voxels")
-			
-		except Exception as e:
-			self.get_logger().error(f"Error updating per-voxel GP visualization: {e}")
 	
 	def _compute_superposed_gp_field(self, grid_points: np.ndarray) -> np.ndarray:
-		"""Compute superposed GP field from all semantic voxels using per-voxel parameters."""
+		"""Compute superposed GP field from semantic data (per-voxel visualization removed)."""
 		try:
-			superposed_field = np.zeros(len(grid_points))
-			
-			with self.gp_viz_lock:
-				for voxel_key, (cause_name, voxel_gp_value) in self.semantic_voxels_gp.items():
-					voxel_center = self._get_voxel_center_from_key(voxel_key)
-					if voxel_center is None:
-						continue
-					
-					# Get per-voxel GP parameters for this cause (learned from narration hotspots)
-					gp_params = self.gp_library.get(cause_name)
-					if not gp_params:
-						continue
-					
-					# Compute RBF contribution from this voxel to all grid points
-					# Use the per-voxel parameters learned from narration hotspots
-					distances = np.linalg.norm(grid_points - voxel_center, axis=1)
-					lxy = gp_params.get('lxy', 0.5)
-					lz = gp_params.get('lz', 0.5)
-					A = gp_params.get('A', 1.0)
-					b = gp_params.get('b', 0.0)
-					
-					# Use average length scale from learned parameters
-					avg_length = (lxy + lz) / 2.0
-					
-					# RBF contribution using per-voxel parameters
-					rbf_contributions = A * np.exp(-(distances**2) / (2 * avg_length**2)) + b
-					
-					# Add to superposed field
-					superposed_field += rbf_contributions
-			
-			return superposed_field
-			
+			# Per-voxel GP visualization has been removed; return zeros by default
+			return np.zeros(len(grid_points))
 		except Exception as e:
 			self.get_logger().error(f"Error computing superposed GP field: {e}")
 			return np.zeros(len(grid_points))
-
+	
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 									 threshold: float, stats: dict):
 		"""Apply semantic labels to voxels based on hotspot points."""
@@ -1254,8 +1157,6 @@ class SemanticDepthOctoMapNode(Node):
 			
 			self.get_logger().info(f"✓ Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' - these will appear RED in the colored cloud")
 			
-			# Compute per-voxel GP values for new semantic voxels
-			self._compute_per_voxel_gp_values(voxel_keys, vlm_answer)
 			
 		except Exception as e:
 			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
@@ -1300,10 +1201,6 @@ class SemanticDepthOctoMapNode(Node):
 			self._process_bridge_message_queue()
 			self.last_queue_process_time = current_time
 
-		# Periodic per-voxel GP visualization update (1 Hz)
-		if (current_time - self.last_gp_viz_update) >= self.gp_viz_update_interval:
-			self._update_per_voxel_gp_visualization()
-			self.last_gp_viz_update = current_time
 
 		# Periodic publishing
 		self._periodic_publishing()
@@ -1714,6 +1611,7 @@ class SemanticDepthOctoMapNode(Node):
 			return Rz @ Ry @ Rx
 		except Exception:
 			return np.eye(3, dtype=np.float32)
+
 
 
 

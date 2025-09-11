@@ -30,6 +30,9 @@ from resilience.path_manager import PathManager
 from resilience.naradio_processor import NARadioProcessor
 from resilience.narration_manager import NarrationManager
 from resilience.risk_buffer import RiskBufferManager
+from resilience.pointcloud_utils import depth_to_meters as pc_depth_to_meters, depth_mask_to_world_points, voxelize_pointcloud, create_cloud_xyz
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Header
 
 
 class ResilienceNode(Node):
@@ -55,19 +58,21 @@ class ResilienceNode(Node):
             ('enable_combined_segmentation', True),
             ('main_config_path', ''),
             ('mapping_config_path', ''),
-            ('enable_voxel_mapping', True)
+            ('enable_voxel_mapping', True),
+            ('pose_is_base_link', True)
         ])
 
         param_values = self.get_parameters([
             'flip_y_axis', 'use_tf',
             'radio_model_version', 'radio_lang_model', 'radio_input_resolution',
+            'pose_is_base_link',
             'enable_naradio_visualization', 'enable_combined_segmentation',
             'main_config_path', 'mapping_config_path', 'enable_voxel_mapping'
         ])
         
         (self.flip_y_axis, self.use_tf,
          self.radio_model_version, self.radio_lang_model, self.radio_input_resolution,
-         self.enable_naradio_visualization, self.enable_combined_segmentation,
+         self.pose_is_base_link, self.enable_naradio_visualization, self.enable_combined_segmentation,
          self.main_config_path, self.mapping_config_path, self.enable_voxel_mapping
         ) = [p.value for p in param_values]
 
@@ -195,6 +200,14 @@ class ResilienceNode(Node):
         
         self.print_initialization_status()
 
+        # PointCloud worker thread state
+        self.pc_queue = []  # list of dicts: {'mask': np.ndarray, 'timestamp': float}
+        self.pc_queue_max_size = 50
+        self.pc_cond = threading.Condition()
+        self.pc_thread = threading.Thread(target=self._pointcloud_worker_loop, daemon=True)
+        self.pc_thread_running = True
+        self.pc_thread.start()
+
     def wait_for_path_ready(self):
         """Wait for path to be ready before starting main functionality."""
         print("Waiting for path to be ready...")
@@ -283,6 +296,16 @@ class ResilienceNode(Node):
         
         for topic, msg_type, callback, qos in subscriptions:
             self.create_subscription(msg_type, topic, callback, qos)
+
+        # After init_subscriptions
+        # Timestamped buffers for sync (similar to depth_octomap_node)
+        self.rgb_buffer = []    # list of tuples (timestamp_float, rgb_np_uint8, rgb_msg)
+        self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters, depth_msg)
+        self.pose_buffer = []   # list of tuples (timestamp_float, PoseStamped)
+        self.sync_buffer_duration = 2.0
+        # Direct semantic point cloud publisher
+        self.direct_semantic_cloud_pub = self.create_publisher(PointCloud2, '/direct_semantic_cloud', 10)
+        self.direct_points_accum = []  # accumulate all semantic voxels over time
 
     def print_initialization_status(self):
         """Print initialization status."""
@@ -465,21 +488,26 @@ class ResilienceNode(Node):
             print("NARadio thread already running")
 
     def rgb_callback(self, msg):
-        """Store RGB message with timestamp for hotspot publishing."""
+        """Store RGB message with timestamp for hotspot publishing and sync buffers."""
         msg_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+        except Exception:
+            return
         # Store RGB image with timestamp for hotspot publishing
         self.rgb_images_with_timestamps.append((msg, msg_timestamp))
         if len(self.rgb_images_with_timestamps) > self.max_rgb_buffer:
             self.rgb_images_with_timestamps.pop(0)
+        # Push into RGB buffer
+        self.rgb_buffer.append((msg_timestamp, cv_image, msg))
+        if len(self.rgb_buffer) > 50:
+            self.rgb_buffer = self.rgb_buffer[-50:]
         
         with self.processing_lock:
             self.latest_rgb_msg = msg
             if self.latest_pose is not None:
                 self.detection_pose = self.latest_pose.copy()
                 self.detection_pose_time = self.latest_pose_time
-        
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         
         self.image_buffer.append((cv_image, msg_timestamp, msg))
         
@@ -495,10 +523,20 @@ class ResilienceNode(Node):
 
         
     def depth_callback(self, msg):
-        """Store latest depth message."""
+        """Store latest depth message and push into depth buffer."""
         with self.processing_lock:
             self.latest_depth_msg = msg
-        
+        try:
+            depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            depth_m = pc_depth_to_meters(depth_img, msg.encoding)
+        except Exception:
+            return
+        ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self.depth_buffer.append((ts, depth_m, msg))
+        if len(self.depth_buffer) > 50:
+            self.depth_buffer = self.depth_buffer[-50:]
+
+
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
         # Always compute and print drift, even if detection is disabled
@@ -528,6 +566,13 @@ class ResilienceNode(Node):
             self.last_pose_time = pose_time
             
             self.narration_manager.add_actual_point(pos, pose_time, self.flip_y_axis)
+        # Push pose message into pose buffer for timestamp-based sync
+        try:
+            self.pose_buffer.append((pose_time, msg))
+            if len(self.pose_buffer) > 50:
+                self.pose_buffer = self.pose_buffer[-50:]
+        except Exception:
+            pass
 
         breach_now = self.path_manager.is_breach(drift)
         
@@ -768,6 +813,65 @@ class ResilienceNode(Node):
             print(f"Error publishing narration hotspot mask: {e}")
             import traceback
             traceback.print_exc()
+            return False
+
+
+    def _lookup_depth_and_pose_by_ts(self, target_ts: float):
+        best_depth = None
+        best_pose = None
+        best_depth_dt = float('inf')
+        best_pose_dt = float('inf')
+        # Depth
+        for ts, depth_m, dmsg in self.depth_buffer:
+            dt = abs(ts - target_ts)
+            if dt < best_depth_dt and dt <= self.sync_buffer_duration:
+                best_depth_dt = dt
+                best_depth = (depth_m, dmsg)
+        # Pose
+        for ts, pose_msg in self.pose_buffer:
+            dt = abs(ts - target_ts)
+            if dt < best_pose_dt and dt <= self.sync_buffer_duration:
+                best_pose_dt = dt
+                best_pose = pose_msg
+        return best_depth, best_pose
+
+    def publish_direct_mask_pointcloud(self, mask: np.ndarray, original_image_timestamp: float):
+        try:
+            depth_pair, pose_msg = self._lookup_depth_and_pose_by_ts(original_image_timestamp)
+            if depth_pair is None or pose_msg is None:
+                return False
+            depth_m, depth_msg = depth_pair
+            if depth_m is None or self.camera_intrinsics is None:
+                return False
+            pts_world, _, _ = depth_mask_to_world_points(
+                depth_m=depth_m,
+                mask=mask.astype(np.uint8),
+                intrinsics=self.camera_intrinsics,
+                pose=pose_msg,
+                pose_is_base_link=bool(self.pose_is_base_link),
+                apply_optical_frame_rotation=True
+            )
+            if pts_world is None or len(pts_world) == 0:
+                return False
+            # No depth/range limit for semantic voxels in direct publishing
+            if pts_world.size == 0:
+                return False
+            # Accumulate all semantic voxels
+            try:
+                self.direct_points_accum.append(pts_world)
+                accum_all = np.vstack(self.direct_points_accum) if len(self.direct_points_accum) > 0 else None
+            except Exception:
+                accum_all = pts_world
+            # Voxelize accumulated points for stable visualization
+            voxel_size = 0.1
+            voxelized = voxelize_pointcloud(accum_all, voxel_size, max_points=50000)
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg()
+            header.frame_id = 'map'
+            cloud = create_cloud_xyz(voxelized, header)
+            self.direct_semantic_cloud_pub.publish(cloud)
+            return True
+        except Exception:
             return False
 
 
@@ -1061,8 +1165,20 @@ class ResilienceNode(Node):
             
             if hotspot_success:
                 print(f"Hotspot mask sent to semantic bridge for '{vlm_answer}'")
-            else:
-                print(f"Failed to send hotspot mask to semantic bridge")
+                print(f"  Original timestamp: {original_image_timestamp:.6f}")
+                print(f"  Hotspot pixels: {int(np.sum(hotspot_mask))}")
+                print(f"  Threshold: {threshold:.3f}")
+                # Enqueue for asynchronous direct semantic cloud publishing
+                try:
+                    if np.any(hotspot_mask):
+                        with self.pc_cond:
+                            if len(self.pc_queue) >= self.pc_queue_max_size:
+                                self.pc_queue.pop(0)
+                            self.pc_queue.append({'mask': hotspot_mask.copy(), 'timestamp': original_image_timestamp})
+                            self.pc_cond.notify()
+                except Exception:
+                    pass
+                return True
             
             # STEP 4: Process enhanced embedding in background (non-blocking)
             try:
@@ -1140,6 +1256,30 @@ class ResilienceNode(Node):
             return time.time()
 
 
+    def _pointcloud_worker_loop(self):
+        """Worker thread to process pointcloud publishing asynchronously."""
+        print("PointCloud worker thread started")
+        while True:
+            # Wait for work or shutdown
+            with self.pc_cond:
+                while not self.pc_queue and self.pc_thread_running:
+                    self.pc_cond.wait()
+                if not self.pc_thread_running:
+                    break
+                item = self.pc_queue.pop(0)
+            # Process outside the lock
+            try:
+                mask = item.get('mask')
+                original_image_timestamp = item.get('timestamp')
+                if mask is not None and original_image_timestamp is not None:
+                    self.publish_direct_mask_pointcloud(mask, original_image_timestamp)
+            except Exception as e:
+                print(f"Error publishing pointcloud from worker: {e}")
+                import traceback
+                traceback.print_exc()
+        print("PointCloud worker thread ended")
+
+
 
 def main():
     rclpy.init()
@@ -1157,6 +1297,18 @@ def main():
             node.naradio_running = False
             if hasattr(node, 'naradio_thread') and node.naradio_thread and node.naradio_thread.is_alive():
                 node.naradio_thread.join(timeout=2.0)
+        
+        # Stop pointcloud worker thread
+        try:
+            if hasattr(node, 'pc_thread_running'):
+                node.pc_thread_running = False
+                if hasattr(node, 'pc_cond'):
+                    with node.pc_cond:
+                        node.pc_cond.notify_all()
+                if hasattr(node, 'pc_thread') and node.pc_thread and node.pc_thread.is_alive():
+                    node.pc_thread.join(timeout=2.0)
+        except Exception:
+            pass
         
         if hasattr(node, 'naradio_processor') and node.naradio_processor.is_ready():
             try:
