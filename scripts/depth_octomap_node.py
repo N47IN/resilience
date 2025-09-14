@@ -60,6 +60,11 @@ class SemanticDepthOctoMapNode(Node):
 	def __init__(self):
 		super().__init__('semantic_depth_octomap_node')
 
+		# Professional startup message
+		self.get_logger().info("=" * 60)
+		self.get_logger().info("SEMANTIC OCTOMAP SYSTEM INITIALIZING")
+		self.get_logger().info("=" * 60)
+
 		# Parameters
 		self.declare_parameters('', [
 			('depth_topic', '/robot_1/sensors/front_stereo/depth/depth_registered'),
@@ -158,10 +163,10 @@ class SemanticDepthOctoMapNode(Node):
 			self.semantic_octomap_colored_cloud_topic = topics.get('semantic_octomap_colored_cloud_topic', '/semantic_octomap_colored_cloud')
 			self.semantic_voxels_only_topic = topics.get('semantic_voxels_only_topic', '/semantic_voxels_only')
 			
-			self.get_logger().info(f"Loaded topic configuration from: {config_path}")
+			self.get_logger().info(f"Topic configuration loaded from: {config_path}")
 			
 		except Exception as e:
-			self.get_logger().error(f"Error loading topic configuration: {e}")
+			self.get_logger().warn(f"Using default topic configuration: {e}")
 			# Fallback to default topics
 			self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
 			self.camera_info_topic = '/robot_1/sensors/front_stereo/left/camera_info'
@@ -314,17 +319,26 @@ class SemanticDepthOctoMapNode(Node):
 		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
 		self.costmap_pub = self.create_publisher(PointCloud2, '/semantic_costmap', 10)
 
-		self.get_logger().info(
-			f"SemanticDepthOctoMapNode initialized:\n"
-			f"  - Voxel resolution: {self.voxel_resolution}m\n"
-			f"  - Voxel mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}\n"
-			f"  - Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}\n"
-			f"  - Bridge queue: max_size={self.max_queue_size}, process_interval={self.queue_processing_interval}s\n"
-			f"  - Sync buffers: duration={self.sync_buffer_duration}s\n"
-			f"  - Voxel helper ready: {hasattr(self, 'voxel_helper') and self.voxel_helper is not None}\n"
-			f"  - Semantic mapper ready: {hasattr(self.voxel_helper, 'semantic_mapper') and self.voxel_helper.semantic_mapper is not None}\n"
-			f"  - Topics: depth={self.depth_topic}, pose={self.pose_topic}"
-		)
+		self.get_logger().info("=" * 60)
+		self.get_logger().info("SEMANTIC OCTOMAP SYSTEM READY")
+		self.get_logger().info("=" * 60)
+		
+		self.get_logger().info(f"Mapping Configuration:")
+		self.get_logger().info(f"   Voxel resolution: {self.voxel_resolution}m")
+		self.get_logger().info(f"   Max range: {self.max_range}m")
+		self.get_logger().info(f"   Min range: {self.min_range}m")
+		
+		self.get_logger().info(f"Feature Status:")
+		self.get_logger().info(f"   Voxel mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
+		self.get_logger().info(f"   Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}")
+		self.get_logger().info(f"   Voxel helper: {'READY' if hasattr(self, 'voxel_helper') and self.voxel_helper is not None else 'NOT READY'}")
+		
+		self.get_logger().info(f"Topics:")
+		self.get_logger().info(f"   Depth: {self.depth_topic}")
+		self.get_logger().info(f"   Pose: {self.pose_topic}")
+		self.get_logger().info(f"   Semantic hotspots: {self.semantic_hotspots_topic}")
+		
+		self.get_logger().info("=" * 60)
 
 		# Timer for inactivity detection (non-intrusive)
 

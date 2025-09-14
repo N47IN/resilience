@@ -32,6 +32,11 @@ class NarrationDisplayNode(Node):
     def __init__(self):
         super().__init__('narration_display_node')
         
+        # Professional startup message
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("NARRATION DISPLAY SYSTEM INITIALIZING")
+        self.get_logger().info("=" * 60)
+        
         # Initialize CV bridge
         self.bridge = CvBridge()
         
@@ -77,16 +82,19 @@ class NarrationDisplayNode(Node):
             10
         )
         
-        self.get_logger().info("Narration Display Node initialized")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("NARRATION DISPLAY SYSTEM READY")
+        self.get_logger().info("=" * 60)
+        
         self.get_logger().info(f"Output directory: {self.output_dir}")
-        self.get_logger().info("Subscribing to /narration_image and /narration_text")
-        self.get_logger().info("Publishing to /vlm_answer")
+        self.get_logger().info(f"Subscribing to: /narration_image, /narration_text")
+        self.get_logger().info(f"Publishing to: /vlm_answer")
         self.get_logger().info(f"Sync tolerance: {self.sync_tolerance}s")
         
         if self.api_key:
             self.get_logger().info("VLM API key found - VLM integration enabled")
         else:
-            self.get_logger().warning("No OPENAI_API_KEY found - VLM integration disabled")
+            self.get_logger().warn("No OPENAI_API_KEY found - VLM integration disabled")
 
     def image_callback(self, msg):
         """Handle incoming image messages"""
@@ -101,7 +109,7 @@ class NarrationDisplayNode(Node):
                 self.latest_image = cv_image.copy()
                 self.latest_image_time = msg_timestamp
             
-            self.get_logger().info(f"Received image at {msg_timestamp:.3f}")
+            self.get_logger().debug(f"Received image at {msg_timestamp:.3f}")
             
             # Try to save if we have matching text
             self.try_save_synchronized()
@@ -119,7 +127,7 @@ class NarrationDisplayNode(Node):
                 self.latest_text = msg.data
                 self.latest_text_time = msg_timestamp
             
-            self.get_logger().info(f"Received text: '{msg.data}' at {msg_timestamp:.3f}")
+            self.get_logger().debug(f"Received text: '{msg.data}' at {msg_timestamp:.3f}")
             
             # Try to save if we have matching image
             self.try_save_synchronized()
@@ -152,7 +160,7 @@ class NarrationDisplayNode(Node):
                 
                 self.get_logger().info(f"Saved synchronized image+text (time diff: {time_diff:.3f}s)")
             else:
-                self.get_logger().info(f"Image and text not synchronized (time diff: {time_diff:.3f}s)")
+                self.get_logger().debug(f"Image and text not synchronized (time diff: {time_diff:.3f}s)")
 
     def encode_image_for_api(self, cv_image, max_dim: int = 768) -> str:
         """Convert OpenCV image to base64 for API"""
@@ -186,7 +194,7 @@ class NarrationDisplayNode(Node):
             base_prompt = "I am a drone, after 1s"
             full_prompt = f"{base_prompt} {narration_text} What object do you think in this scene is the cause, give one singular word as description"
             
-            self.get_logger().info(f"Querying VLM with prompt: {full_prompt}")
+            self.get_logger().debug(f"Querying VLM with prompt: {full_prompt}")
             
             response = client.chat.completions.create(
                 model=self.model,

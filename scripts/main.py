@@ -41,6 +41,11 @@ class ResilienceNode(Node):
     def __init__(self):
         super().__init__('resilience_node')
 
+        # Professional startup message
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("RESILIENCE SYSTEM INITIALIZING")
+        self.get_logger().info("=" * 60)
+
         # Track recent VLM answers for smart semantic processing
         self.recent_vlm_answers = {}  # vlm_answer -> timestamp
         
@@ -116,11 +121,11 @@ class ResilienceNode(Node):
             # Extract path configuration
             self.path_config = config.get('path_mode', {})
             
-            print(f"Loaded topic configuration from: {config_path}")
-            print(f"Path mode: {self.path_config.get('mode', 'json_file')}")
+            self.get_logger().info(f"Topic configuration loaded from: {config_path}")
+            self.get_logger().info(f"Path mode: {self.path_config.get('mode', 'json_file')}")
             
         except Exception as e:
-            print(f"Error loading topic configuration: {e}")
+            self.get_logger().warn(f"Using default topic configuration: {e}")
             # Fallback to default topics
             self.rgb_topic = '/robot_1/sensors/front_stereo/right/image'
             self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
@@ -137,7 +142,7 @@ class ResilienceNode(Node):
             
             # Default path configuration
             self.path_config = {'mode': 'json_file', 'global_path_topic': '/global_path'}
-            print("Using default topic configuration")
+            self.get_logger().info("Using default topic configuration")
 
         self.init_components()
         
@@ -219,7 +224,7 @@ class ResilienceNode(Node):
 
     def wait_for_path_ready(self):
         """Wait for path to be ready before starting main functionality."""
-        print("Waiting for path to be ready...")
+        self.get_logger().info("Waiting for path to be ready...")
         
         # Get timeout from config
         timeout_seconds = 30.0  # Default timeout
@@ -228,39 +233,41 @@ class ResilienceNode(Node):
         
         # For external planner mode, check periodically instead of blocking
         if self.path_manager.get_mode() == 'external_planner':
-            print(f"External planner mode: Waiting up to {timeout_seconds}s for path...")
+            self.get_logger().info(f"External planner mode: Waiting up to {timeout_seconds}s for path...")
             start_time = time.time()
             
             while not self.path_manager.is_ready() and (time.time() - start_time) < timeout_seconds:
                 time.sleep(0.5)  # Check every 0.5 seconds
-                print(f"Still waiting for external path... ({time.time() - start_time:.1f}s elapsed)")
+                elapsed = time.time() - start_time
+                if elapsed % 5.0 < 0.5:  # Print every 5 seconds
+                    self.get_logger().info(f"Still waiting for external path... ({elapsed:.1f}s elapsed)")
             
             if self.path_manager.is_ready():
-                print("✓ External path received - starting main functionality")
+                self.get_logger().info("External path received - starting main functionality")
                 self.path_ready = True
                 
                 # Update narration manager with path points
                 nominal_points = self.path_manager.get_nominal_points_as_numpy()
                 if len(nominal_points) > 0:
                     self.narration_manager.update_intended_trajectory(nominal_points)
-                    print("✓ Updated narration manager with external path points")
+                    self.get_logger().info("Updated narration manager with external path points")
             else:
-                print("✗ External path not received within timeout")
+                self.get_logger().warn("External path not received within timeout")
                 self.path_ready = False
                 self.disable_drift_detection = True
         else:
             # For JSON mode, use the original blocking wait
             if self.path_manager.wait_for_path(timeout_seconds):
-                print("✓ Path ready - starting main functionality")
+                self.get_logger().info("Path ready - starting main functionality")
                 self.path_ready = True
                 
                 # Update narration manager with path points if not already set
                 nominal_points = self.path_manager.get_nominal_points_as_numpy()
                 if len(nominal_points) > 0 and len(self.narration_manager.intended_points) == 0:
                     self.narration_manager.update_intended_trajectory(nominal_points)
-                    print("✓ Updated narration manager with path points")
+                    self.get_logger().info("Updated narration manager with path points")
             else:
-                print("✗ Path not ready - some functionality may be limited")
+                self.get_logger().warn("Path not ready - some functionality may be limited")
                 self.path_ready = False
                 self.disable_drift_detection = True
 
@@ -332,59 +339,58 @@ class ResilienceNode(Node):
 
     def print_initialization_status(self):
         """Print initialization status."""
-        print(f"Resilience Node initialized")
-        print(f"Path mode: {self.path_manager.get_mode()}")
-        print(f"Path topic: {self.path_manager.get_path_topic()}")
-        print(f"Path ready: {'YES' if hasattr(self, 'path_ready') and self.path_ready else 'NO'}")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("RESILIENCE SYSTEM READY")
+        self.get_logger().info("=" * 60)
+        
+        self.get_logger().info(f"Path Configuration:")
+        self.get_logger().info(f"   Mode: {self.path_manager.get_mode()}")
+        self.get_logger().info(f"   Topic: {self.path_manager.get_path_topic()}")
+        self.get_logger().info(f"   Status: {'READY' if hasattr(self, 'path_ready') and self.path_ready else 'NOT READY'}")
+        
         if hasattr(self, 'disable_drift_detection'):
-            print(f"Drift detection: {'DISABLED' if self.disable_drift_detection else 'ENABLED'}")
-        print(f"Soft threshold: {self.path_manager.get_thresholds()[0]} ({self.path_manager.get_threshold_source()})")
-        print(f"Hard threshold: {self.path_manager.get_thresholds()[1]} ({self.path_manager.get_threshold_source()})")
-        print(f"NARadio processing: {'ENABLED' if self.naradio_processor.is_ready() else 'DISABLED'}")
-        print(f"Voxel Mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
-        print(f"Direct Mapping: {'ENABLED' if self.direct_mapping else 'DISABLED'}")
+            self.get_logger().info(f"Drift Detection: {'ENABLED' if not self.disable_drift_detection else 'DISABLED'}")
+        
+        soft_thresh, hard_thresh = self.path_manager.get_thresholds()
+        self.get_logger().info(f"Thresholds: Soft={soft_thresh:.3f}m, Hard={hard_thresh:.3f}m")
+        
+        self.get_logger().info(f"NARadio Processing: {'READY' if self.naradio_processor.is_ready() else 'NOT READY'}")
+        self.get_logger().info(f"Voxel Mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
+        self.get_logger().info(f"Direct Mapping: {'ENABLED' if self.direct_mapping else 'DISABLED'}")
         
         vlm_enabled = (self.enable_combined_segmentation and 
                       hasattr(self, 'naradio_processor') and 
                       self.naradio_processor.is_segmentation_ready())
-        print(f"VLM Similarity Processing: {'ENABLED' if vlm_enabled else 'DISABLED'}")
+        self.get_logger().info(f"VLM Similarity: {'ENABLED' if vlm_enabled else 'DISABLED'}")
         
         if vlm_enabled:
             all_objects = self.naradio_processor.get_all_objects()
-        print(f"  - Total objects: {len(all_objects)}")
-        print(f"RGB buffer size: {self.max_rgb_buffer}")
+            self.get_logger().info(f"   Objects loaded: {len(all_objects)}")
+            
         config = self.naradio_processor.segmentation_config
         prefer_enhanced = config['segmentation'].get('prefer_enhanced_embeddings', True)
+        self.get_logger().info(f"Embedding Method: {'ENHANCED' if prefer_enhanced else 'TEXT'}")
         
-        print(f"Embedding method: {'ENHANCED' if prefer_enhanced else 'TEXT'}")
+        self.get_logger().info("=" * 60)
 
 
     def init_components(self):
         """Initialize resilience components."""
+        self.get_logger().info("Initializing system components...")
+        
         # Initialize path manager with unified interface
         self.path_manager = PathManager(self, self.path_config)
-        
-        # Print discretization status
-        print("=" * 60)
-        print("PATH MANAGER INITIALIZATION STATUS")
-        print("=" * 60)
-        print(f"Path mode: {self.path_manager.get_mode()}")
-        print(f"Sampling distance: {self.path_manager.get_sampling_distance():.3f}m")
-        print(f"Lookback window size: {self.path_manager.get_lookback_window_size()} points")
+        self.get_logger().info("Path Manager initialized")
         
         # Get thresholds from path manager
         soft_threshold, hard_threshold = self.path_manager.get_thresholds()
-        print(f"Soft threshold: {soft_threshold:.3f}m")
-        print(f"Hard threshold: {hard_threshold:.3f}m")
         
         # Wait for path to be ready and print discretization results
         if self.path_manager.wait_for_path(timeout_seconds=10.0):
             discretized_points = self.path_manager.get_discretized_nominal_points()
-            print(f"✓ Path loaded and discretized: {len(discretized_points)} points")
-            print(f"✓ Discretization complete with {self.path_manager.get_sampling_distance():.3f}m sampling")
+            self.get_logger().info(f"Path loaded: {len(discretized_points)} points, {self.path_manager.get_sampling_distance():.3f}m sampling")
         else:
-            print("⚠ Path not ready within timeout - will retry during operation")
-        print("=" * 60)
+            self.get_logger().warn("Path not ready within timeout - will retry during operation")
         
         try:
             self.naradio_processor = NARadioProcessor(
@@ -397,15 +403,15 @@ class ResilienceNode(Node):
             )
             
             if not self.naradio_processor.is_ready():
-                print("Warning: NARadio initialization failed, will retry in processing loop")
+                self.get_logger().warn("NARadio initialization failed, will retry in processing loop")
             else:
-                print("NARadio processor initialized")
+                self.get_logger().info("NARadio processor initialized")
                 
             if self.enable_combined_segmentation:
                 if self.naradio_processor.is_segmentation_ready():
-                    print("Combined segmentation initialized")
+                    self.get_logger().info("Combined segmentation initialized")
                 else:
-                    print("Warning: Combined segmentation initialization failed")
+                    self.get_logger().warn("Combined segmentation initialization failed")
             
             # Read voxel mapping parameters from main config (non-blocking)
             self.enable_voxel_mapping = False  # Default value
@@ -416,14 +422,14 @@ class ResilienceNode(Node):
                     self.enable_voxel_mapping = self.naradio_processor.segmentation_config.get('enable_voxel_mapping', False)
                     self.direct_mapping = self.naradio_processor.segmentation_config.get('direct_mapping', False)
                 except Exception as e:
-                    print(f"Warning: Could not read voxel mapping parameters from config: {e}")
+                    self.get_logger().warn(f"Could not read voxel mapping parameters from config: {e}")
                     self.enable_voxel_mapping = False
                     self.direct_mapping = False
             else:
-                print("Warning: NARadio processor not ready, using default voxel mapping: False, direct mapping: False")
+                self.get_logger().warn("NARadio processor not ready, using default voxel mapping: False, direct mapping: False")
                 
         except Exception as e:
-            print(f"Error initializing NARadio processor: {e}")
+            self.get_logger().error(f"Error initializing NARadio processor: {e}")
             import traceback
             traceback.print_exc()
             self.naradio_processor = NARadioProcessor(
@@ -444,31 +450,23 @@ class ResilienceNode(Node):
             lookback_window_size=lookback_window_size,
             sampling_distance=sampling_distance
         )
-        
-        print("=" * 60)
-        print("NARRATION MANAGER INITIALIZATION STATUS")
-        print("=" * 60)
-        print(f"Soft threshold: {soft_threshold:.3f}m")
-        print(f"Hard threshold: {hard_threshold:.3f}m")
-        print(f"Lookback window: {lookback_window_size} points")
-        print(f"Sampling distance: {sampling_distance:.3f}m")
-        print("=" * 60)
+        self.get_logger().info("Narration Manager initialized")
         
         # Ensure voxel mapping parameters are always set (final fallback)
         if not hasattr(self, 'enable_voxel_mapping'):
             self.enable_voxel_mapping = False
-            print("Voxel mapping parameter not set, using default: False")
+            self.get_logger().info("Voxel mapping parameter not set, using default: False")
         if not hasattr(self, 'direct_mapping'):
             self.direct_mapping = False
-            print("Direct mapping parameter not set, using default: False")
+            self.get_logger().info("Direct mapping parameter not set, using default: False")
         
         # Set nominal trajectory points if available (use discretized data)
         nominal_points = self.path_manager.get_discretized_nominal_as_numpy()
         if len(nominal_points) > 0:
             self.narration_manager.set_intended_trajectory(nominal_points)
-            print(f"✓ Narration manager initialized with {len(nominal_points)} discretized points")
+            self.get_logger().info(f"Narration manager initialized with {len(nominal_points)} discretized points")
         else:
-            print("⚠ Warning: No discretized nominal points available for narration manager")
+            self.get_logger().warn("No discretized nominal points available for narration manager")
     
     def init_risk_buffer_manager(self):
         """Initialize risk buffer manager."""
@@ -617,8 +615,7 @@ class ResilienceNode(Node):
             self.current_breach_active = True
             self.narration_manager.reset_narration_state()
             
-            print("BREACH STARTED")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
+            self.get_logger().warn(f"BREACH STARTED - Drift: {drift:.3f}m (threshold: {self.path_manager.get_thresholds()[0]:.3f}m)")
             
             # Start new buffer when breach begins
             if self.risk_buffer_manager:
@@ -630,8 +627,7 @@ class ResilienceNode(Node):
             self.last_breach_state = False
             self.current_breach_active = False
             
-            print("BREACH ENDED")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
+            self.get_logger().info(f"BREACH ENDED - Drift: {drift:.3f}m (threshold: {self.path_manager.get_thresholds()[0]:.3f}m)")
             
             # Freeze buffers when breach ends
             if self.risk_buffer_manager:
@@ -644,8 +640,7 @@ class ResilienceNode(Node):
             self.current_breach_active = True
             self.narration_manager.reset_narration_state()
             
-            print("BREACH DETECTED (already in progress)")
-            print(f"Time: {pose_time:.2f}, Drift: {drift:.3f} (threshold: {self.path_manager.get_thresholds()[0]:.3f})")
+            self.get_logger().warn(f"BREACH DETECTED - Drift: {drift:.3f}m (threshold: {self.path_manager.get_thresholds()[0]:.3f}m)")
             
             # Start new buffer when breach is detected
             if self.risk_buffer_manager:
@@ -1027,7 +1022,7 @@ class ResilienceNode(Node):
             if not vlm_answer or "VLM Error" in vlm_answer or "VLM not available" in vlm_answer:
                 return
             
-            print(f"VLM ANSWER RECEIVED: '{vlm_answer}'")
+            self.get_logger().info(f"VLM ANSWER RECEIVED: '{vlm_answer}'")
             
             # Track this VLM answer as recent for smart semantic processing
             self.recent_vlm_answers[vlm_answer] = time.time()
@@ -1037,7 +1032,7 @@ class ResilienceNode(Node):
             if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
                 success = self.naradio_processor.add_vlm_object(vlm_answer)
                 if success:
-                    print(f"VLM object '{vlm_answer}' added for monitoring")
+                    self.get_logger().info(f"VLM object '{vlm_answer}' added for monitoring")
                     
                     if hasattr(self, 'segmentation_legend_pub'):
                         try:
@@ -1048,10 +1043,10 @@ class ResilienceNode(Node):
                             
                             self.segmentation_legend_pub.publish(String(data=legend_text))
                         except Exception as e:
-                            print(f"Error updating VLM objects legend: {e}")
+                            self.get_logger().warn(f"Error updating VLM objects legend: {e}")
                     
                 else:
-                    print(f"Failed to add VLM object '{vlm_answer}' to object list")
+                    self.get_logger().warn(f"Failed to add VLM object '{vlm_answer}' to object list")
             
             self.associate_vlm_answer_with_buffer_reliable(vlm_answer)
             
