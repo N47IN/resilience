@@ -19,6 +19,22 @@ The Resilience system consists of three core nodes that work together to provide
 - **Semantic Depth OctoMap Node** - 3D voxel mapping with semantic labels and disturbance field analysis
 - **Narration Display Node** - VLM integration for cause analysis and image processing
 
+## System Architecture
+
+```mermaid
+graph TD
+    A[Sensor Data] --> B[Main Resilience Node]
+    C[Global Path] --> B
+    B --> D[Narration Display Node]
+    B --> E[Semantic OctoMap Node]
+    D --> F[VLM Answer]
+    F --> B
+    E --> G[Disturbance Costmaps]
+    E --> H[Semantic Voxel Maps]
+```
+
+The system provides a complete pipeline from sensor data to actionable disturbance costmaps, enabling robust path planning and resilience monitoring in dynamic environments.
+
 ## Launch Files
 
 ### Primary Launch File
@@ -257,18 +273,4 @@ ros2 launch resilience resilience.launch.py \
 - **Max range**: Limit to 1.5-2.0m for indoor environments
 - **Sync buffer**: Increase `sync_buffer_seconds` if experiencing timestamp mismatches
 
-## System Architecture
 
-```mermaid
-graph TD
-    A[Sensor Data] --> B[Main Resilience Node]
-    C[Global Path] --> B
-    B --> D[Narration Display Node]
-    B --> E[Semantic OctoMap Node]
-    D --> F[VLM Answer]
-    F --> B
-    E --> G[Disturbance Costmaps]
-    E --> H[Semantic Voxel Maps]
-```
-
-The system provides a complete pipeline from sensor data to actionable disturbance costmaps, enabling robust path planning and resilience monitoring in dynamic environments.
