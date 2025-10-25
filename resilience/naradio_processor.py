@@ -1242,76 +1242,237 @@ class NARadioProcessor:
     @torch.inference_mode()
     def compute_enhanced_similarity_map_optimized(self, rgb_image: np.ndarray, vlm_answer: str, 
                                                  feat_map_np: Optional[np.ndarray] = None,
-                                                 chunk_size: int = 4000) -> Optional[np.ndarray]:
-        """Compute similarity map using enhanced embedding only."""
+                                                 use_softmax: bool = True, chunk_size: int = 4000) -> Optional[np.ndarray]:
+        """
+        ENHANCED: Compute similarity map using enhanced embedding instead of text-based encoding.
+        This provides more accurate risk object detection based on actual visual patterns.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to get enhanced embedding for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            use_softmax: Whether to apply softmax (usually False for enhanced embeddings)
+            chunk_size: Chunk size for memory efficiency
+            
+        Returns:
+            np.ndarray: Enhanced similarity map (H, W) for risk detection, or None if failed
+        """
         try:
+            # Check if we have enhanced embedding for this VLM answer
             if not self.has_enhanced_embedding(vlm_answer):
-                return None
+                print(f"No enhanced embedding available for '{vlm_answer}', falling back to text-based")
+                return self.compute_vlm_similarity_map_optimized(rgb_image, vlm_answer, feat_map_np, use_softmax, chunk_size)
             
             enhanced_embedding = self.get_enhanced_embedding(vlm_answer)
             if enhanced_embedding is None:
                 return None
             
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            # Convert enhanced embedding to tensor
             enhanced_embedding_tensor = torch.from_numpy(enhanced_embedding).to(device).float()
             if len(enhanced_embedding_tensor.shape) == 1:
-                enhanced_embedding_tensor = enhanced_embedding_tensor.unsqueeze(0)
+                enhanced_embedding_tensor = enhanced_embedding_tensor.unsqueeze(0)  # Add batch dimension
             
-            # Reuse features if provided
+            # OPTIMIZATION: Reuse features if provided, otherwise compute them
             if feat_map_np is not None:
-                feat_map_tensor = torch.from_numpy(feat_map_np).to(device) if isinstance(feat_map_np, np.ndarray) else feat_map_np
+                # Convert to tensor
+                if isinstance(feat_map_np, np.ndarray):
+                    feat_map_tensor = torch.from_numpy(feat_map_np).to(device)
+                else:
+                    feat_map_tensor = feat_map_np
             else:
+                # Set model resolution
                 resolution = (self.radio_input_resolution, self.radio_input_resolution)
-                tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1).to(device).float() / 255.0
+                if hasattr(self.radio_encoder, "input_resolution"):
+                    self.radio_encoder.input_resolution = resolution
+                
+                # Convert image to tensor
+                tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1)
+                tensor_image = tensor_image.to(device).float() / 255.0
                 tensor_image = torch.nn.functional.interpolate(
                     tensor_image.unsqueeze(0), resolution, mode="bilinear", antialias=True)
+                
+                # Extract features
                 feat_map_tensor = self.radio_encoder.encode_image_to_feat_map(tensor_image)
+                
                 del tensor_image
             
-            # Align features and compute similarity
+            # Align features with language (this ensures compatibility with enhanced embeddings)
             feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
+            
+            # Resize to final resolution
+            resolution = (self.radio_input_resolution, self.radio_input_resolution)
             feat_map_aligned = torch.nn.functional.interpolate(
-                feat_map_aligned, (self.radio_input_resolution, self.radio_input_resolution), mode="bilinear", antialias=True)
+                feat_map_aligned, resolution, mode="bilinear", antialias=True)
             feat_map_aligned = feat_map_aligned.squeeze(0).permute(1, 2, 0)
             
+            # Compute similarity with enhanced embedding
             H, W, C = feat_map_aligned.shape
-            feat_map_flat = feat_map_aligned.reshape(-1, C)
+            feat_map_flat = feat_map_aligned.reshape(-1, C)  # H*W x C
+            
             del feat_map_aligned
             
-            # Compute cosine similarity in chunks
+            # Compute cosine similarity between enhanced embedding and spatial features
             num_chunks = max(1, int(np.ceil(feat_map_flat.shape[0] / chunk_size)))
             similarity_chunks = []
             
             for c in range(num_chunks):
                 chunk_features = feat_map_flat[c*chunk_size:(c+1)*chunk_size]
+                
+                # Compute cosine similarity: enhanced_embedding (1xC) vs chunk_features (NxC)
                 enhanced_norm = enhanced_embedding_tensor / (torch.norm(enhanced_embedding_tensor, dim=-1, keepdim=True) + 1e-8)
                 chunk_norm = chunk_features / (torch.norm(chunk_features, dim=-1, keepdim=True) + 1e-8)
-                chunk_similarity = torch.mm(enhanced_norm, chunk_norm.t()).squeeze(0)
-                similarity_chunks.append(chunk_similarity)
+                
+                # Cosine similarity: (1xC) @ (NxC).T = (1xN)
+                chunk_similarity = torch.mm(enhanced_norm, chunk_norm.t())  # (1, N)
+                similarity_chunks.append(chunk_similarity.squeeze(0))  # (N,)
+                
                 del chunk_features, chunk_norm
             
-            similarity_flat = torch.cat(similarity_chunks, dim=0)
-            enhanced_similarity_map = similarity_flat.reshape(H, W)
+            # Concatenate all similarity chunks
+            similarity_flat = torch.cat(similarity_chunks, dim=0)  # (H*W,)
+            enhanced_similarity_map = similarity_flat.reshape(H, W)  # (H, W)
             
-            # Normalize to [0,1] range
-            enhanced_similarity_map = self.norm_img_01(enhanced_similarity_map.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+            # Apply same normalization as original VLM similarity
+            if not use_softmax:
+                enhanced_similarity_map = self.norm_img_01(enhanced_similarity_map.unsqueeze(0).unsqueeze(0))
+                enhanced_similarity_map = enhanced_similarity_map.squeeze(0).squeeze(0)
+            else:
+                # For softmax consistency with original, normalize to [0,1] range
+                enhanced_similarity_map = self.norm_img_01(enhanced_similarity_map.unsqueeze(0).unsqueeze(0))
+                enhanced_similarity_map = enhanced_similarity_map.squeeze(0).squeeze(0)
             
-            return enhanced_similarity_map.cpu().numpy()
+            # Memory cleanup if needed
+            if torch.cuda.is_available() and torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.85:
+                torch.cuda.empty_cache()
+            
+            # Return as numpy array
+            result = enhanced_similarity_map.cpu().numpy()
+            return result
             
         except Exception as e:
+            print(f"Error computing enhanced similarity map for '{vlm_answer}': {e}")
             return None
 
     @torch.inference_mode()
     def compute_vlm_similarity_map_optimized(self, rgb_image: np.ndarray, vlm_answer: str, 
                                             feat_map_np: Optional[np.ndarray] = None,
                                             use_softmax: bool = True, chunk_size: int = 4000) -> Optional[np.ndarray]:
-        """Legacy method - redirects to enhanced similarity only."""
-        return self.compute_enhanced_similarity_map_optimized(rgb_image, vlm_answer, feat_map_np, chunk_size)
+        """
+        OPTIMIZED: Compute similarity map for a specific VLM answer, reusing features if provided.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to compute similarity for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            use_softmax: Whether to apply softmax
+            chunk_size: Chunk size for memory efficiency (increased default)
+            
+        Returns:
+            np.ndarray: Similarity map (H, W) for the VLM answer, or None if failed
+        """
+        try:
+            # Check if VLM answer is in our objects
+            all_objects = self.get_all_objects()
+            if vlm_answer not in all_objects:
+                return None
+            
+            vlm_index = all_objects.index(vlm_answer)
+            
+            # Get all features (base + dynamic objects)
+            all_features = self.get_all_features()
+            
+            if all_features is None or len(all_objects) == 0:
+                return None
+            
+            N = len(all_objects)
+            if use_softmax and N == 1:
+                return None
+            
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            # OPTIMIZATION: Reuse features if provided, otherwise compute them
+            if feat_map_np is not None:
+                # Convert to tensor
+                if isinstance(feat_map_np, np.ndarray):
+                    feat_map_tensor = torch.from_numpy(feat_map_np).to(device)
+                else:
+                    feat_map_tensor = feat_map_np
+            else:
+                # Set model resolution
+                resolution = (self.radio_input_resolution, self.radio_input_resolution)
+                if hasattr(self.radio_encoder, "input_resolution"):
+                    self.radio_encoder.input_resolution = resolution
+                
+                # Convert image to tensor
+                tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1)
+                tensor_image = tensor_image.to(device).float() / 255.0
+                tensor_image = torch.nn.functional.interpolate(
+                    tensor_image.unsqueeze(0), resolution, mode="bilinear", antialias=True)
+                
+                # Extract features
+                feat_map_tensor = self.radio_encoder.encode_image_to_feat_map(tensor_image)
+                
+                # SPEED OPTIMIZATION: Reduce tensor cleanup overhead
+                del tensor_image
+            
+            # Align features with language
+            feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
+            
+            # Resize to final resolution
+            resolution = (self.radio_input_resolution, self.radio_input_resolution)
+            feat_map_aligned = torch.nn.functional.interpolate(
+                feat_map_aligned, resolution, mode="bilinear", antialias=True)
+            feat_map_aligned = feat_map_aligned.squeeze(0).permute(1, 2, 0)
+            
+            # Compute similarity with optimized chunking
+            H, W, C = feat_map_aligned.shape
+            feat_map_flat = feat_map_aligned.reshape(-1, C)  # H*W x C
+            
+            # SPEED OPTIMIZATION: Reduce intermediate memory management
+            del feat_map_aligned
+            
+            # SPEED OPTIMIZATION: Use larger chunks and stay on GPU longer
+            num_chunks = max(1, int(np.ceil(feat_map_flat.shape[0] / chunk_size)))
+            cos_sim_chunks = []
+            
+            for c in range(num_chunks):
+                chunk_features = feat_map_flat[c*chunk_size:(c+1)*chunk_size]
+                
+                # SPEED OPTIMIZATION: Keep computation on GPU, reduce transfers
+                chunk_sim = self.compute_cos_sim(all_features, chunk_features, softmax=use_softmax)
+                cos_sim_chunks.append(chunk_sim)
+                
+                del chunk_features
+            
+            # SPEED OPTIMIZATION: Concatenate on GPU first, then extract only what we need
+            cos_sim = torch.cat(cos_sim_chunks, dim=0)  # H*W x N
+            cos_sim = cos_sim.reshape(H, W, N)   # H x W x N
+            
+            # Apply normalization if not using softmax
+            if not use_softmax:
+                cos_sim = self.norm_img_01(cos_sim.permute(2, 0, 1).unsqueeze(0))  # 1 x N x H x W
+                cos_sim = cos_sim.squeeze(0).permute(1, 2, 0)  # H x W x N
+            
+            # Extract similarity map for the VLM answer
+            vlm_similarity_map = cos_sim[:, :, vlm_index]  # H x W
+            
+            # SPEED OPTIMIZATION: Reduce cleanup frequency - only when necessary
+            if torch.cuda.is_available() and torch.cuda.memory_allocated() > torch.cuda.get_device_properties(0).total_memory * 0.85:
+                torch.cuda.empty_cache()
+            
+            # Return as numpy array
+            result = vlm_similarity_map.cpu().numpy()
+            return result
+            
+        except Exception as e:
+            return None
 
     @torch.inference_mode()
     def compute_vlm_similarity_map(self, rgb_image: np.ndarray, vlm_answer: str, use_softmax: bool = True, chunk_size: int = 2000) -> Optional[np.ndarray]:
-        """Legacy method - redirects to enhanced similarity only."""
-        return self.compute_enhanced_similarity_map_optimized(rgb_image, vlm_answer, None, chunk_size)
+        """Legacy method - redirects to optimized version without pre-computed features."""
+        return self.compute_vlm_similarity_map_optimized(rgb_image, vlm_answer, None, use_softmax, chunk_size)
 
     def apply_colormap(self, image: np.ndarray, cmap_name='viridis') -> np.ndarray:
         """Apply a colormap to a grayscale image and return an RGB uint8 image."""
@@ -1327,57 +1488,117 @@ class NARadioProcessor:
 
     def process_enhanced_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
                                                            feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
-        """Process similarity map using enhanced embedding only."""
+        """
+        ENHANCED: Process similarity map using enhanced embedding.
+        Uses EXACT same function as VLM text, just with enhanced embeddings as input.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to get enhanced embedding for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            
+        Returns:
+            dict: Contains similarity_map, colored_similarity, metadata, and processing_info
+        """
+        if not self.segmentation_ready or not self.naradio_ready:
+            return None
+        
+        # Simply call the VLM text function - it will handle everything identically
+        # The only difference is that enhanced embeddings are already stored in the processor
+        return self.process_vlm_similarity_visualization_optimized(
+            rgb_image, vlm_answer, feat_map_np)
+
+    def process_vlm_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
+                                                     feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
+        """
+        OPTIMIZED: Process VLM similarity map and create colored visualization, reusing features if provided.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to compute similarity for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            
+        Returns:
+            dict: Contains similarity_map, colored_similarity, metadata, and processing_info
+        """
         if not self.segmentation_ready or not self.naradio_ready:
             return None
         
         try:
             start_time = time.time()
             
-            similarity_map = self.compute_enhanced_similarity_map_optimized(rgb_image, vlm_answer, feat_map_np)
+            # OPTIMIZATION: Reuse features if provided, use larger chunk size for speed
+            similarity_map = self.compute_vlm_similarity_map_optimized(
+                rgb_image, vlm_answer, feat_map_np, use_softmax=True, chunk_size=4000)
+            
             if similarity_map is None:
                 return None
             
-            # Resize to original image dimensions
+            # Get original image dimensions
             original_height, original_width = rgb_image.shape[:2]
-            similarity_resized = cv2.resize(similarity_map, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
             
-            # Apply colormap
+            # Resize similarity map to original image dimensions
+            similarity_resized = cv2.resize(similarity_map, (original_width, original_height), 
+                                          interpolation=cv2.INTER_LINEAR)
+            
+            # SPEED OPTIMIZATION: Use faster colormap application
             colored_similarity = self.apply_colormap(similarity_resized, cmap_name='viridis')
             
+            # SPEED OPTIMIZATION: Minimal metadata creation
             processing_time = time.time() - start_time
             
-            return {
-                'similarity_map': similarity_resized,
-                'colored_similarity': colored_similarity,
+            result = {
+                'similarity_map': similarity_resized,  # Resized to original image size
+                'colored_similarity': colored_similarity,  # RGB colored version
                 'metadata': {
                     'vlm_answer': vlm_answer,
                     'processing_time': processing_time,
-                    'method': 'enhanced_embedding'
+                    'reused_features': feat_map_np is not None
                 },
-                'processing_info': {'processing_time': processing_time}
+                'processing_info': {
+                    'processing_time': processing_time
+                }
             }
+            
+            return result
             
         except Exception as e:
             return None
 
-    def process_vlm_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
-                                                     feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
-        """Legacy method - redirects to enhanced similarity only."""
-        return self.process_similarity_visualization(rgb_image, vlm_answer, feat_map_np)
-
     def get_similarity_method_info(self, vlm_answer: str) -> Dict[str, any]:
-        """Get information about similarity method (enhanced only)."""
+        """
+        Get information about which similarity method would be used for a VLM answer.
+        
+        Args:
+            vlm_answer: The VLM answer to check
+            
+        Returns:
+            dict: Information about similarity method selection
+        """
+        prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
         has_enhanced = self.has_enhanced_embedding(vlm_answer)
+        
+        if prefer_enhanced and has_enhanced:
+            method = "enhanced_embedding"
+            reason = "config prefers enhanced and enhanced embedding available"
+        elif prefer_enhanced and not has_enhanced:
+            method = "vlm_text"
+            reason = "config prefers enhanced but no enhanced embedding available"
+        else:
+            method = "vlm_text"
+            reason = "config prefers VLM text embedding"
+        
         return {
             'vlm_answer': vlm_answer,
-            'method': "enhanced_embedding" if has_enhanced else "none",
+            'method': method,
+            'reason': reason,
+            'config_prefer_enhanced': prefer_enhanced,
             'has_enhanced_embedding': has_enhanced
         }
 
     def process_vlm_similarity_visualization(self, rgb_image: np.ndarray, vlm_answer: str) -> Optional[Dict]:
-        """Legacy method - redirects to enhanced similarity only."""
-        return self.process_similarity_visualization(rgb_image, vlm_answer, None)
+        """Legacy method - redirects to optimized version without pre-computed features."""
+        return self.process_vlm_similarity_visualization_optimized(rgb_image, vlm_answer, None)
 
     def is_segmentation_ready(self) -> bool:
         """Check if combined segmentation is ready."""
@@ -1430,9 +1651,9 @@ class NARadioProcessor:
             
             H, W, C = feat_map_aligned.shape
             
-            # Get or compute similarity map using enhanced embeddings
+            # Get or compute similarity map
             if similarity_map is None:
-                similarity_map = self.compute_enhanced_similarity_map_optimized(rgb_image, vlm_answer)
+                similarity_map = self.compute_vlm_similarity_map_optimized(rgb_image, vlm_answer)
                 if similarity_map is None:
                     print(f"Failed to compute similarity map for enhanced embedding")
                     return None
@@ -1522,8 +1743,8 @@ class NARadioProcessor:
             
             print(f"Processing narration similarity and enhanced embedding for VLM '{vlm_answer}' in buffer {buffer_id}")
             
-            # Process similarity for the narration image using enhanced embeddings
-            similarity_result = self.process_similarity_visualization(
+            # Process VLM similarity for the narration image
+            similarity_result = self.process_vlm_similarity_visualization_optimized(
                 narration_image, vlm_answer, feat_map_np=None)
             
             if similarity_result is None:
@@ -1656,10 +1877,52 @@ class NARadioProcessor:
             import traceback
             traceback.print_exc() 
 
-    def process_similarity_visualization(self, rgb_image: np.ndarray, vlm_answer: str,
-                                        feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
-        """Process similarity visualization using enhanced embeddings only."""
-        return self.process_enhanced_similarity_visualization_optimized(rgb_image, vlm_answer, feat_map_np)
+    def process_adaptive_similarity_visualization_optimized(self, rgb_image: np.ndarray, vlm_answer: str,
+                                                           feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict]:
+        """
+        ADAPTIVE: Choose between enhanced embedding and VLM text similarity based on config and availability.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answer: The VLM answer to compute similarity for
+            feat_map_np: Pre-computed feature map (optional, avoids redundant computation)
+            
+        Returns:
+            dict: Contains similarity_map, colored_similarity, metadata, and processing_info
+        """
+        if not self.segmentation_ready or not self.naradio_ready:
+            return None
+        
+        try:
+            # Check config preference and availability
+            prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
+            has_enhanced = self.has_enhanced_embedding(vlm_answer)
+            
+            # Decision logic based on config and availability
+            if prefer_enhanced:
+                # Config says to prefer enhanced embeddings
+                if has_enhanced:
+                    # Use enhanced embedding similarity
+                    return self.process_enhanced_similarity_visualization_optimized(
+                        rgb_image, vlm_answer, feat_map_np)
+                else:
+                    # Config prefers enhanced but none available - return None instead of falling back
+                    print(f"Config prefers enhanced embeddings for '{vlm_answer}' but none available - skipping")
+                    return None
+            else:
+                # Config says to prefer VLM text embeddings
+                return self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np)
+                
+        except Exception as e:
+            print(f"Error in adaptive similarity processing: {e}")
+            # Only fallback to VLM text if config doesn't prefer enhanced
+            prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
+            if not prefer_enhanced:
+                return self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np)
+            else:
+                return None
 
     def _save_hotspot_mask(self, vlm_answer: str, buffer_dir: str, similarity_map: np.ndarray, 
                           original_image: np.ndarray):
@@ -1843,45 +2106,78 @@ class NARadioProcessor:
             traceback.print_exc()
 
     def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str]) -> Optional[Dict[str, np.ndarray]]:
-        """Create hotspot masks using enhanced embeddings only."""
+        """
+        Create hotspot masks for multiple VLM answers and merge them with different colors.
+        
+        Args:
+            rgb_image: RGB image as numpy array (H, W, 3)
+            vlm_answers: List of VLM answers to process
+            
+        Returns:
+            Dict mapping vlm_answer -> hotspot_mask (binary) or None if failed
+        """
         try:
             if not self.is_segmentation_ready():
+                print("Cannot create merged hotspots - segmentation not ready")
                 return None
             
+            # Get hotspot threshold from config
             hotspot_threshold = self.segmentation_config['segmentation'].get('hotspot_threshold', 0.6)
             min_area = self.segmentation_config['segmentation'].get('min_hotspot_area', 50)
             
             vlm_hotspots = {}
             
             for vlm_answer in vlm_answers:
-                if not self.has_enhanced_embedding(vlm_answer):
+                if vlm_answer not in self.get_all_objects():
+                    print(f"VLM answer '{vlm_answer}' not in object list, skipping")
                     continue
                 
-                # Use enhanced embedding similarity
-                similarity_map = self.compute_enhanced_similarity_map_optimized(rgb_image, vlm_answer)
+                # Process VLM similarity for this answer
+                similarity_result = self.process_vlm_similarity_visualization_optimized(
+                    rgb_image, vlm_answer, feat_map_np=None)
+                
+                if similarity_result is None:
+                    continue
+                
+                similarity_map = similarity_result.get('similarity_map')
                 if similarity_map is None:
                     continue
                 
-                # Apply threshold and filter
+                # Apply binary threshold to similarity map
                 hotspot_mask = similarity_map > hotspot_threshold
+                
                 if not np.any(hotspot_mask):
                     continue
                 
-                # Filter small regions
+                # Filter small regions using connected components
                 hotspot_mask_uint8 = (hotspot_mask * 255).astype(np.uint8)
                 contours, _ = cv2.findContours(hotspot_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
+                # Create filtered mask with only significant regions
                 filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
-                for contour in contours:
-                    if cv2.contourArea(contour) >= min_area:
-                        cv2.fillPoly(filtered_mask, [contour], 255)
+                hotspot_count = 0
                 
-                if np.any(filtered_mask):
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area >= min_area:
+                        cv2.fillPoly(filtered_mask, [contour], 255)
+                        hotspot_count += 1
+                
+                if hotspot_count > 0:
                     vlm_hotspots[vlm_answer] = filtered_mask
+                    print(f"✓ Created hotspot mask for '{vlm_answer}' ({hotspot_count} regions)")
             
-            return vlm_hotspots if vlm_hotspots else None
+            if not vlm_hotspots:
+                # print("No valid hotspot masks created")
+                return None
+            
+            print(f"✓ Created merged hotspot masks for {len(vlm_hotspots)} VLM answers")
+            return vlm_hotspots
             
         except Exception as e:
+            print(f"Error creating merged hotspot masks: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _make_json_serializable(self, obj):
