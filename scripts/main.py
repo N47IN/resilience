@@ -795,9 +795,8 @@ class ResilienceNode(Node):
             if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
                 return False
             
-            # Process the narration image to get hotspot mask
-            # Use the same similarity processing as regular VLM objects
-            similarity_result = self.naradio_processor.process_vlm_similarity_visualization(
+            # Process the narration image to get hotspot mask using enhanced embeddings
+            similarity_result = self.naradio_processor.process_similarity_visualization(
                 narration_image, vlm_answer
             )
             
@@ -1156,7 +1155,7 @@ class ResilienceNode(Node):
             print(f"Processing narration image for '{vlm_answer}' from buffer {target_buffer.buffer_id}")
             
             # STEP 1: Process similarity and get hotspot mask IMMEDIATELY
-            similarity_result = self.naradio_processor.process_vlm_similarity_visualization(
+            similarity_result = self.naradio_processor.process_similarity_visualization(
                 narration_image, vlm_answer
             )
             
@@ -1215,34 +1214,19 @@ class ResilienceNode(Node):
                         pass
                 return True
             
-            # STEP 4: Process enhanced embedding in background (non-blocking)
-            try:
-                # Process the narration image for enhanced embedding
-                enhanced_success = self.naradio_processor.process_narration_image_similarity(
-                    narration_image=narration_image,
-                    vlm_answer=vlm_answer,
-                    buffer_id=target_buffer.buffer_id,
-                    buffer_dir=buffer_dir
-                )
-                
-                if enhanced_success:
-                    # Load and store enhanced embedding in buffer object
-                    try:
-                        enhanced_embedding = self.load_enhanced_embedding_from_buffer(buffer_dir, vlm_answer)
-                        if enhanced_embedding is not None:
-                            target_buffer.assign_enhanced_cause_embedding(enhanced_embedding)
-                            
-                            # Also add to NARadio processor for real-time similarity detection
-                            if (hasattr(self, 'naradio_processor') and 
-                                self.naradio_processor.is_segmentation_ready()):
-                                success = self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
-                                if success:
-                                    print(f"Enhanced embedding added to NARadio processor")
-                            
-                    except Exception as e:
-                        print(f"Error loading enhanced embedding: {e}")
-            except Exception as e:
-                print(f"Error processing enhanced embedding: {e}")
+            # Process enhanced embedding
+            enhanced_success = self.naradio_processor.process_narration_image_similarity(
+                narration_image=narration_image,
+                vlm_answer=vlm_answer,
+                buffer_id=target_buffer.buffer_id,
+                buffer_dir=buffer_dir
+            )
+            
+            if enhanced_success:
+                enhanced_embedding = self.load_enhanced_embedding_from_buffer(buffer_dir, vlm_answer)
+                if enhanced_embedding is not None:
+                    target_buffer.assign_enhanced_cause_embedding(enhanced_embedding)
+                    self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
             
             return hotspot_success  # Return success based on hotspot mask publishing
             

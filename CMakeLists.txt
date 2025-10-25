@@ -23,6 +23,7 @@ install(PROGRAMS
   scripts/main.py
   scripts/narration_display_node.py
   scripts/depth_octomap_node.py
+  scripts/rayfronts_mapping_node.py
   scripts/publish_plan.py
   DESTINATION lib/${PROJECT_NAME}
 )
