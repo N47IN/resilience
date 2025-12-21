@@ -185,11 +185,11 @@ class NarrationDisplayNode(Node):
         """Query VLM with double prompt mechanism: get objects then score them
         
         Returns:
-            tuple: (most_probable_answer, score) or (error_message, 0.0) on failure
+            list: [(object_name, score), ...] top 4 objects with scores, sorted descending
         """
         if not self.api_key:
             self.get_logger().warning("No API key available - skipping VLM query")
-            return "VLM not available", 0.0
+            return []
         
         try:
             client = OpenAI(api_key=self.api_key)
@@ -199,19 +199,19 @@ class NarrationDisplayNode(Node):
             # STEP 1: Get 15 distinct objects from the image
             objects = self._get_object_list(client, data_url)
             if not objects or len(objects) == 0:
-                return "VLM Error: No objects detected", 0.0
+                return []
             
-            # STEP 2: Score objects using logprobs
+            # STEP 2: Score objects using logprobs, get top 4
             base_prompt = "I am a drone, after 1s"
             full_narration = f"{base_prompt} {narration_text}"
-            most_probable, score = self._score_objects_with_logprobs(client, data_url, objects, full_narration)
+            top_objects = self._score_objects_with_logprobs(client, data_url, objects, full_narration)
             
-            self.get_logger().info(f"VLM answer: {most_probable} (score: {score:.4f})")
-            return most_probable, score
+            self.get_logger().info(f"VLM top objects: {[(obj, f'{score:.4f}') for obj, score in top_objects]}")
+            return top_objects
             
         except Exception as e:
             self.get_logger().error(f"Error querying VLM: {e}")
-            return f"VLM Error: {str(e)}", 0.0
+            return []
     
     def _get_object_list(self, client, data_url, retries=3):
         """Get 15 distinct objects from image"""
@@ -257,10 +257,10 @@ RESPONSE FORMAT RULES:
         return []
     
     def _score_objects_with_logprobs(self, client, data_url, objects, narration):
-        """Score objects using logprobs and return most probable with score
+        """Score objects using logprobs and return top 4 with scores
         
         Returns:
-            tuple: (most_probable_object, probability_score)
+            list: [(object_name, score), ...] sorted by score descending, max 4 items
         """
         letters = string.ascii_uppercase[:len(objects)]
         options = {letter: obj for letter, obj in zip(letters, objects)}
@@ -301,7 +301,7 @@ Formatting rules:
             stop=["\n"],
         )
         
-        # Extract logprobs and compute scores
+        # Extract logprobs and compute scores for all objects
         logprob_entry = response.choices[0].logprobs.content[0]
         actual_token = logprob_entry.token
         actual_logprob = logprob_entry.logprob
@@ -316,14 +316,15 @@ Formatting rules:
             if tok_clean in options and tok_clean not in raw_scores:
                 raw_scores[tok_clean] = math.exp(item.logprob)
         
-        # Return most probable object with its score
+        # Return top 4 objects with scores, sorted by score descending
         if raw_scores:
-            most_likely_letter, score = max(raw_scores.items(), key=lambda x: x[1])
-            return options[most_likely_letter], float(score)
+            scored_objects = [(options[letter], float(score)) for letter, score in raw_scores.items()]
+            scored_objects.sort(key=lambda x: x[1], reverse=True)
+            return scored_objects[:4]
         
-        # Fallback to sampled answer with exp(logprob) as score
+        # Fallback to sampled answer
         fallback_score = math.exp(actual_logprob) if actual_clean in options else 0.0
-        return options.get(actual_clean, objects[0]), float(fallback_score)
+        return [(options.get(actual_clean, objects[0]), float(fallback_score))]
 
     def publish_vlm_answer(self, answer):
         """Publish VLM answer to ROS topic"""
@@ -390,17 +391,18 @@ Formatting rules:
     def save_image_with_text(self, image, narration_text):
         """Save image with text overlay to file"""
         try:
-            # Query VLM with the narration
-            vlm_answer, vlm_score = self.query_vlm(image, narration_text)
+            # Query VLM with the narration - get top 4 objects with scores
+            top_objects = self.query_vlm(image, narration_text)
             
-            # Publish VLM answer with score (format: "answer|score")
-            vlm_message = f"{vlm_answer}|{vlm_score:.6f}"
+            # Publish top 4 objects as JSON: [{"name": str, "score": float}, ...]
+            vlm_message = json.dumps([{"name": obj, "score": score} for obj, score in top_objects])
             self.publish_vlm_answer(vlm_message)
             
             # Create the full text to display
             base_prompt = "I am a drone, after 1s"
             full_narration = f"{base_prompt} {narration_text}"
-            full_text = f"{full_narration}\n\nVLM Answer: {vlm_answer} (score: {vlm_score:.4f})"
+            vlm_text = "\n".join([f"{obj} ({score:.4f})" for obj, score in top_objects])
+            full_text = f"{full_narration}\n\nVLM Top Objects:\n{vlm_text}"
             
             # Add text to image
             display_image = self.add_text_to_image(image, full_text)
@@ -418,7 +420,7 @@ Formatting rules:
             cv2.imwrite(filepath, display_image)
             
             self.image_counter += 1
-            self.get_logger().info(f"Saved narration image with VLM answer: {filepath}")
+            self.get_logger().info(f"Saved narration image with VLM answers: {filepath}")
             
         except Exception as e:
             self.get_logger().error(f"Error saving image: {e}")

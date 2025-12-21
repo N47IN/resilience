@@ -671,10 +671,8 @@ class SemanticDepthOctoMapNode(Node):
 			# Update VDB map with hotspot points for semantic voxels (only if within range)
 			if is_narration and points_world_near.size > 0:
 				# Save PCD to the specific buffer directory if buffer_id is provided
-				if buffer_id:
-					buffer_dir = self._save_narration_pcd_to_specific_buffer(buffer_id, points_world_near)
-				else:
-					buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
+				
+				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
 				
 				# Check if poses.npy is available before starting GP fit
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
@@ -895,69 +893,11 @@ class SemanticDepthOctoMapNode(Node):
 		latest_subfolder2 = max(subfolders2, key=os.path.getmtime)		
 		# Step 3: save voxelized PCD inside latest_subfolder2
 		save_path = os.path.join(latest_subfolder2, filename)
+		arr = np.mean(voxelized_points, axis=0)
+		with open(os.path.join(latest_subfolder2, "mean_cause.json"), "w") as f:
+			json.dump(arr.tolist(), f)
 		_save_pcd(voxelized_points, save_path)
 		return latest_subfolder2, save_path
-
-	def _save_narration_pcd_to_specific_buffer(self, buffer_id: str, points_world: np.ndarray) -> str:
-		"""Save narration PCD to a specific buffer directory."""
-		try:
-			# Find the buffer directory by looking for the buffer_id in the buffers directory
-			buffers_base_dir = "/home/navin/ros2_ws/src/buffers"
-			
-			# Look for the latest run directory
-			run_dirs = [d for d in os.listdir(buffers_base_dir) if os.path.isdir(os.path.join(buffers_base_dir, d)) and d.startswith('run_')]
-			if not run_dirs:
-				self.get_logger().warn(f"No run directories found in {buffers_base_dir}")
-				return None
-			
-			latest_run_dir = max(run_dirs, key=lambda d: os.path.getmtime(os.path.join(buffers_base_dir, d)))
-			run_path = os.path.join(buffers_base_dir, latest_run_dir)
-			
-			# Look for the specific buffer directory
-			buffer_dir = os.path.join(run_path, buffer_id)
-			if not os.path.exists(buffer_dir):
-				self.get_logger().warn(f"Buffer directory {buffer_dir} not found")
-				return None
-			
-			# Voxelize points before saving to reduce density for GP fitting
-			voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
-			
-			# Save PCD to the specific buffer directory
-			pcd_path = os.path.join(buffer_dir, "points.pcd")
-			self._save_pcd_file(voxelized_points, pcd_path)
-			
-			self.get_logger().info(f"Saved narration PCD to specific buffer: {buffer_dir}")
-			return buffer_dir
-			
-		except Exception as e:
-			self.get_logger().error(f"Error saving narration PCD to specific buffer: {e}")
-			return None
-	
-	def _save_pcd_file(self, points: np.ndarray, out_path: str):
-		"""Save points as a binary PCD file."""
-		try:
-			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-			mask = np.isfinite(pts).all(axis=1)
-			pts = pts[mask]
-			header = (
-				"# .PCD v0.7 - Point Cloud Data file format\n"
-				"VERSION 0.7\n"
-				"FIELDS x y z\n"
-				"SIZE 4 4 4\n"
-				"TYPE F F F\n"
-				"COUNT 1 1 1\n"
-				f"WIDTH {pts.shape[0]}\n"
-				"HEIGHT 1\n"
-				"VIEWPOINT 0 0 0 1 0 0 0\n"
-				f"POINTS {pts.shape[0]}\n"
-				"DATA binary\n"
-			)
-			with open(out_path, "wb") as f:
-				f.write(header.encode("ascii"))
-				f.write(pts.astype("<f4").tobytes())
-			self.get_logger().info(f"Saved {pts.shape[0]} voxelized points to {out_path}")
-		except Exception as e:
-			self.get_logger().error(f"Error saving PCD file: {e}")
 
 
 	def _check_and_start_gp_fit_if_ready(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):

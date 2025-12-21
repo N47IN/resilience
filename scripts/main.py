@@ -1059,9 +1059,6 @@ class ResilienceNode(Node):
         last_memory_cleanup = time.time()
         memory_cleanup_interval = 60.0  # SPEED OPTIMIZATION: Increased from 30s
         
-        last_device_check = time.time()
-        device_check_interval = 15.0  # SPEED OPTIMIZATION: Increased from 5s
-        
         while rclpy.ok() and self.naradio_running:
             try:
                 current_time = time.time()
@@ -1071,17 +1068,10 @@ class ResilienceNode(Node):
                     self.naradio_processor.cleanup_memory()
                     last_memory_cleanup = current_time
                 
+                # Check if processor is ready - skip processing if not ready
                 if not self.naradio_processor.is_ready():
-                    self.naradio_processor.reinitialize()
-                    time.sleep(1.0)  # Wait after reinit
+                    time.sleep(0.1)
                     continue
-                
-                # SPEED OPTIMIZATION: Less frequent device checks
-                if (self.naradio_processor.is_ready() and 
-                    current_time - last_device_check > device_check_interval):
-                    if not self.naradio_processor.ensure_device_consistency():
-                        self.naradio_processor.reinitialize()
-                    last_device_check = current_time
                 
                 with self.processing_lock:
                     if self.latest_rgb_msg is None:
@@ -1154,51 +1144,90 @@ class ResilienceNode(Node):
     def vlm_answer_callback(self, msg):
         """Handle VLM answers for cause analysis and buffer association."""
         try:
-            vlm_answer = msg.data.strip()
-            
-            if not vlm_answer or "VLM Error" in vlm_answer or "VLM not available" in vlm_answer:
+            data = msg.data.strip()
+            if not data or "VLM Error" in data or "VLM not available" in data:
                 return
             
-            self.get_logger().info(f"VLM ANSWER RECEIVED: '{vlm_answer}'")
-
-            # Track this VLM answer as recent for smart semantic processing
-            self.recent_vlm_answers[vlm_answer] = time.time()
-
-            
-            # Add VLM answer to NARadio processor for continuous monitoring
-            if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
-                success = self.naradio_processor.add_vlm_object(vlm_answer)
-                if success:
-                    self.get_logger().info(f"VLM object '{vlm_answer}' added for monitoring")
-                    self.save_cause_registry_snapshot()
-                    
-                    if hasattr(self, 'segmentation_legend_pub'):
-                        try:
-                            all_objects = self.naradio_processor.get_all_objects()
-                            legend_text = "VLM Objects Available for Similarity:\n"
-                            for i, obj in enumerate(all_objects):
-                                legend_text += f"{i}: {obj}\n"
-                            
-                            self.segmentation_legend_pub.publish(String(data=legend_text))
-                        except Exception as e:
-                            self.get_logger().warn(f"Error updating VLM objects legend: {e}")
-                    
+            # Parse JSON list: [{"name": str, "score": float}, ...]
+            try:
+                top_objects = json.loads(data)
+                if not isinstance(top_objects, list):
+                    top_objects = []  # Fallback for old format
+            except json.JSONDecodeError:
+                # Fallback: treat as old format "answer|score"
+                parts = data.split('|')
+                if len(parts) == 2:
+                    top_objects = [{"name": parts[0], "score": float(parts[1])}]
                 else:
-                    self.get_logger().warn(f"Failed to add VLM object '{vlm_answer}' to object list")
+                    top_objects = [{"name": data, "score": 1.0}]
             
-            self.associate_vlm_answer_with_buffer_reliable(vlm_answer)
+            if not top_objects:
+                return
             
-            # Process narration image chain IMMEDIATELY when VLM answer is received
-            # This ensures hotspot mask is sent to semantic bridge as soon as possible
-            narration_success = self.process_narration_chain_for_vlm_answer(vlm_answer)
+            obj_list_str = ', '.join([f"{obj['name']} ({obj['score']:.4f})" for obj in top_objects])
+            self.get_logger().info(f"VLM TOP OBJECTS RECEIVED: {obj_list_str}")
             
-            if narration_success:
-                print(f"Narration processing completed for '{vlm_answer}'")
-            else:
-                print(f"Narration processing failed for '{vlm_answer}'")
+            # Process all top 4 objects: store in registry with confidence=score, only add high-score ones to processor
+            primary_cause = None
+            for obj_data in top_objects:
+                vlm_answer = obj_data['name']
+                score = float(obj_data.get('score', 0.0))
+                
+                # Track as recent
+                self.recent_vlm_answers[vlm_answer] = time.time()
+                
+                # Store all in registry with confidence=score
+                # Only add to processor (dynamic_objects) for predictive similarity if score > 0.8
+                if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
+                    if score > 0.8:
+                        # Add to processor for predictive similarity (also adds to registry)
+                        success = self.naradio_processor.add_vlm_object(vlm_answer)
+                        if success:
+                            self.cause_registry.record_detection(vlm_answer, score)
+                            # Verify it's in dynamic_objects
+                            if vlm_answer in self.naradio_processor.dynamic_objects:
+                                self.get_logger().info(f"✓ '{vlm_answer}' added for predictive similarity (score: {score:.4f} > 0.8)")
+                            else:
+                                self.get_logger().warn(f"✗ '{vlm_answer}' not in dynamic_objects after add_vlm_object")
+                        else:
+                            self.get_logger().warn(f"Failed to add '{vlm_answer}' to processor")
+                    else:
+                        # For score <= 0.8: add to registry only, NOT to processor dynamic_objects
+                        entry = self.cause_registry.get_entry_by_name(vlm_answer)
+                        if entry is None:
+                            # Encode and add to registry only (skip dynamic_objects)
+                            try:
+                                import torch
+                                with torch.no_grad():
+                                    if hasattr(self.naradio_processor, 'radio_encoder') and self.naradio_processor.radio_encoder:
+                                        embedding = self.naradio_processor.radio_encoder.encode_labels([vlm_answer])
+                                        embedding_np = embedding.detach().cpu().numpy().reshape(-1)
+                                        self.cause_registry.upsert_cause(
+                                            vlm_answer, embedding_np, source="vlm", type_="dynamic"
+                                        )
+                            except Exception as e:
+                                self.get_logger().warn(f"Failed to add '{vlm_answer}' to registry: {e}")
+                        self.cause_registry.record_detection(vlm_answer, score)
+                        # Don't add to dynamic_objects - objects with score <= 0.8 won't get predictive similarity
+                        self.get_logger().debug(f"'{vlm_answer}' stored in registry only (score: {score:.4f} <= 0.8, no predictive similarity)")
+                
+                # Use first (highest score) as primary cause for buffer association
+                if primary_cause is None:
+                    primary_cause = vlm_answer
+            
+            self.save_cause_registry_snapshot()
+            
+            # Associate primary cause with buffer and process narration
+            if primary_cause:
+                self.associate_vlm_answer_with_buffer_reliable(primary_cause)
+                narration_success = self.process_narration_chain_for_vlm_answer(primary_cause)
+                if narration_success:
+                    self.get_logger().info(f"Narration processing completed for '{primary_cause}'")
             
         except Exception as e:
             print(f"Error processing VLM answer: {e}")
+            import traceback
+            traceback.print_exc()
 
     def process_narration_chain_for_vlm_answer(self, vlm_answer: str) -> bool:
         """
