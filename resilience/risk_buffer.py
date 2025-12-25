@@ -49,7 +49,7 @@ class RiskBuffer:
         self.images = []  # List of (timestamp, cv_image, ros_msg) tuples
         self.poses = []   # List of (timestamp, pose, drift) tuples  
         self.depth_msgs = {}  # Dict of timestamp -> depth_msg
-        self.drift
+        # self.drift
         
         # NEW: Narration image storage
         self.narration_image = None  # Store the narration image for easy retrieval

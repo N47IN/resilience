@@ -242,6 +242,14 @@ class SemanticHotspotPublisher:
             # Create overlay
             overlay = original_image.copy()
             
+            # FIX: Resize mask to match original image dimensions if they don't match
+            orig_h, orig_w = original_image.shape[:2]
+            mask_h, mask_w = merged_mask.shape[:2]
+            
+            if (orig_h != mask_h) or (orig_w != mask_w):
+                # Resize mask to match original image dimensions
+                merged_mask = cv2.resize(merged_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            
             # Apply colored overlay where hotspots are detected
             hotspot_pixels = np.any(merged_mask > 0, axis=2)
             overlay[hotspot_pixels] = cv2.addWeighted(

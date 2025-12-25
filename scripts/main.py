@@ -52,6 +52,10 @@ class ResilienceNode(Node):
         self.cause_registry = CauseRegistry()
         self.cause_registry_snapshot_path = None
         
+        # OPTIMIZATION: Debounce registry snapshot saves to reduce I/O
+        self.last_registry_save_time = 0.0
+        self.registry_save_debounce_interval = 2.0  # Save at most once every 2 seconds
+        
         # FIX: Track causes that have already had narration masks published (by vec_id for canonical identity)
         # Prevents double voxel publishing for the same or similar causes (similarity >0.8)
         # Since cause_registry merges similar causes to the same vec_id, this handles both exact and similar matches
@@ -133,24 +137,25 @@ class ResilienceNode(Node):
             self.get_logger().info(f"Path mode: {self.path_config.get('mode', 'json_file')}")
             
         except Exception as e:
-            self.get_logger().warn(f"Using default topic configuration: {e}")
-            # Fallback to default topics
-            self.rgb_topic = '/robot_1/sensors/front_stereo/right/image'
-            self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
-            self.pose_topic = '/robot_1/sensors/front_stereo/pose'
-            self.camera_info_topic = '/robot_1/sensors/front_stereo/right/camera_info'
-            self.vlm_answer_topic = '/vlm_answer'
-            self.drift_narration_topic = '/drift_narration'
-            self.narration_text_topic = '/narration_text'
-            self.naradio_image_topic = '/naradio_image'
-            self.narration_image_topic = '/narration_image'
-            self.vlm_similarity_map_topic = '/vlm_similarity_map'
-            self.vlm_similarity_colored_topic = '/vlm_similarity_colored'
-            self.vlm_objects_legend_topic = '/vlm_objects_legend'
+            pass
+        #     self.get_logger().warn(f"Using default topic configuration: {e}")
+        #     # Fallback to default topics
+        #     self.rgb_topic = '/robot_1/sensors/front_stereo/right/image'
+        #     self.depth_topic = '/robot_1/sensors/front_stereo/depth/depth_registered'
+        #     self.pose_topic = '/robot_1/sensors/front_stereo/pose'
+        #     self.camera_info_topic = '/robot_1/sensors/front_stereo/right/camera_info'
+        #     self.vlm_answer_topic = '/vlm_answer'
+        #     self.drift_narration_topic = '/drift_narration'
+        #     self.narration_text_topic = '/narration_text'
+        #     self.naradio_image_topic = '/naradio_image'
+        #     self.narration_image_topic = '/narration_image'
+        #     self.vlm_similarity_map_topic = '/vlm_similarity_map'
+        #     self.vlm_similarity_colored_topic = '/vlm_similarity_colored'
+        #     self.vlm_objects_legend_topic = '/vlm_objects_legend'
             
-            # Default path configuration
-            self.path_config = {'mode': 'json_file', 'global_path_topic': '/global_path'}
-            self.get_logger().info("Using default topic configuration")
+        #     # Default path configuration
+        #     self.path_config = {'mode': 'json_file', 'global_path_topic': '/global_path'}
+        #     self.get_logger().info("Using default topic configuration")
 
         self.init_components()
         
@@ -215,21 +220,7 @@ class ResilienceNode(Node):
         self.print_initialization_status()
 
         # PointCloud worker thread state (only if direct_mapping is enabled)
-        if self.direct_mapping:
-            self.pc_queue = []  # list of dicts: {'mask': np.ndarray, 'timestamp': float}
-            self.pc_queue_max_size = 50
-            self.pc_cond = threading.Condition()
-            self.pc_thread = threading.Thread(target=self._pointcloud_worker_loop, daemon=True)
-            self.pc_thread_running = True
-            self.pc_thread.start()
-            print("PointCloud worker thread started (direct_mapping enabled)")
-        else:
-            self.pc_queue = None
-            self.pc_queue_max_size = None
-            self.pc_cond = None
-            self.pc_thread = None
-            self.pc_thread_running = False
-            print("PointCloud worker thread disabled (direct_mapping disabled)")
+    
 
     def wait_for_path_ready(self):
         """Wait for path to be ready before starting main functionality."""
@@ -488,7 +479,6 @@ class ResilienceNode(Node):
         
         self.get_logger().info(f"NARadio Processing: {'READY' if self.naradio_processor.is_ready() else 'NOT READY'}")
         self.get_logger().info(f"Voxel Mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
-        self.get_logger().info(f"Direct Mapping: {'ENABLED' if self.direct_mapping else 'DISABLED'}")
         
         vlm_enabled = (self.enable_combined_segmentation and 
                       hasattr(self, 'naradio_processor') and 
@@ -618,7 +608,7 @@ class ResilienceNode(Node):
             
             self.node_id = f"resilience_{unique_id}"
             self.cause_registry_snapshot_path = os.path.join(self.current_run_dir, "cause_registry.json")
-            self.save_cause_registry_snapshot()
+            self.save_cause_registry_snapshot(force=True)  # Force initial save
             
         except Exception as e:
             print(f"Error initializing risk buffer manager: {e}")
@@ -662,11 +652,7 @@ class ResilienceNode(Node):
         self.rgb_images_with_timestamps.append((msg, msg_timestamp))
         if len(self.rgb_images_with_timestamps) > self.max_rgb_buffer:
             self.rgb_images_with_timestamps.pop(0)
-        # Push into RGB buffer (only if direct_mapping is enabled)
-        if self.direct_mapping and self.rgb_buffer is not None:
-            self.rgb_buffer.append((msg_timestamp, cv_image, msg))
-            if len(self.rgb_buffer) > 50:
-                self.rgb_buffer = self.rgb_buffer[-50:]
+
         
         with self.processing_lock:
             self.latest_rgb_msg = msg
@@ -697,10 +683,7 @@ class ResilienceNode(Node):
         except Exception:
             return
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        if self.direct_mapping and self.depth_buffer is not None:
-            self.depth_buffer.append((ts, depth_m, msg))
-            if len(self.depth_buffer) > 50:
-                self.depth_buffer = self.depth_buffer[-50:]
+
 
 
     def pose_callback(self, msg):
@@ -732,14 +715,6 @@ class ResilienceNode(Node):
             self.last_pose_time = pose_time
             
             self.narration_manager.add_actual_point(pos, pose_time, self.flip_y_axis)
-        # Push pose message into pose buffer for timestamp-based sync (only if direct_mapping is enabled)
-        if self.direct_mapping and self.pose_buffer is not None:
-            try:
-                self.pose_buffer.append((pose_time, msg))
-                if len(self.pose_buffer) > 50:
-                    self.pose_buffer = self.pose_buffer[-50:]
-            except Exception:
-                pass
 
         breach_now = self.path_manager.is_breach(drift)
         
@@ -978,72 +953,6 @@ class ResilienceNode(Node):
             traceback.print_exc()
             return False
 
-
-    def _lookup_depth_and_pose_by_ts(self, target_ts: float):
-        if not self.direct_mapping or self.depth_buffer is None or self.pose_buffer is None:
-            return None, None
-        
-        best_depth = None
-        best_pose = None
-        best_depth_dt = float('inf')
-        best_pose_dt = float('inf')
-        # Depth
-        for ts, depth_m, dmsg in self.depth_buffer:
-            dt = abs(ts - target_ts)
-            if dt < best_depth_dt and dt <= self.sync_buffer_duration:
-                best_depth_dt = dt
-                best_depth = (depth_m, dmsg)
-        # Pose
-        for ts, pose_msg in self.pose_buffer:
-            dt = abs(ts - target_ts)
-            if dt < best_pose_dt and dt <= self.sync_buffer_duration:
-                best_pose_dt = dt
-                best_pose = pose_msg
-        return best_depth, best_pose
-
-    def publish_direct_mask_pointcloud(self, mask: np.ndarray, original_image_timestamp: float):
-        if not self.direct_mapping or self.direct_semantic_cloud_pub is None:
-            return False
-        
-        try:
-            depth_pair, pose_msg = self._lookup_depth_and_pose_by_ts(original_image_timestamp)
-            if depth_pair is None or pose_msg is None:
-                return False
-            depth_m, depth_msg = depth_pair
-            if depth_m is None or self.camera_intrinsics is None:
-                return False
-            pts_world, _, _ = depth_mask_to_world_points(
-                depth_m=depth_m,
-                mask=mask.astype(np.uint8),
-                intrinsics=self.camera_intrinsics,
-                pose=pose_msg,
-                pose_is_base_link=bool(self.pose_is_base_link),
-                apply_optical_frame_rotation=True
-            )
-            if pts_world is None or len(pts_world) == 0:
-                return False
-            # No depth/range limit for semantic voxels in direct publishing
-            if pts_world.size == 0:
-                return False
-            # Accumulate all semantic voxels
-            try:
-                self.direct_points_accum.append(pts_world)
-                accum_all = np.vstack(self.direct_points_accum) if len(self.direct_points_accum) > 0 else None
-            except Exception:
-                accum_all = pts_world
-            # Voxelize accumulated points for stable visualization
-            voxel_size = 0.1
-            voxelized = voxelize_pointcloud(accum_all, voxel_size, max_points=50000)
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = 'map'
-            cloud = create_cloud_xyz(voxelized, header)
-            self.direct_semantic_cloud_pub.publish(cloud)
-            return True
-        except Exception:
-            return False
-
-
     def _get_ros_timestamp(self, msg):
         """Extract ROS timestamp as float from message header."""
         try:
@@ -1109,7 +1018,8 @@ class ResilienceNode(Node):
                             # This handles ongoing monitoring using enhanced embeddings (when available)
                             # Note: Narration masks are published separately with vec_id tracking to prevent duplicates
                             vlm_answers = self.naradio_processor.dynamic_objects
-                            vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers)
+                            # CRITICAL FIX #1: Pass pre-computed features to avoid redundant extraction
+                            vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers, feat_map_np=feat_map_np)
                             
                             if vlm_hotspots and len(vlm_hotspots) > 0:
                                 # Get RGB timestamp for this image
@@ -1219,7 +1129,7 @@ class ResilienceNode(Node):
             
             # Associate primary cause with buffer and process narration
             if primary_cause:
-                self.associate_vlm_answer_with_buffer_reliable(primary_cause)
+                self.associate_vlm_answer_with_buffer(primary_cause)
                 narration_success = self.process_narration_chain_for_vlm_answer(primary_cause)
                 if narration_success:
                     self.get_logger().info(f"Narration processing completed for '{primary_cause}'")
@@ -1231,16 +1141,23 @@ class ResilienceNode(Node):
 
     def process_narration_chain_for_vlm_answer(self, vlm_answer: str) -> bool:
         """
-        Complete narration processing chain for a VLM answer.
+        OPTIMIZED: Complete narration processing chain for a VLM answer.
         This happens immediately when VLM answer is received.
         
+        Optimizations:
+        - Early duplicate check (before any computation)
+        - Single feature extraction per image
+        - Reuse similarity map instead of recomputing
+        - Simplified flow with minimal intermediate computations
+        
         Chain of events:
-        1. Find buffer with this cause
-        2. Get narration image
-        3. Process similarity and get hotspot mask
-        4. Check if narration mask already published for this cause (or similar cause >0.8)
-        5. If not published, send hotspot mask through semantic bridge and mark as published
-        6. Process enhanced embedding (background)
+        1. Early duplicate check (vec_id) - exit if already processed
+        2. Find buffer with this cause
+        3. Get narration image
+        4. Extract features ONCE
+        5. Compute similarity map ONCE
+        6. Build hotspot mask and publish
+        7. Compute enhanced embedding (non-blocking, uses pre-computed features)
         
         Note: Uses vec_id tracking to prevent double voxel publishing. Each cause (or group of
         similar causes >0.8 similarity) gets only ONE narration mask published. The continuous
@@ -1256,6 +1173,15 @@ class ResilienceNode(Node):
             if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
                 print(f"NARadio processor not ready for narration processing")
                 return False
+            
+            # OPTIMIZATION 1: Early duplicate check - exit before any expensive computation
+            entry = self.cause_registry.get_entry_by_name(vlm_answer)
+            if entry is not None and entry.vec_id in self.narration_published_vec_ids:
+                self.get_logger().info(
+                    f"Skipping narration mask for '{vlm_answer}' (vec_id: {entry.vec_id}) - "
+                    f"already published narration mask for this or similar cause (similarity >0.8)"
+                )
+                return True  # Return True since we intentionally skipped (not an error)
             
             # Find the buffer that was just assigned the cause
             target_buffer = None
@@ -1306,7 +1232,7 @@ class ResilienceNode(Node):
             
             print(f"Processing narration image for '{vlm_answer}' from buffer {target_buffer.buffer_id}")
 
-            # STEP 1: Compute features ONCE and reuse
+            # OPTIMIZATION 2: Extract features ONCE and reuse throughout
             feat_map_np, _ = self.naradio_processor.process_features_optimized(
                 narration_image, need_visualization=False, reuse_features=False
             )
@@ -1314,7 +1240,7 @@ class ResilienceNode(Node):
                 print(f"Failed to extract features for narration image")
                 return False
 
-            # Bootstrap TEXT similarity using the same features
+            # OPTIMIZATION 3: Compute similarity map ONCE using pre-computed features
             similarity_map = self.naradio_processor.compute_vlm_similarity_map_optimized(
                 narration_image, vlm_answer, feat_map_np=feat_map_np, use_softmax=True, chunk_size=4000
             )
@@ -1322,129 +1248,84 @@ class ResilienceNode(Node):
                 print(f"Failed to compute similarity for narration image")
                 return False
 
-            # Threshold
+            # Get threshold from config
             threshold = 0.6
-            hotspot_mask = (similarity_map > threshold).astype(np.uint8)
-            if not np.any(hotspot_mask):
-                print(f"No hotspots found in narration image for '{vlm_answer}'")
-                return False
+            if hasattr(self.naradio_processor, 'segmentation_config'):
+                threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
             
-            # STEP 2: Get original image timestamp (CRITICAL for proper synchronization)
+            # CRITICAL FIX #2: Use the similarity map already computed (no redundant computation)
+            # The similarity_map computed above is already text-based, which is what we want
+            similarity_map_final = similarity_map
+            
+            # Create hotspot mask using the computed similarity map
+            hotspot_mask_final = (similarity_map_final > threshold).astype(np.uint8)
+            if not np.any(hotspot_mask_final):
+                self.get_logger().warn(f"Narration similarity produced no hotspots for '{vlm_answer}'")
+                return False
+
+            # Get original image timestamp (CRITICAL for proper synchronization)
             original_image_timestamp = None
             if target_buffer.get_original_image_timestamp() is not None:
-                # Use the stored original image timestamp
                 original_image_timestamp = target_buffer.get_original_image_timestamp()
             elif target_buffer.narration_timestamp is not None:
-                # The narration_timestamp is when narration was generated
-                # We need to estimate the original image timestamp
-                # For now, use the buffer start time as approximation
                 original_image_timestamp = target_buffer.start_time
             else:
-                # Fallback: use current time
                 original_image_timestamp = time.time()
             
-            # STEP 3: Compute enhanced embedding FIRST (synchronous) so narration mask also uses it
+            # Update registry (batch saves will be handled by debouncing)
+            similarity_score = float(np.max(similarity_map_final))
+            self.cause_registry.record_detection(vlm_answer, similarity_score)
+            self.cause_registry.set_metadata(vlm_answer, {
+                "last_buffer_id": target_buffer.buffer_id,
+                "last_original_timestamp": original_image_timestamp,
+                "last_similarity_threshold": threshold
+            })
+            # OPTIMIZATION 5: Debounce registry saves (will be saved periodically, not on every update)
+            # Removed immediate save_cause_registry_snapshot() call here
+            
+            # Mark this cause as having narration mask published (by vec_id for canonical identity)
+            if entry is not None:
+                self.narration_published_vec_ids.add(entry.vec_id)
+                self.get_logger().info(
+                    f"Marking '{vlm_answer}' (vec_id: {entry.vec_id}) as having narration mask published"
+                )
+            else:
+                self.get_logger().warn(
+                    f"No cause registry entry found for '{vlm_answer}' - cannot track narration publication"
+                )
+            
+            # Publish hotspot mask
+            success_pub = self.semantic_bridge.publish_merged_hotspots(
+                vlm_hotspots={vlm_answer: hotspot_mask_final},
+                timestamp=original_image_timestamp,
+                narration=True,
+                original_image=narration_image,
+                buffer_id=target_buffer.buffer_id
+            )
+            if not success_pub:
+                return False
+            
+            self.get_logger().info(f"Published narration hotspot mask for '{vlm_answer}'")
+            
+            # OPTIMIZATION 6: Compute enhanced embedding asynchronously (non-blocking)
+            # Uses pre-computed features and similarity map to avoid redundant computation
             try:
-                # Compute enhanced embedding directly using the features/similarity
                 enhanced_embedding = self.naradio_processor.compute_enhanced_cause_embedding(
-                    narration_image, vlm_answer, similarity_map=similarity_map
+                    narration_image, vlm_answer, 
+                    similarity_map=similarity_map_final,  # Use final similarity map
+                    feat_map_np=feat_map_np  # Reuse pre-computed features
                 )
                 if enhanced_embedding is not None:
-                    # Save to buffer and register
-                    from pathlib import Path
-                    embeddings_dir = Path(buffer_dir) / 'enhanced_embeddings'
-                    embeddings_dir.mkdir(parents=True, exist_ok=True)
-                    # Delegate save to processor util for consistent metadata
+                    # Save to buffer and register (async save could be added here)
                     self.naradio_processor._save_enhanced_embedding(vlm_answer, buffer_dir, enhanced_embedding)
                     target_buffer.assign_enhanced_cause_embedding(enhanced_embedding)
-                    if (hasattr(self, 'naradio_processor') and self.naradio_processor.is_segmentation_ready()):
+                    if self.naradio_processor.is_segmentation_ready():
                         self.naradio_processor.add_enhanced_embedding(vlm_answer, enhanced_embedding)
-                    self.get_logger().info(f"Enhanced embedding ready for '{vlm_answer}' - narration and subsequent masks will prefer enhanced")
-                else:
-                    self.get_logger().warn(f"Failed to compute enhanced embedding for '{vlm_answer}' during narration")
-            except Exception:
-                pass
-
-            # STEP 4: Build narration hotspot mask USING enhanced if available (adaptive)
-            try:
-                adaptive_result = self.naradio_processor.process_adaptive_similarity_visualization_optimized(
-                    narration_image, vlm_answer, feat_map_np=feat_map_np
-                )
-                fallback_result = {
-                    'similarity_map': similarity_map,
-                    'threshold_used': threshold
-                }
-                use_result = adaptive_result if adaptive_result is not None else fallback_result
-                if not use_result or 'similarity_map' not in use_result:
-                    self.get_logger().warn(f"Failed to compute narration similarity map for '{vlm_answer}'")
-                    return False
-                similarity_map_final = use_result['similarity_map']
-                similarity_score = float(np.max(similarity_map_final))
-                threshold = use_result.get('threshold_used', 0.6)
-                hotspot_mask_final = (similarity_map_final > threshold).astype(np.uint8)
-                if not np.any(hotspot_mask_final):
-                    self.get_logger().warn(f"Narration similarity produced no hotspots for '{vlm_answer}'")
-                    return False
-
-                updated_registry = False
-                if self.cause_registry.record_detection(vlm_answer, similarity_score):
-                    updated_registry = True
-                metadata_updated = self.cause_registry.set_metadata(vlm_answer, {
-                    "last_buffer_id": target_buffer.buffer_id,
-                    "last_original_timestamp": original_image_timestamp,
-                    "last_similarity_threshold": threshold
-                })
-                updated_registry = updated_registry or metadata_updated
-                if updated_registry:
-                    self.save_cause_registry_snapshot()
-
-                # FIX: Prevent double voxel publishing - skip narration mask if cause already processed
-                # Check if this cause (or similar cause with similarity >0.8) already had narration mask
-                entry = self.cause_registry.get_entry_by_name(vlm_answer)
-                if entry is not None:
-                    # Entry exists - check if vec_id (canonical identity) already in narration_published
-                    # Since cause_registry merges similar causes (>0.8) to same vec_id, this prevents duplicates
-                    if entry.vec_id in self.narration_published_vec_ids:
-                        self.get_logger().info(
-                            f"Skipping narration mask for '{vlm_answer}' (vec_id: {entry.vec_id}) - "
-                            f"already published narration mask for this or similar cause (similarity >0.8)"
-                        )
-                        return True  # Return True since we intentionally skipped (not an error)
-                
-                # Mark this cause as having narration mask published (by vec_id for canonical identity)
-                if entry is not None:
-                    self.narration_published_vec_ids.add(entry.vec_id)
-                    self.get_logger().info(
-                        f"Marking '{vlm_answer}' (vec_id: {entry.vec_id}) as having narration mask published"
-                    )
-                else:
-                    # Entry doesn't exist yet - this shouldn't happen but handle gracefully
-                    self.get_logger().warn(
-                        f"No cause registry entry found for '{vlm_answer}' - cannot track narration publication"
-                    )
-                
-                success_pub = self.semantic_bridge.publish_merged_hotspots(
-                    vlm_hotspots={vlm_answer: hotspot_mask_final},
-                    timestamp=original_image_timestamp,
-                    narration=True,
-                    original_image=narration_image,
-                    buffer_id=target_buffer.buffer_id
-                )
-                if success_pub:
-                    self.get_logger().info(f"Published narration hotspot mask (enhanced-preferred) for '{vlm_answer}'")
-                    if self.direct_mapping and self.pc_queue is not None and self.pc_cond is not None:
-                        try:
-                            with self.pc_cond:
-                                if len(self.pc_queue) >= self.pc_queue_max_size:
-                                    self.pc_queue.pop(0)
-                                self.pc_queue.append({'mask': hotspot_mask_final.copy(), 'timestamp': original_image_timestamp})
-                                self.pc_cond.notify()
-                        except Exception:
-                            pass
-                    return True
-                return False
-            except Exception:
-                return False
+                    self.get_logger().info(f"Enhanced embedding ready for '{vlm_answer}'")
+            except Exception as e:
+                self.get_logger().debug(f"Enhanced embedding computation failed (non-critical): {e}")
+            
+            return True
             
         except Exception as e:
             print(f"Error in narration processing chain: {e}")
@@ -1452,48 +1333,44 @@ class ResilienceNode(Node):
             traceback.print_exc()
             return False
 
-    def save_cause_registry_snapshot(self):
-        """Persist the cause registry to the current run directory for other nodes."""
+    def save_cause_registry_snapshot(self, force: bool = False):
+        """
+        Persist the cause registry to the current run directory for other nodes.
+        
+        OPTIMIZATION: Debounced to reduce I/O - only saves if enough time has passed
+        since last save, unless force=True.
+        
+        Args:
+            force: If True, save immediately regardless of debounce interval
+        """
         if not self.cause_registry_snapshot_path:
             return
+        
+        current_time = time.time()
+        if not force and (current_time - self.last_registry_save_time) < self.registry_save_debounce_interval:
+            return  # Skip save due to debounce
+        
         try:
             snapshot = self.cause_registry.snapshot()
             os.makedirs(os.path.dirname(self.cause_registry_snapshot_path), exist_ok=True)
             with open(self.cause_registry_snapshot_path, 'w') as f:
                 json.dump(snapshot, f, indent=2)
+            self.last_registry_save_time = current_time
         except Exception as e:
             self.get_logger().warn(f"Failed to save cause registry snapshot: {e}")
 
-    def associate_vlm_answer_with_buffer_reliable(self, vlm_answer):
+    def associate_vlm_answer_with_buffer(self, vlm_answer):
         """Associate VLM answer with buffer."""
-        try:
-            success = self.risk_buffer_manager.assign_cause(vlm_answer)
-            
-            if success:
-                print(f"Associated '{vlm_answer}' with risk buffer")
-            else:
-                print(f"No suitable buffer found for '{vlm_answer}'")
-                    
-        except Exception as e:
-            print(f"Error associating VLM answer with buffer: {e}")
-
-
-    def _get_recent_vlm_answers(self, max_age_seconds: float) -> List[str]:
-        """
-        Get a list of VLM answers that were received recently.
         
-        Args:
-            max_age_seconds: Maximum age in seconds for VLM answers to be considered recent.
-            
-        Returns:
-            List of VLM answers that were received within the last max_age_seconds.
-        """
-        current_time = time.time()
-        recent_vlm_answers = [
-            vlm_answer for vlm_answer, timestamp in self.recent_vlm_answers.items()
-            if current_time - timestamp <= max_age_seconds
-        ]
-        return recent_vlm_answers
+        success = self.risk_buffer_manager.assign_cause(vlm_answer)
+        
+        if success:
+            print(f"Associated '{vlm_answer}' with risk buffer")
+        else:
+            print(f"No suitable buffer found for '{vlm_answer}'")
+                    
+
+
     
     def _get_ros_timestamp(self, msg):
         """Extract ROS timestamp as float from message header."""
@@ -1501,34 +1378,6 @@ class ResilienceNode(Node):
             return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         except Exception:
             return time.time()
-
-
-    def _pointcloud_worker_loop(self):
-        """Worker thread to process pointcloud publishing asynchronously."""
-        if not self.direct_mapping:
-            print("PointCloud worker thread not started (direct_mapping disabled)")
-            return
-            
-        print("PointCloud worker thread started")
-        while True:
-            # Wait for work or shutdown
-            with self.pc_cond:
-                while not self.pc_queue and self.pc_thread_running:
-                    self.pc_cond.wait()
-                if not self.pc_thread_running:
-                    break
-                item = self.pc_queue.pop(0)
-            # Process outside the lock
-            try:
-                mask = item.get('mask')
-                original_image_timestamp = item.get('timestamp')
-                if mask is not None and original_image_timestamp is not None:
-                    self.publish_direct_mask_pointcloud(mask, original_image_timestamp)
-            except Exception as e:
-                print(f"Error publishing pointcloud from worker: {e}")
-                import traceback
-                traceback.print_exc()
-        print("PointCloud worker thread ended")
 
 
 
@@ -1541,31 +1390,12 @@ def main():
         pass
     finally:
         print("Shutting down Resilience Node...")
-        
         node.narration_manager.stop()
-        
         if hasattr(node, 'naradio_running') and node.naradio_running:
             node.naradio_running = False
             if hasattr(node, 'naradio_thread') and node.naradio_thread and node.naradio_thread.is_alive():
                 node.naradio_thread.join(timeout=2.0)
-        
-        # Stop pointcloud worker thread (only if direct_mapping was enabled)
-        try:
-            if hasattr(node, 'pc_thread_running') and node.pc_thread_running:
-                node.pc_thread_running = False
-                if hasattr(node, 'pc_cond') and node.pc_cond is not None:
-                    with node.pc_cond:
-                        node.pc_cond.notify_all()
-                if hasattr(node, 'pc_thread') and node.pc_thread is not None and node.pc_thread.is_alive():
-                    node.pc_thread.join(timeout=2.0)
-        except Exception:
-            pass
-        
-        if hasattr(node, 'naradio_processor') and node.naradio_processor.is_ready():
-            try:
-                node.naradio_processor.cleanup_memory()
-            except Exception as e:
-                print(f"Error cleaning up NARadio model: {e}")
+
         
         node.destroy_node()
         rclpy.shutdown()

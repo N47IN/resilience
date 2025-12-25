@@ -1637,7 +1637,8 @@ class NARadioProcessor:
 
     @torch.inference_mode()
     def compute_enhanced_cause_embedding(self, rgb_image: np.ndarray, vlm_answer: str, 
-                                       similarity_map: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+                                       similarity_map: Optional[np.ndarray] = None,
+                                       feat_map_np: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """
         Compute enhanced cause embedding by weighted averaging spatial features using similarity as weights.
         
@@ -1645,6 +1646,7 @@ class NARadioProcessor:
             rgb_image: RGB image as numpy array (H, W, 3)
             vlm_answer: The VLM answer to compute enhanced embedding for
             similarity_map: Pre-computed similarity map (optional, will compute if not provided)
+            feat_map_np: Pre-computed feature map (optional, avoids redundant feature extraction)
             
         Returns:
             np.ndarray: Enhanced cause embedding vector, or None if failed
@@ -1658,33 +1660,54 @@ class NARadioProcessor:
             
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-            # Extract spatial features from the image
-            resolution = (self.radio_input_resolution, self.radio_input_resolution)
-            if hasattr(self.radio_encoder, "input_resolution"):
-                self.radio_encoder.input_resolution = resolution
-            
-            # Convert image to tensor
-            tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1)
-            tensor_image = tensor_image.to(device).float() / 255.0
-            tensor_image = torch.nn.functional.interpolate(
-                tensor_image.unsqueeze(0), resolution, mode="bilinear", antialias=True)
-            
-            # Extract features
-            feat_map_tensor = self.radio_encoder.encode_image_to_feat_map(tensor_image)
-            
-            # Align features with language
-            feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
-            
-            # Resize to final resolution
-            feat_map_aligned = torch.nn.functional.interpolate(
-                feat_map_aligned, resolution, mode="bilinear", antialias=True)
-            feat_map_aligned = feat_map_aligned.squeeze(0).permute(1, 2, 0)  # H x W x C
+            # OPTIMIZATION: Reuse pre-computed features if provided
+            if feat_map_np is not None:
+                # Convert to tensor and align
+                if isinstance(feat_map_np, np.ndarray):
+                    feat_map_tensor = torch.from_numpy(feat_map_np).to(device)
+                else:
+                    feat_map_tensor = feat_map_np.to(device)
+                
+                # Align features with language
+                feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
+                
+                # Resize to final resolution
+                resolution = (self.radio_input_resolution, self.radio_input_resolution)
+                feat_map_aligned = torch.nn.functional.interpolate(
+                    feat_map_aligned, resolution, mode="bilinear", antialias=True)
+                feat_map_aligned = feat_map_aligned.squeeze(0).permute(1, 2, 0)  # H x W x C
+            else:
+                # Extract spatial features from the image (fallback if not provided)
+                resolution = (self.radio_input_resolution, self.radio_input_resolution)
+                if hasattr(self.radio_encoder, "input_resolution"):
+                    self.radio_encoder.input_resolution = resolution
+                
+                # Convert image to tensor
+                tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1)
+                tensor_image = tensor_image.to(device).float() / 255.0
+                tensor_image = torch.nn.functional.interpolate(
+                    tensor_image.unsqueeze(0), resolution, mode="bilinear", antialias=True)
+                
+                # Extract features
+                feat_map_tensor = self.radio_encoder.encode_image_to_feat_map(tensor_image)
+                
+                # Align features with language
+                feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
+                
+                # Resize to final resolution
+                feat_map_aligned = torch.nn.functional.interpolate(
+                    feat_map_aligned, resolution, mode="bilinear", antialias=True)
+                feat_map_aligned = feat_map_aligned.squeeze(0).permute(1, 2, 0)  # H x W x C
+                
+                del tensor_image, feat_map_tensor
             
             H, W, C = feat_map_aligned.shape
             
             # Get or compute similarity map
             if similarity_map is None:
-                similarity_map = self.compute_vlm_similarity_map_optimized(rgb_image, vlm_answer)
+                # OPTIMIZATION: Reuse pre-computed features if available
+                similarity_map = self.compute_vlm_similarity_map_optimized(
+                    rgb_image, vlm_answer, feat_map_np=feat_map_np)
                 if similarity_map is None:
                     print(f"Failed to compute similarity map for enhanced embedding")
                     return None
@@ -1738,8 +1761,11 @@ class NARadioProcessor:
             print(f"✓ Computed enhanced cause embedding for '{vlm_answer}' (shape: {enhanced_embedding_np.shape})")
             print(f"  Used {total_weight.item():.3f} total similarity weight from {H*W} pixels")
             
-            # Cleanup
-            del tensor_image, feat_map_tensor, feat_map_aligned, weights, feat_map_flat, weights_flat
+            # Cleanup - only delete variables that were actually created
+            del feat_map_aligned, weights, feat_map_flat, weights_flat
+            if feat_map_np is None:
+                # Only these were created in the else branch
+                del tensor_image, feat_map_tensor
             
             return enhanced_embedding_np
             
@@ -2136,13 +2162,14 @@ class NARadioProcessor:
             import traceback
             traceback.print_exc()
 
-    def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str]) -> Optional[Dict[str, np.ndarray]]:
+    def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
         """
         Create hotspot masks for multiple VLM answers and merge them with different colors.
         
         Args:
             rgb_image: RGB image as numpy array (H, W, 3)
             vlm_answers: List of VLM answers to process
+            feat_map_np: Pre-computed feature map (optional, avoids redundant feature extraction)
             
         Returns:
             Dict mapping vlm_answer -> hotspot_mask (binary) or None if failed
@@ -2166,8 +2193,9 @@ class NARadioProcessor:
                 if prefer_enhanced and not self.has_enhanced_embedding(vlm_answer):
                     continue
 
+                # CRITICAL FIX #1: Pass pre-computed features to avoid redundant extraction
                 similarity_result = self.process_adaptive_similarity_visualization_optimized(
-                    rgb_image, vlm_answer, feat_map_np=None)
+                    rgb_image, vlm_answer, feat_map_np=feat_map_np)
                 if similarity_result is None:
                     continue
 
@@ -2199,7 +2227,7 @@ class NARadioProcessor:
         except Exception:
             return None
 
-    def create_merged_hotspot_masks_text(self, rgb_image: np.ndarray, vlm_answers: List[str]) -> Optional[Dict[str, np.ndarray]]:
+    def create_merged_hotspot_masks_text(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
         """Create merged hotspot masks using TEXT embeddings only for the provided answers."""
         try:
             if not self.is_segmentation_ready():
@@ -2214,8 +2242,9 @@ class NARadioProcessor:
                 if vlm_answer not in self.get_all_objects():
                     continue
 
+                # CRITICAL FIX #1: Pass pre-computed features to avoid redundant extraction
                 similarity_result = self.process_vlm_similarity_visualization_optimized(
-                    rgb_image, vlm_answer, feat_map_np=None
+                    rgb_image, vlm_answer, feat_map_np=feat_map_np
                 )
                 if similarity_result is None:
                     continue

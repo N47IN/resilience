@@ -196,7 +196,7 @@ class NarrationDisplayNode(Node):
             image_base64 = self.encode_image_for_api(image)
             data_url = f"data:image/png;base64,{image_base64}"
             
-            # STEP 1: Get 15 distinct objects from the image
+            # STEP 1: Get 15 distinct objects from the image    
             objects = self._get_object_list(client, data_url)
             if not objects or len(objects) == 0:
                 return []
@@ -215,11 +215,11 @@ class NarrationDisplayNode(Node):
     
     def _get_object_list(self, client, data_url, retries=3):
         """Get 15 distinct objects from image"""
-        prompt = """You must output EXACTLY 15 distinct object types from the image.
+        prompt = """You must output EXACTLY 5 distinct object types from the image.
 
 RESPONSE FORMAT RULES:
 - Output MUST be ONLY a JSON array.
-- EXACTLY 15 strings.
+- EXACTLY 5 strings.
 - No markdown.
 - No backticks.
 - No explanation.
@@ -247,8 +247,8 @@ RESPONSE FORMAT RULES:
             
             try:
                 object_list = json.loads(raw)
-                if isinstance(object_list, list) and len(object_list) >= 15:
-                    return object_list[:15]
+                if isinstance(object_list, list) and len(object_list) >=5:
+                    return object_list[:5]
                 elif isinstance(object_list, list) and len(object_list) > 0:
                     return object_list  # Return what we have
             except json.JSONDecodeError:
