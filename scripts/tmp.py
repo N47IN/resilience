@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Semantic Depth OctoMap ROS2 Node
+Semantic Depth VDB Mapping ROS2 Node
 
-Simplified node that uses VoxelMappingHelper for all heavy lifting.
-Subscribes to depth, pose, and semantic info to create semantic voxel maps.
+Simplified node that uses RayFronts SemanticRayFrontiersMap for efficient 3D mapping.
+Subscribes to depth, pose, and semantic info to create semantic voxel maps using OpenVDB.
 Maintains timestamped buffers for depth frames and poses to align with hotspot masks
 received via the semantic bridge using original RGB timestamps.
 """
@@ -11,31 +11,41 @@ received via the semantic bridge using original RGB timestamps.
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.logging import LoggingSeverity
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import MarkerArray, Marker
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
 from std_msgs.msg import String
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2
 
 import numpy as np
+import torch
 from cv_bridge import CvBridge
 import time
 import json
 import math
-from typing import Optional, List
+from typing import Optional, List, Dict
 import sensor_msgs_py.point_cloud2 as pc2
 import threading
 import cv2
 import os
+from collections import deque, defaultdict
 
-# Import helpers
+# Import RayFronts VDB mapping
 try:
-	from resilience.voxel_mapping_helper import VoxelMappingHelper
-	HELPERS_AVAILABLE = True
-except ImportError:
-	HELPERS_AVAILABLE = False
+	import sys
+	sys.path.append('/home/navin/ros2_ws/src/resilience/RayFronts')
+	from rayfronts.mapping.semantic_ray_frontiers_map import SemanticRayFrontiersMap
+	from rayfronts import geometry3d as g3d
+	import rayfronts_cpp
+	VDB_AVAILABLE = True
+except ImportError as e:
+	print(f"RayFronts VDB not available: {e}")
+	VDB_AVAILABLE = False
 
 # Optional GP helper
 try:
@@ -43,8 +53,6 @@ try:
 	GP_HELPER_AVAILABLE = True
 except ImportError:
 	GP_HELPER_AVAILABLE = False
-
-# Simple GP Manager - no complex superposition needed
 
 # Optional PathManager for global path access
 try:
@@ -54,16 +62,78 @@ except ImportError:
 	PATH_MANAGER_AVAILABLE = False
 
 
+class VoxelObservationTracker:
+	"""Efficient tracker for voxel observations with incremental frame counting."""
+	def __init__(self, max_age: float = 5.0):
+		self.frame_ids = set()  # O(1) lookup for unique frames
+		self.observation_count = 0  # Total observation count
+		self.timestamps = deque(maxlen=100)  # Auto-pruning deque for timestamps
+		self.max_age = max_age
+		self.last_update = time.time()
+	
+	def add_observation(self, frame_id: int, timestamp: float) -> bool:
+		"""Add observation and return True if threshold is newly met."""
+		was_met = len(self.frame_ids) >= 3
+		self.frame_ids.add(frame_id)
+		self.observation_count += 1
+		self.timestamps.append(timestamp)
+		self.last_update = timestamp
+		now_met = len(self.frame_ids) >= 3
+		return now_met and not was_met  # Return True if newly crossed threshold
+	
+	def prune_old_observations(self, current_time: float):
+		"""Remove observations older than max_age. Note: frame_ids are kept for efficiency."""
+		cutoff_time = current_time - self.max_age
+		# Remove old timestamps from deque (already auto-pruned by maxlen)
+		# For frame_ids, we keep them since they're just integers and don't take much space
+		# The age check is done during counting, not storage
+		pass
+	
+	def get_unique_frame_count(self) -> int:
+		"""Get count of unique frames (O(1) operation)."""
+		return len(self.frame_ids)
+	
+	def get_observation_count(self) -> int:
+		"""Get total observation count."""
+		return self.observation_count
+	
+	def is_recent(self, current_time: float) -> bool:
+		"""Check if tracker has recent observations."""
+		return (current_time - self.last_update) <= self.max_age
+
+
+class _ZeroImageEncoder:
+	def __init__(self, embed_dim: int, device: str):
+		self.embed_dim = embed_dim
+		self.device = device
+
+	def encode_image_to_vector(self, rgb_img: torch.Tensor) -> torch.Tensor:
+		batch = rgb_img.shape[0]
+		return torch.zeros(batch, self.embed_dim, device=rgb_img.device, dtype=rgb_img.dtype)
+
+	def encode_image_to_feat_map(self, rgb_img: torch.Tensor) -> torch.Tensor:
+		batch, _, h, w = rgb_img.shape
+		return torch.zeros(batch, self.embed_dim, h, w, device=rgb_img.device, dtype=rgb_img.dtype)
+
+	def align_spatial_features_with_language(self, feat: torch.Tensor) -> torch.Tensor:
+		return feat
+
+
 class SemanticDepthOctoMapNode(Node):
-	"""Simplified semantic depth octomap node using helpers."""
+	"""Simplified semantic depth VDB mapping node using RayFronts SemanticRayFrontiersMap."""
 
 	def __init__(self):
-		super().__init__('semantic_depth_octomap_node')
+		super().__init__('semantic_depth_vdb_mapping_node')
+		self.get_logger().set_level(LoggingSeverity.WARN)
 
 		# Professional startup message
 		self.get_logger().info("=" * 60)
-		self.get_logger().info("SEMANTIC OCTOMAP SYSTEM INITIALIZING")
+		self.get_logger().info("SEMANTIC VDB MAPPING SYSTEM INITIALIZING")
 		self.get_logger().info("=" * 60)
+
+		if not VDB_AVAILABLE:
+			self.get_logger().error("RayFronts VDB not available! Please check installation.")
+			return
 
 		# Parameters
 		self.declare_parameters('', [
@@ -72,7 +142,7 @@ class SemanticDepthOctoMapNode(Node):
 			('pose_topic', '/robot_1/sensors/front_stereo/pose'),
 			('map_frame', 'map'),
 			('voxel_resolution', 0.1),
-			('max_range', 5.0),
+			('max_range', 1.5),
 			('min_range', 0.1),
 			('probability_hit', 0.7),
 			('probability_miss', 0.4),
@@ -96,7 +166,6 @@ class SemanticDepthOctoMapNode(Node):
 			('bridge_queue_process_interval', 0.1),
 			('enable_voxel_mapping', True),
 			('sync_buffer_seconds', 2.0),
-			# New: inactivity detection and export
 			('inactivity_threshold_seconds', 2.5),
 			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers'),
 			('mapping_config_path', ''),
@@ -131,6 +200,160 @@ class SemanticDepthOctoMapNode(Node):
 
 		# Load topic configuration from mapping config
 		self.load_topic_configuration()
+		
+		# Initialize state variables
+		self.bridge = CvBridge()
+		self.camera_intrinsics = None
+		self.latest_pose = None
+		self.last_marker_pub = 0.0
+		self.last_stats_pub = 0.0
+		self.last_data_time = time.time()
+		self.semantic_pcd_exported = False
+		
+		# Timestamped buffers for sync
+		self.depth_buffer = []
+		self.pose_buffer = []
+		self.mask_buffer = []
+		self.sync_buffer_duration = float(self.sync_buffer_seconds)
+		self.sync_lock = threading.Lock()
+		
+		# GP fitting state
+		self.gp_fit_lock = threading.Lock()
+		self.gp_fitting_active = False
+		self.global_gp_params = None
+		self.last_gp_update_time = 0.0
+		self.gp_update_interval = 1.0
+		self.gp_computation_thread = None
+		self.gp_thread_lock = threading.Lock()
+		self.gp_thread_running = False
+		self.min_radius = 0.5
+		self.max_radius = 2.0
+		self.base_radius = 1.0
+		
+		# PathManager initialization
+		self.path_manager = None
+		if PATH_MANAGER_AVAILABLE:
+			try:
+				path_config = None
+				if isinstance(self.main_config_path, str) and len(self.main_config_path) > 0:
+					import yaml
+					with open(self.main_config_path, 'r') as f:
+						cfg = yaml.safe_load(f)
+					path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
+				else:
+					try:
+						from ament_index_python.packages import get_package_share_directory
+						package_dir = get_package_share_directory('resilience')
+						default_main = os.path.join(package_dir, 'config', 'main_config.yaml')
+						import yaml
+						with open(default_main, 'r') as f:
+							cfg = yaml.safe_load(f)
+						path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
+					except Exception:
+						path_config = {}
+				self.path_manager = PathManager(self, path_config)
+				self.get_logger().info("PathManager initialized for nominal path access (non-blocking)")
+			except Exception as e:
+				self.get_logger().warn(f"Failed to initialize PathManager: {e}")
+		
+		# Queue system for bridge messages
+		self.bridge_message_queue = []
+		self.bridge_queue_lock = threading.Lock()
+		self.max_queue_size = int(self.bridge_queue_max_size)
+		self.queue_processing_interval = float(self.bridge_queue_process_interval)
+		self.last_queue_process_time = 0.0
+		self._latest_pose_rays = None  # (origin_world np.array(3,), dirs np.array(N,3))
+		
+		# Initialize unified VDB mapper (occupancy + frontiers + rays)
+		self._initialize_vdb_mapper()
+		
+		# Create alias for backward compatibility
+		self.rf_sem_map = self.vdb_mapper
+		
+		# Semantic voxel tracking with RayFronts-style confidence accumulation
+		self.semantic_voxels = {}  # voxel_key -> {'vlm_answer': str, 'similarity': float, 'timestamp': float, 'position': np.array, 'confidence': float}
+		self.semantic_voxels_lock = threading.Lock()
+		
+		# Improved data structure for incremental processing:
+		# voxel_key -> {vlm_answer: VoxelObservationTracker}
+		# VoxelObservationTracker tracks frame_ids (set) and observation_count incrementally
+		self.semantic_voxel_observations = defaultdict(dict)  # voxel_key -> {vlm_answer: VoxelObservationTracker}
+		self.narration_confirmation_threshold = 1  # Narration: instant confirmation (1 frame)
+		self.operational_confirmation_threshold = 3  # Operational: need 3 different frames
+		self.semantic_observation_max_age = 5.0  # Keep observations for 5 seconds
+		self.frame_counter = 0  # Track unique frames for operational hotspots
+		
+		# Cache for spatial neighbor lookups (precomputed for efficiency)
+		self._neighbor_cache = {}  # voxel_key -> set of neighbor keys
+		
+		# Periodic cleanup for old observations
+		self._last_cleanup_time = time.time()
+		self._cleanup_interval = 10.0  # Clean up every 10 seconds
+		# Accumulated pose-ray bins (match RayFronts behavior)
+		self.pose_rays_orig_angles = None
+		self.pose_rays_feats_cnt = None
+		
+		# Load existing embeddings
+		if isinstance(self.buffers_directory, str) and len(self.buffers_directory) > 0:
+			self.get_logger().info(f"Buffers directory: {self.buffers_directory}")
+		
+		# Simple GP visualization
+		self.get_logger().info("Simple GP visualization system initialized")
+		self._start_gp_computation_thread()
+		
+		# Precompute transforms
+		self.R_opt_to_base = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float32)
+		self.R_cam_to_base_extra = self._rpy_deg_to_rot(self.cam_to_base_rpy_deg)
+		self.t_cam_to_base_extra = np.array(self.cam_to_base_xyz, dtype=np.float32)
+		
+		# QoS
+		sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5)
+		
+		# Subscribers
+		self.create_subscription(Image, self.depth_topic, self.depth_callback, sensor_qos)
+		self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
+		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
+		if self.enable_semantic_mapping and self.enable_voxel_mapping:
+			self.create_subscription(String, self.semantic_hotspots_topic, self.semantic_hotspot_callback, 10)
+			self.create_subscription(Image, self.semantic_hotspot_mask_topic, self.semantic_hotspot_mask_callback, 10)
+		
+		# Publishers
+		self.marker_pub = self.create_publisher(MarkerArray, self.semantic_octomap_markers_topic, 10) if self.publish_markers else None
+		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
+		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
+		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
+		
+		# Registry query publishers/subscribers for real-time access
+		self.registry_query_pub = self.create_publisher(String, '/cause_registry/query', 10)
+		self.registry_response_sub = self.create_subscription(String, '/cause_registry/response', self._handle_registry_response, 10)
+		self.pending_registry_queries = {}  # query_id -> callback
+		self.registry_query_counter = 0
+		self.registry_query_lock = threading.Lock()
+		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
+		self.costmap_pub = self.create_publisher(PointCloud2, '/semantic_costmap', 10)
+		# New: frontiers and rays publishers
+		self.frontiers_pub = self.create_publisher(PointCloud2, '/vdb_frontiers', 10)
+		self.mask_frontiers_pub = self.create_publisher(PointCloud2, '/mask_frontiers', 10)
+		self.mask_rays_pub = self.create_publisher(MarkerArray, '/mask_rays', 10)
+		
+		self.get_logger().info("=" * 60)
+		self.get_logger().info("SEMANTIC VDB MAPPING SYSTEM READY")
+		self.get_logger().info("=" * 60)
+		self.get_logger().info(f"Mapping Configuration:")
+		self.get_logger().info(f"   Mapper: SemanticRayFrontiersMap (OpenVDB)")
+		self.get_logger().info(f"   Device: {self.vdb_mapper.device}")
+		self.get_logger().info(f"   Voxel resolution: {self.voxel_resolution}m")
+		self.get_logger().info(f"   Max range: {self.max_range}m")
+		self.get_logger().info(f"   Min range: {self.min_range}m")
+		self.get_logger().info(f"Feature Status:")
+		self.get_logger().info(f"   VDB occupancy mapping: ENABLED")
+		self.get_logger().info(f"   Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}")
+		self.get_logger().info(f"   VDB mapper: {'READY' if hasattr(self, 'vdb_mapper') and self.vdb_mapper is not None else 'NOT READY'}")
+		self.get_logger().info(f"Topics:")
+		self.get_logger().info(f"   Depth: {self.depth_topic}")
+		self.get_logger().info(f"   Pose: {self.pose_topic}")
+		self.get_logger().info(f"   Semantic hotspots: {self.semantic_hotspots_topic}")
+		self.get_logger().info("=" * 60)
 
 	def load_topic_configuration(self):
 		"""Load topic configuration from mapping config file."""
@@ -179,171 +402,80 @@ class SemanticDepthOctoMapNode(Node):
 			self.semantic_voxels_only_topic = '/semantic_voxels_only'
 			self.get_logger().info("Using default topic configuration")
 
-		# State
-		self.bridge = CvBridge()
-		self.camera_intrinsics = None
-		self.latest_pose = None
-		self.last_marker_pub = 0.0
-		self.last_stats_pub = 0.0
-		# Inactivity detection state
-		self.last_data_time = time.time()
-		self.semantic_pcd_exported = False
-
-		# Timestamped buffers for sync
-		self.depth_buffer = []  # list of tuples (timestamp_float, depth_np_float_meters)
-		self.pose_buffer = []   # list of tuples (timestamp_float, PoseStamped)
-		self.mask_buffer = []   # list of tuples (timestamp_float, merged_mask_rgb_uint8)
-		self.sync_buffer_duration = float(self.sync_buffer_seconds)
-		self.sync_lock = threading.Lock()
-
-		# GP fitting state
-		self.gp_fit_lock = threading.Lock()
-		self.gp_fitting_active = False
-
-		# Simple GP state - use same parameters for all semantic voxels
-		self.global_gp_params = None  # Will store the latest GP parameters
-		self.last_gp_update_time = 0.0
-		self.gp_update_interval = 1.0  # Update every 1 second
-		
-		# GP computation thread
-		self.gp_computation_thread = None
-		self.gp_thread_lock = threading.Lock()
-		self.gp_thread_running = False
-		
-		# Adaptive radius parameters
-		self.min_radius = 0.5  # Minimum radius around voxels
-		self.max_radius = 2.0  # Maximum radius around voxels
-		self.base_radius = 1.0  # Base radius for computation
-
-		# Optional: initialize PathManager for accessing global path (non-blocking)
-		self.path_manager = None
-		if PATH_MANAGER_AVAILABLE:
-			try:
-				# Load path_mode config from main config
-				path_config = None
-				if isinstance(self.main_config_path, str) and len(self.main_config_path) > 0:
-					import yaml
-					with open(self.main_config_path, 'r') as f:
-						cfg = yaml.safe_load(f)
-					path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
-				else:
-					try:
-						from ament_index_python.packages import get_package_share_directory
-						package_dir = get_package_share_directory('resilience')
-						default_main = os.path.join(package_dir, 'config', 'main_config.yaml')
-						import yaml
-						with open(default_main, 'r') as f:
-							cfg = yaml.safe_load(f)
-						path_config = cfg.get('path_mode', {}) if isinstance(cfg, dict) else {}
-					except Exception:
-						path_config = {}
-				self.path_manager = PathManager(self, path_config)
-				self.get_logger().info("PathManager initialized for nominal path access (non-blocking)")
-				# Announce nominal source preference at startup
-				if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
-					self.get_logger().info(f"Nominal source preference: GLOBAL PATH via PathManager when available; fallback FILE: {self.nominal_path}")
-				else:
-					self.get_logger().info("Nominal source preference: GLOBAL PATH via PathManager; no file fallback provided")
-			except Exception as e:
-				self.get_logger().warn(f"Failed to initialize PathManager: {e}")
-				if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
-					self.get_logger().info(f"Nominal source: FILE only: {self.nominal_path}")
-				else:
-					self.get_logger().warn("Nominal source: NONE available (no PathManager, no file)")
-		else:
-			# No PathManager available
-			if isinstance(self.nominal_path, str) and len(self.nominal_path) > 0:
-				self.get_logger().info(f"Nominal source: FILE only: {self.nominal_path}")
-			else:
-				self.get_logger().warn("Nominal source: NONE available (PathManager not available, no file path)")
-
-		# Queue system for bridge messages
-		self.bridge_message_queue = []
-		self.bridge_queue_lock = threading.Lock()
-		self.max_queue_size = int(self.bridge_queue_max_size)
-		self.queue_processing_interval = float(self.bridge_queue_process_interval)
-		self.last_queue_process_time = 0.0
-
-		# Initialize voxel mapping helper
-		if not HELPERS_AVAILABLE:
-			self.get_logger().error("VoxelMappingHelper not available!")
-			return
-
-		self.voxel_helper = VoxelMappingHelper(
-			voxel_resolution=float(self.voxel_resolution),
-			probability_hit=float(self.prob_hit),
-			probability_miss=float(self.prob_miss),
-			occupancy_threshold=float(self.occ_thresh),
-			embedding_dim=int(self.embedding_dim),
-			enable_semantic_mapping=bool(self.enable_semantic_mapping),
-			semantic_similarity_threshold=float(self.semantic_similarity_threshold),
-			map_frame=str(self.map_frame),
-			verbose=False
-		)
-
-		# Load existing embeddings
-		if isinstance(self.buffers_directory, str) and len(self.buffers_directory) > 0:
-			loaded = self.voxel_helper.load_vlm_embeddings_from_buffers(self.buffers_directory)
-			if loaded > 0:
-				self.get_logger().info(f"Loaded {loaded} VLM embeddings from buffers")
-
-		# Simple GP visualization - no complex superposition needed
-		self.get_logger().info("Simple GP visualization system initialized")
-		
-		# Start GP computation thread
-		self._start_gp_computation_thread()
-
-		# Precompute transforms
-		self.R_opt_to_base = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float32)
-		self.R_cam_to_base_extra = self._rpy_deg_to_rot(self.cam_to_base_rpy_deg)
-		self.t_cam_to_base_extra = np.array(self.cam_to_base_xyz, dtype=np.float32)
-
-		# QoS
-		sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5)
-
-		# Subscribers
-		self.create_subscription(Image, self.depth_topic, self.depth_callback, sensor_qos)
-		self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
-		self.create_subscription(PoseStamped, self.pose_topic, self.pose_callback, 10)
-		# Subscribe to semantic hotspots and mask image
-		if self.enable_semantic_mapping and self.enable_voxel_mapping:
-			self.create_subscription(String, self.semantic_hotspots_topic, self.semantic_hotspot_callback, 10)
-			self.create_subscription(Image, self.semantic_hotspot_mask_topic, self.semantic_hotspot_mask_callback, 10)
-
-		# Publishers
-		self.marker_pub = self.create_publisher(MarkerArray, self.semantic_octomap_markers_topic, 10) if self.publish_markers else None
-		self.stats_pub = self.create_publisher(String, self.semantic_octomap_stats_topic, 10) if self.publish_stats else None
-		self.cloud_pub = self.create_publisher(PointCloud2, self.semantic_octomap_colored_cloud_topic, 10) if self.publish_colored_cloud else None
-		self.semantic_only_pub = self.create_publisher(PointCloud2, self.semantic_voxels_only_topic, 10) if self.publish_colored_cloud else None
-		# GP visualization and costmap publishers
-		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
-		self.costmap_pub = self.create_publisher(PointCloud2, '/semantic_costmap', 10)
-
-		self.get_logger().info("=" * 60)
-		self.get_logger().info("SEMANTIC OCTOMAP SYSTEM READY")
-		self.get_logger().info("=" * 60)
-		
-		self.get_logger().info(f"Mapping Configuration:")
-		self.get_logger().info(f"   Voxel resolution: {self.voxel_resolution}m")
-		self.get_logger().info(f"   Max range: {self.max_range}m")
-		self.get_logger().info(f"   Min range: {self.min_range}m")
-		
-		self.get_logger().info(f"Feature Status:")
-		self.get_logger().info(f"   Voxel mapping: {'ENABLED' if self.enable_voxel_mapping else 'DISABLED'}")
-		self.get_logger().info(f"   Semantic mapping: {'ENABLED' if self.enable_semantic_mapping else 'DISABLED'}")
-		self.get_logger().info(f"   Voxel helper: {'READY' if hasattr(self, 'voxel_helper') and self.voxel_helper is not None else 'NOT READY'}")
-		
-		self.get_logger().info(f"Topics:")
-		self.get_logger().info(f"   Depth: {self.depth_topic}")
-		self.get_logger().info(f"   Pose: {self.pose_topic}")
-		self.get_logger().info(f"   Semantic hotspots: {self.semantic_hotspots_topic}")
-		
-		self.get_logger().info("=" * 60)
-
-		# Timer for inactivity detection (non-intrusive)
+	def _initialize_vdb_mapper(self):
+		"""Initialize the RayFronts VDB occupancy mapper with noise-robust parameters."""
+		try:
+			# Create dummy intrinsics (will be updated when camera info is received)
+			dummy_intrinsics = torch.tensor([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+			
+			# Initialize SemanticRayFrontiersMap as the primary VDB mapper
+			# This includes occupancy, frontiers, and rays all in one
+			self.vdb_mapper = SemanticRayFrontiersMap(
+				intrinsics_3x3=dummy_intrinsics,
+				device=("cuda" if torch.cuda.is_available() else "cpu"),
+				visualizer=None,
+				clip_bbox=None,
+				encoder=None,
+				feat_compressor=None,
+				interp_mode="bilinear",
+				max_pts_per_frame=2000,  # Increased for better coverage
+				vox_size=float(self.voxel_resolution),
+				vox_accum_period=2,  # Accumulate over 2 frames for smoother updates
+				max_empty_pts_per_frame=2000,  # Increased for better free space clearing
+				max_rays_per_frame=2000,
+				max_depth_sensing=1.5,  # 1.5m for voxelization and frontiers
+				max_empty_cnt=8,  # Increased: require more evidence before removing voxels (reduces flicker)
+				max_occ_cnt=7,  # Increased: require more confirmation before marking occupied (reduces noise)
+				occ_observ_weight=3,  # Reduced: less aggressive updates per observation (smoother)
+				occ_thickness=3,  # Increased: thicker occupied surface (more robust)
+				occ_pruning_tolerance=5,  # Increased: more forgiving pruning (keeps stable voxels)
+				occ_pruning_period=3,  # Increased: prune less frequently (more stable map)
+				sem_pruning_thresh=0,
+				sem_pruning_period=1,
+				fronti_neighborhood_r=1,
+				fronti_min_unobserved=4,
+				fronti_min_empty=2,
+				fronti_min_occupied=0,
+				fronti_subsampling=4,
+				fronti_subsampling_min_fronti=10,
+				ray_accum_period=1,
+				ray_accum_phase=0,
+				angle_bin_size=30.0,
+				ray_erosion=1,
+				ray_tracing=True,
+				global_encoding=True,
+				zero_depth_mode=False,
+				infer_direction=False,
+			)
+			
+			# Set dummy encoder for SemanticRayFrontiersMap
+			if self.vdb_mapper is not None:
+				self.vdb_mapper.encoder = _ZeroImageEncoder(self.embedding_dim, self.vdb_mapper.device)
+			
+			self.get_logger().info(f"VDB SemanticRayFrontiersMap initialized (device: {self.vdb_mapper.device})")
+			self.get_logger().info(f"Unified mapper settings:")
+			self.get_logger().info(f"   Max depth sensing: 1.5m (voxelization and frontiers)")
+			self.get_logger().info(f"   Empty count: 8 (stable free space)")
+			self.get_logger().info(f"   Occupied count: 7 (confirmed occupancy)")
+			self.get_logger().info(f"   Observation weight: 3 (smooth updates)")
+			self.get_logger().info(f"   Surface thickness: 3 voxels (robust surfaces)")
+			
+		except Exception as e:
+			self.get_logger().error(f"Failed to initialize VDB mapper: {e}")
+			import traceback
+			traceback.print_exc()
+			raise
 
 	def camera_info_callback(self, msg: CameraInfo):
 		if self.camera_intrinsics is None:
+			# Update VDB mapper intrinsics
+			intrinsics = torch.tensor([
+				[msg.k[0], msg.k[1], msg.k[2]],
+				[msg.k[3], msg.k[4], msg.k[5]],
+				[msg.k[6], msg.k[7], msg.k[8]]
+			], dtype=torch.float32)
+			
+			self.vdb_mapper.intrinsics_3x3 = intrinsics.to(self.vdb_mapper.device)
 			self.camera_intrinsics = [msg.k[0], msg.k[4], msg.k[2], msg.k[5]]
 			self.get_logger().info(f"Camera intrinsics set: fx={msg.k[0]:.2f}, fy={msg.k[4]:.2f}")
 		# Update activity
@@ -376,24 +508,33 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().warn(f"Failed to buffer hotspot mask image: {e}")
 
 	def semantic_hotspot_callback(self, msg: String):
-		"""Process semantic hotspot metadata immediately (incremental processing)."""
+		"""Queue incoming semantic hotspot metadata for batch processing."""
 		try:
 			if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
 				return
 			
-			# OPTIMIZATION: Process immediately in background thread instead of queuing
-			# This makes processing incremental and avoids queue buildup
-			threading.Thread(
-				target=self._process_single_bridge_message,
-				args=(msg.data,),
-				daemon=True
-			).start()
+			# Add message to queue with timestamp
+			with self.bridge_queue_lock:
+				# Prevent queue from growing too large
+				if len(self.bridge_message_queue) >= self.max_queue_size:
+					# Remove oldest message
+					self.bridge_message_queue.pop(0)
+					self.get_logger().warn(f"Bridge message queue full, dropped oldest message")
+				
+				# Add new message with timestamp
+				self.bridge_message_queue.append({
+					'msg_data': msg.data,
+					'received_time': time.time()
+				})
+				
+				queue_size = len(self.bridge_message_queue)
 			
+			self.get_logger().info(f"Queued hotspot message (queue size: {queue_size})")
 			# Update activity
 			self.last_data_time = time.time()
 			
 		except Exception as e:
-			self.get_logger().error(f"Error processing semantic hotspot message: {e}")
+			self.get_logger().error(f"Error queuing semantic hotspot message: {e}")
 			import traceback
 			traceback.print_exc()
 	
@@ -569,35 +710,144 @@ class SemanticDepthOctoMapNode(Node):
 				self.get_logger().warn("Failed to project hotspot points to world coordinates")
 				return False
 			
-			# Range filter
+			# Range filter for semantic updates (keep raw points for ray casting)
 			origin = self._pose_position(pose)
 			dist = np.linalg.norm(points_world - origin, axis=1)
 			mask_range = (dist >= float(self.min_range)) & (dist <= float(self.max_range))
-			points_world = points_world[mask_range]
+			points_world_near = points_world[mask_range]
+			if points_world_near.size == 0:
+				self.get_logger().debug("Hotspot points beyond semantic max_range; skipping semantic voxel update but continuing with ray casting")
 			
-			if points_world.size == 0:
-				self.get_logger().warn("All hotspot points filtered out by range constraints")
-				return False
-			
-			# Update voxel map with hotspot points
-			if is_narration:
+			# Update VDB map with hotspot points for semantic voxels (only if within range)
+			if is_narration and points_world_near.size > 0:
 				# Save PCD to the specific buffer directory if buffer_id is provided
-				
-				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world)
+				if buffer_id:
+					buffer_dir = self._save_narration_pcd_to_specific_buffer(buffer_id, points_world_near)
+				else:
+					buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
 				
 				# Check if poses.npy is available before starting GP fit
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
 					# Use voxelized points for GP fitting to avoid memory issues
-					voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
-					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points)
+					voxelized_points = self._voxelize_pointcloud(points_world_near, float(self.voxel_resolution), max_points=200)
+					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points, vlm_answer)
 
-			self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
+			# Update VDB map with semantic hotspot using masked depth
+			try:
+				device = self.vdb_mapper.device
+				depth_tensor = torch.from_numpy(depth_hot).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+				
+				# Create dummy RGB
+				h, w = depth_hot.shape
+				rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+				
+				# Convert pose to 4x4 matrix
+				pose_4x4 = self._pose_to_4x4_matrix(pose)
+				
+				# Process with VDB mapper for semantic occupancy
+				update_info = self.vdb_mapper.process_posed_rgbd(
+					rgb_img=rgb_tensor,
+					depth_img=depth_tensor,
+					pose_4x4=pose_4x4
+				)
+			except Exception as e:
+				self.get_logger().warn(f"VDB semantic mapping error: {e}")
 
-			self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats)
-			
+			# Use SemanticRayFrontiersMap to compute mask-specific frontiers and rays beyond max_range
+			try:
+				if self.vdb_mapper is not None:
+					# Prepare masked depth for rays-only beyond max_range
+					depth_for_rays = np.zeros_like(depth_hot, dtype=np.float32)
+					masked = (mask > 0)
+					if depth_m.shape != depth_for_rays.shape:
+						depth_resized_full = cv2.resize(depth_m, (depth_for_rays.shape[1], depth_for_rays.shape[0]), interpolation=cv2.INTER_NEAREST)
+					else:
+						depth_resized_full = depth_m
+					masked_depth_vals = depth_resized_full[masked]
+					threshold = float(self.max_range)
+					beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
+					dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
+					dr[beyond_or_missing] = np.inf
+					# fill back
+					depth_for_rays[masked] = dr
+					mask_far = np.zeros_like(depth_for_rays, dtype=bool)
+					mask_far[masked] = beyond_or_missing
+					if np.any(mask_far) and self.camera_intrinsics is not None:
+						try:
+							far_v, far_u = np.where(mask_far)
+							fx, fy, cx, cy = self.camera_intrinsics
+							fx = float(fx)
+							fy = float(fy)
+							cx = float(cx)
+							cy = float(cy)
+							u = far_u.astype(np.float32)
+							v = far_v.astype(np.float32)
+							dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+							dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+							pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+							R_world_cam = pose_mat[:3, :3]
+							origin_world = pose_mat[:3, 3]
+							dir_world = dir_cam @ R_world_cam.T
+							dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+							self._latest_pose_rays = (origin_world, dir_world)
+						except Exception:
+							self._latest_pose_rays = None
+					else:
+						# Fallback: if no far pixels, still derive rays from all masked pixels (sampled)
+						try:
+							if self.camera_intrinsics is not None and np.any(masked):
+								fx, fy, cx, cy = self.camera_intrinsics
+								fx = float(fx)
+								fy = float(fy)
+								cx = float(cx)
+								cy = float(cy)
+								all_v, all_u = np.where(masked)
+								max_samples = 800
+								if all_u.shape[0] > max_samples:
+									idx = np.random.choice(all_u.shape[0], size=max_samples, replace=False)
+									all_u = all_u[idx]
+									all_v = all_v[idx]
+								u = all_u.astype(np.float32)
+								v = all_v.astype(np.float32)
+								dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+								dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+								pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+								R_world_cam = pose_mat[:3, :3]
+								origin_world = pose_mat[:3, 3]
+								dir_world = dir_cam @ R_world_cam.T
+								dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+								self._latest_pose_rays = (origin_world, dir_world)
+							else:
+								self._latest_pose_rays = None
+						except Exception:
+							self._latest_pose_rays = None
+					# Tensors
+					rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=self.vdb_mapper.device)
+					depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(self.vdb_mapper.device)
+					pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(self.vdb_mapper.device)
+					# conf_map restricts to mask
+					conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.vdb_mapper.device)
+					# Update intrinsics if available
+					if self.camera_intrinsics is not None:
+						fx, fy, cx, cy = self.camera_intrinsics
+						self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=self.vdb_mapper.device)
+					# Process rays (no encoding used due to global_encoding=True)
+					self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
+					# Publish mask-specific frontiers and rays
+					self._publish_mask_frontiers_and_rays()
+			except Exception as e:
+				self.get_logger().warn(f"Mask rays/frontiers failed: {e}")
+
+			# Apply semantic labels only if we have near-range points
+			if points_world_near.size > 0:
+				self._apply_semantic_labels_to_voxels(points_world_near, vlm_answer, threshold, stats, is_narration)
+				near_count = points_world_near.shape[0]
+			else:
+				near_count = 0
+
+			hotspot_type = "NARRATION" if is_narration else "OPERATIONAL"
 			self.get_logger().info(
-				f"Applied {len(points_world)} hotspot points to voxel map for '{vlm_answer}' "
-				f"(rgb_ts={rgb_ts:.6f}, depth_ts={used_ts[0]}, pose_ts={used_ts[1]})"
+				f"Applied hotspot processing for '{vlm_answer}' (within_range={near_count}, rgb_ts={rgb_ts:.6f}, depth_ts={used_ts[0]}, pose_ts={used_ts[1]}, type={hotspot_type})"
 			)
 			return True
 			
@@ -678,27 +928,89 @@ class SemanticDepthOctoMapNode(Node):
 
 		# Voxelize points before saving to reduce density for GP fitting
 		voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
-		arr = np.mean(voxelized_points, axis=0)
-		
+
     	# Step 1: find latest subfolder1
 		subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
 		               if os.path.isdir(os.path.join(known_folder, d))]
-
+		if not subfolders1:
+			print(f"No subfolders found inside {known_folder}")
+			return None, None
 		latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
     	# Step 2: find latest subfolder2 inside latest_subfolder1
 		subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
 		               if os.path.isdir(os.path.join(latest_subfolder1, d))]
-
+		if not subfolders2:
+			print(f"No subfolders found inside {latest_subfolder1}")
+			return None, None
 		latest_subfolder2 = max(subfolders2, key=os.path.getmtime)		
 		# Step 3: save voxelized PCD inside latest_subfolder2
 		save_path = os.path.join(latest_subfolder2, filename)
-		with open(os.path.join(latest_subfolder2, "mean_array.json"), "w") as f:
-			json.dump(arr.tolist(), f)
-		print('HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH')
 		_save_pcd(voxelized_points, save_path)
 		return latest_subfolder2, save_path
 
-	def _check_and_start_gp_fit_if_ready(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+	def _save_narration_pcd_to_specific_buffer(self, buffer_id: str, points_world: np.ndarray) -> str:
+		"""Save narration PCD to a specific buffer directory."""
+		try:
+			# Find the buffer directory by looking for the buffer_id in the buffers directory
+			buffers_base_dir = "/home/navin/ros2_ws/src/buffers"
+			
+			# Look for the latest run directory
+			run_dirs = [d for d in os.listdir(buffers_base_dir) if os.path.isdir(os.path.join(buffers_base_dir, d)) and d.startswith('run_')]
+			if not run_dirs:
+				self.get_logger().warn(f"No run directories found in {buffers_base_dir}")
+				return None
+			
+			latest_run_dir = max(run_dirs, key=lambda d: os.path.getmtime(os.path.join(buffers_base_dir, d)))
+			run_path = os.path.join(buffers_base_dir, latest_run_dir)
+			
+			# Look for the specific buffer directory
+			buffer_dir = os.path.join(run_path, buffer_id)
+			if not os.path.exists(buffer_dir):
+				self.get_logger().warn(f"Buffer directory {buffer_dir} not found")
+				return None
+			
+			# Voxelize points before saving to reduce density for GP fitting
+			voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
+			
+			# Save PCD to the specific buffer directory
+			pcd_path = os.path.join(buffer_dir, "points.pcd")
+			self._save_pcd_file(voxelized_points, pcd_path)
+			
+			self.get_logger().info(f"Saved narration PCD to specific buffer: {buffer_dir}")
+			return buffer_dir
+			
+		except Exception as e:
+			self.get_logger().error(f"Error saving narration PCD to specific buffer: {e}")
+			return None
+	
+	def _save_pcd_file(self, points: np.ndarray, out_path: str):
+		"""Save points as a binary PCD file."""
+		try:
+			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+			mask = np.isfinite(pts).all(axis=1)
+			pts = pts[mask]
+			header = (
+				"# .PCD v0.7 - Point Cloud Data file format\n"
+				"VERSION 0.7\n"
+				"FIELDS x y z\n"
+				"SIZE 4 4 4\n"
+				"TYPE F F F\n"
+				"COUNT 1 1 1\n"
+				f"WIDTH {pts.shape[0]}\n"
+				"HEIGHT 1\n"
+				"VIEWPOINT 0 0 0 1 0 0 0\n"
+				f"POINTS {pts.shape[0]}\n"
+				"DATA binary\n"
+			)
+			with open(out_path, "wb") as f:
+				f.write(header.encode("ascii"))
+				f.write(pts.astype("<f4").tobytes())
+			self.get_logger().info(f"Saved {pts.shape[0]} voxelized points to {out_path}")
+		except Exception as e:
+			self.get_logger().error(f"Error saving PCD file: {e}")
+
+
+	def _check_and_start_gp_fit_if_ready(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Check if poses.npy is available and start GP fitting if ready."""
 		try:
 			# Check if poses.npy exists in the buffer directory
@@ -719,12 +1031,12 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Both PCD and poses are available, start GP fitting
 			self.get_logger().info(f"Both PCD and poses.npy available in {buffer_dir}, starting GP fit")
-			self._start_background_gp_fit(buffer_dir, pointcloud_xyz)
+			self._start_background_gp_fit(buffer_dir, pointcloud_xyz, cause_name)
 			
 		except Exception as e:
 			self.get_logger().warn(f"Error checking GP fit readiness: {e}")
 
-	def _start_background_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+	def _start_background_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Start GP fitting in a background thread if not already running."""
 		try:
 			with self.gp_fit_lock:
@@ -732,12 +1044,12 @@ class SemanticDepthOctoMapNode(Node):
 					self.get_logger().info("GP fit already running; skipping new request")
 					return
 				self.gp_fitting_active = True
-			args = (buffer_dir, np.array(pointcloud_xyz, dtype=np.float32))
+			args = (buffer_dir, np.array(pointcloud_xyz, dtype=np.float32), cause_name)
 			threading.Thread(target=self._run_gp_fit_task, args=args, daemon=True).start()
 		except Exception as e:
 			self.get_logger().warn(f"Failed to start GP fit thread: {e}")
 
-	def _run_gp_fit_task(self, buffer_dir: str, pointcloud_xyz: np.ndarray):
+	def _run_gp_fit_task(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Run GP fitting and save parameters to buffer directory."""
 		try:
 			self.get_logger().info(f"Starting GP fit for buffer: {buffer_dir}")
@@ -794,6 +1106,10 @@ class SemanticDepthOctoMapNode(Node):
 			with open(out_path, 'w') as f:
 				json.dump(o, f, indent=2)
 			self.get_logger().info(f"Saved GP fit parameters to {out_path}")
+			
+			# Update cause registry with GP params if cause_name is available
+			if cause_name and result and 'fit' in result:
+				self._update_registry_gp_params(cause_name, buffer_dir, result['fit'])
 			
 		except Exception as e:
 			self.get_logger().error(f"GP fit task failed: {e}")
@@ -870,6 +1186,93 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error creating GP visualization: {e}")
 			import traceback
 			traceback.print_exc()
+	
+	def _update_registry_gp_params(self, cause_name: str, buffer_dir: str, fit: Dict):
+		"""Update cause registry with GP params via ROS topic query.
+		
+		First queries registry by name to get vec_id, then uses vec_id for update.
+		This ensures we're working with embedding-indexed entries, not text names.
+		"""
+		try:
+			# Step 1: Query registry by name to get vec_id
+			query_get = {
+				'type': 'get_by_name',
+				'name': cause_name
+			}
+			
+			# Store callback to handle response (use default args to avoid closure issues)
+			query_id = f"gp_update_{time.time()}_{id(self)}"
+			def make_callback(bd, f, cn):
+				return lambda resp: self._handle_gp_update_response(resp, bd, f, cn)
+			with self.registry_query_lock:
+				self.pending_registry_queries[query_id] = make_callback(buffer_dir, fit, cause_name)
+			
+			query_get['query_id'] = query_id
+			query_msg = String(data=json.dumps(query_get))
+			self.registry_query_pub.publish(query_msg)
+			self.get_logger().info(f"Querying registry for vec_id of '{cause_name}' before GP update")
+			
+		except Exception as e:
+			self.get_logger().warn(f"Failed to query registry for '{cause_name}': {e}")
+	
+	def _handle_gp_update_response(self, response: Dict, buffer_dir: str, fit: Dict, cause_name: str):
+		"""Handle registry query response and update GP params using vec_id."""
+		try:
+			if not response.get('success'):
+				self.get_logger().warn(f"Registry query failed for '{cause_name}': {response.get('message')}")
+				return
+			
+			vec_id = response.get('vec_id')
+			if not vec_id:
+				self.get_logger().warn(f"No vec_id in registry response for '{cause_name}'")
+				return
+			
+			# Step 2: Update GP params using vec_id (embedding-indexed)
+			buffer_id = os.path.basename(buffer_dir) if buffer_dir else None
+			gp_params = {
+				'lxy': fit.get('lxy'),
+				'lz': fit.get('lz'),
+				'A': fit.get('A'),
+				'b': fit.get('b'),
+				'mse': fit.get('mse'),
+				'rmse': fit.get('rmse'),
+				'mae': fit.get('mae'),
+				'r2_score': fit.get('r2_score'),
+				'timestamp': time.time(),
+				'buffer_id': buffer_id
+			}
+			
+			query_set = {
+				'type': 'set_gp',
+				'vec_id': vec_id,  # Use vec_id instead of name
+				'gp_params': gp_params
+			}
+			
+			query_msg = String(data=json.dumps(query_set))
+			self.registry_query_pub.publish(query_msg)
+			self.get_logger().info(f"Published GP params update to registry for vec_id '{vec_id}' (cause: '{cause_name}')")
+			
+		except Exception as e:
+			self.get_logger().warn(f"Failed to update registry GP params: {e}")
+	
+	def _handle_registry_response(self, msg):
+		"""Handle registry query responses and route to appropriate callbacks."""
+		try:
+			response = json.loads(msg.data)
+			query_id = response.get('query_id')
+			
+			if query_id and query_id in self.pending_registry_queries:
+				# Route to callback
+				callback = self.pending_registry_queries.pop(query_id)
+				callback(response)
+			else:
+				# No callback, just log
+				if response.get('success'):
+					self.get_logger().debug(f"Registry query succeeded: {response.get('message', 'OK')}")
+				else:
+					self.get_logger().warn(f"Registry query failed: {response.get('message', 'Unknown error')}")
+		except Exception as e:
+			self.get_logger().warn(f"Error handling registry response: {e}")
 	
 	def _load_pcd_points(self, pcd_path: str) -> np.ndarray:
 		"""Load points from PCD file."""
@@ -1409,143 +1812,202 @@ class SemanticDepthOctoMapNode(Node):
 			return grid_points
 	
 	def _get_all_semantic_voxels(self) -> List[np.ndarray]:
-		"""Get all semantic voxel positions with deduplication and revoxelization to avoid double counting."""
+		"""Return stored semantic voxel positions without further processing."""
 		try:
-			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
-				return []
-			
-			semantic_mapper = self.voxel_helper.semantic_mapper
-			semantic_voxel_positions = []
-			
-			with semantic_mapper.voxel_semantics_lock:
-				for voxel_key in semantic_mapper.voxel_semantics.keys():
-					voxel_position = self._get_voxel_center_from_key(voxel_key)
+			semantic_voxel_positions: List[np.ndarray] = []
+			with self.semantic_voxels_lock:
+				for semantic_info in self.semantic_voxels.values():
+					voxel_position = semantic_info.get('position')
 					if voxel_position is not None:
 						semantic_voxel_positions.append(voxel_position)
-			
-			if not semantic_voxel_positions:
-				return []
-			
-			# Convert to numpy array for processing
-			semantic_points = np.array(semantic_voxel_positions)
-			
-			# DEDUPLICATION: Remove duplicate voxels to avoid double counting
-			# This happens when the same semantic voxels come from both direct mapping and narration
-			deduplicated_points = self._deduplicate_semantic_voxels(semantic_points)
-			
-			# REVOXELIZATION: Maintain nearly same ratio by clustering nearby voxels
-			# This prevents misleading double points while preserving spatial distribution
-			revoxelized_points = self._revoxelize_semantic_voxels(deduplicated_points)
-			
-			self.get_logger().info(f"Semantic voxels: {len(semantic_points)} → {len(deduplicated_points)} (dedup) → {len(revoxelized_points)} (revoxelized)")
-			
-			return revoxelized_points.tolist()
-			
+			return semantic_voxel_positions
 		except Exception as e:
 			self.get_logger().error(f"Error getting semantic voxels: {e}")
 			return []
 	
-	def _deduplicate_semantic_voxels(self, semantic_points: np.ndarray) -> np.ndarray:
-		"""Remove duplicate voxels that are too close together (within voxel resolution)."""
-		try:
-			if len(semantic_points) <= 1:
-				return semantic_points
-			
-			# Use voxel resolution as the deduplication threshold
-			dedup_threshold = self.voxel_resolution * 0.5  # Half voxel resolution for safety
-			
-			# Simple deduplication: keep first occurrence of each unique voxel
-			deduplicated = []
-			used_indices = set()
-			
-			for i, point in enumerate(semantic_points):
-				if i in used_indices:
-					continue
-				
-				# Find all points within dedup_threshold of this point
-				distances = np.linalg.norm(semantic_points - point, axis=1)
-				close_indices = np.where(distances <= dedup_threshold)[0]
-				
-				# Mark all close points as used
-				used_indices.update(close_indices)
-				
-				# Add the first (representative) point
-				deduplicated.append(point)
-			
-			return np.array(deduplicated)
-			
-		except Exception as e:
-			self.get_logger().error(f"Error deduplicating semantic voxels: {e}")
-			return semantic_points
+	def _get_neighboring_voxel_keys(self, voxel_key: tuple) -> set:
+		"""Get voxel key and its 26 neighbors (3x3x3 cube) with caching."""
+		if voxel_key in self._neighbor_cache:
+			return self._neighbor_cache[voxel_key]
+		
+		vx, vy, vz = voxel_key
+		neighbors = set()
+		for dx in [-1, 0, 1]:
+			for dy in [-1, 0, 1]:
+				for dz in [-1, 0, 1]:
+					neighbors.add((vx + dx, vy + dy, vz + dz))
+		
+		# Cache result (limit cache size to prevent memory bloat)
+		if len(self._neighbor_cache) < 10000:
+			self._neighbor_cache[voxel_key] = neighbors
+		
+		return neighbors
 	
-	def _revoxelize_semantic_voxels(self, semantic_points: np.ndarray) -> np.ndarray:
-		"""Revoxelize semantic voxels to maintain nearly same ratio while avoiding double counting."""
-		try:
-			if len(semantic_points) <= 1:
-				return semantic_points
+	def _get_observation_count_with_spatial_support(self, voxel_key: tuple, vlm_answer: str, current_time: float) -> int:
+		"""Get observation count for this voxel and its spatial neighbors (incremental, O(1) per neighbor)."""
+		neighbors = self._get_neighboring_voxel_keys(voxel_key)
+		count = 0
+		
+		for nkey in neighbors:
+			if nkey in self.semantic_voxel_observations:
+				tracker = self.semantic_voxel_observations[nkey].get(vlm_answer)
+				if tracker and tracker.is_recent(current_time):
+					count += tracker.get_observation_count()
+		
+		return count
+	
+	def _get_unique_frame_count_with_spatial_support(self, voxel_key: tuple, vlm_answer: str, current_time: float) -> int:
+		"""Get unique frame count for this voxel and its spatial neighbors (incremental, uses set union)."""
+		neighbors = self._get_neighboring_voxel_keys(voxel_key)
+		all_frame_ids = set()
+		
+		for nkey in neighbors:
+			if nkey in self.semantic_voxel_observations:
+				tracker = self.semantic_voxel_observations[nkey].get(vlm_answer)
+				if tracker and tracker.is_recent(current_time):
+					all_frame_ids.update(tracker.frame_ids)
+		
+		return len(all_frame_ids)
+	
+	def _cleanup_old_observations(self, current_time: float):
+		"""Periodic cleanup of old observation trackers to prevent memory bloat."""
+		if (current_time - self._last_cleanup_time) < self._cleanup_interval:
+			return
+		
+		self._last_cleanup_time = current_time
+		
+		# Remove trackers that are too old and have no recent activity
+		voxels_to_remove = []
+		for voxel_key, vlm_trackers in self.semantic_voxel_observations.items():
+			vlm_to_remove = []
+			for vlm_answer, tracker in vlm_trackers.items():
+				if not tracker.is_recent(current_time) and len(tracker.frame_ids) == 0:
+					vlm_to_remove.append(vlm_answer)
 			
-			# Use a slightly larger voxel size for revoxelization to cluster nearby voxels
-			revoxel_size = self.voxel_resolution * 1.5  # 1.5x voxel resolution
+			# Remove old VLM trackers
+			for vlm_answer in vlm_to_remove:
+				del vlm_trackers[vlm_answer]
 			
-			# Convert points to revoxel coordinates
-			revoxel_coords = np.floor(semantic_points / revoxel_size).astype(np.int32)
-			
-			# Find unique revoxels and their indices
-			unique_revoxels, inverse_indices = np.unique(revoxel_coords, axis=0, return_inverse=True)
-			
-			# Compute centroids for each revoxel
-			revoxelized_points = []
-			for i in range(len(unique_revoxels)):
-				# Find all points belonging to this revoxel
-				voxel_mask = inverse_indices == i
-				voxel_points = semantic_points[voxel_mask]
-				
-				# Take centroid
-				centroid = np.mean(voxel_points, axis=0)
-				revoxelized_points.append(centroid)
-			
-			return np.array(revoxelized_points)
-			
-		except Exception as e:
-			self.get_logger().error(f"Error revoxelizing semantic voxels: {e}")
-			return semantic_points
-
+			# Remove voxel entry if no trackers remain
+			if len(vlm_trackers) == 0:
+				voxels_to_remove.append(voxel_key)
+		
+		# Remove empty voxel entries
+		for voxel_key in voxels_to_remove:
+			del self.semantic_voxel_observations[voxel_key]
+		
+		# Limit neighbor cache size
+		if len(self._neighbor_cache) > 10000:
+			# Remove oldest 20% of cache entries (simple FIFO approximation)
+			keys_to_remove = list(self._neighbor_cache.keys())[:2000]
+			for key in keys_to_remove:
+				del self._neighbor_cache[key]
+	
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
-									 threshold: float, stats: dict):
-		"""Apply semantic labels to voxels based on hotspot points."""
+									 threshold: float, stats: dict, is_narration: bool = False):
+		"""Apply semantic labels with incremental temporal+spatial confirmation using efficient data structures."""
 		try:
-			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
-				self.get_logger().warn("Semantic mapper not available")
-				return
+			current_time = time.time()
 			
-			semantic_mapper = self.voxel_helper.semantic_mapper
+			# Periodic cleanup of old observations
+			self._cleanup_old_observations(current_time)
+			
+			# Increment frame counter for operational hotspots
+			if not is_narration:
+				self.frame_counter += 1
 			
 			# Get voxel keys for the world points
 			voxel_keys = set()
 			for point in points_world:
-				if hasattr(self.voxel_helper, 'get_voxel_key_from_point'):
-					voxel_key = self.voxel_helper.get_voxel_key_from_point(point)
-					voxel_keys.add(voxel_key)
+				voxel_key = self._get_voxel_key_from_point(point)
+				voxel_keys.add(voxel_key)
 			
-			# Mark voxels as semantic with high confidence since they passed binary threshold
+			# Incremental processing: update observations and check thresholds immediately
+			frame_id = 0 if is_narration else self.frame_counter
+			confirmation_threshold = self.narration_confirmation_threshold if is_narration else self.operational_confirmation_threshold
 			similarity_score = stats.get('avg_similarity', threshold + 0.1)
 			
-			with semantic_mapper.voxel_semantics_lock:
+			with self.semantic_voxels_lock:
+				confirmed_count = 0
+				newly_confirmed_count = 0
+				
 				for voxel_key in voxel_keys:
-					semantic_info = {
-						'vlm_answer': vlm_answer,
-						'similarity': similarity_score,
-						'threshold_used': threshold,
-						'detection_method': 'binary_threshold_hotspot',
-						'depth_used': True,
-						'timestamp': time.time()
-					}
-					semantic_mapper.voxel_semantics[voxel_key] = semantic_info
+					# Get or create tracker for this voxel+VLM answer combination
+					if vlm_answer not in self.semantic_voxel_observations[voxel_key]:
+						self.semantic_voxel_observations[voxel_key][vlm_answer] = VoxelObservationTracker(
+							max_age=self.semantic_observation_max_age
+						)
+					
+					tracker = self.semantic_voxel_observations[voxel_key][vlm_answer]
+					
+					# Incremental update: add observation and check if threshold is newly met
+					threshold_newly_met = tracker.add_observation(frame_id, current_time)
+					
+					# Prune old observations (lightweight operation)
+					tracker.prune_old_observations(current_time)
+					
+					# Check if voxel meets confirmation threshold (incremental check)
+					if is_narration:
+						# Narration: count observations with spatial support
+						observation_count = self._get_observation_count_with_spatial_support(
+							voxel_key, vlm_answer, current_time
+						)
+						meets_threshold = observation_count >= confirmation_threshold
+						confidence = observation_count
+					else:
+						# Operational: count unique frames with spatial support (incremental)
+						unique_frames = self._get_unique_frame_count_with_spatial_support(
+							voxel_key, vlm_answer, current_time
+						)
+						meets_threshold = unique_frames >= confirmation_threshold
+						confidence = unique_frames
+					
+					# Only update if threshold is met (avoid unnecessary writes)
+					if meets_threshold:
+						# Check if this voxel was already confirmed
+						was_confirmed = (voxel_key in self.semantic_voxels and 
+										self.semantic_voxels[voxel_key].get('vlm_answer') == vlm_answer)
+						
+						semantic_info = {
+							'vlm_answer': vlm_answer,
+							'similarity': similarity_score,
+							'threshold_used': threshold,
+							'detection_method': 'binary_threshold_hotspot',
+							'depth_used': True,
+							'timestamp': current_time,
+							'position': self._get_voxel_center_from_key(voxel_key),
+							'confidence': confidence,
+							'is_narration': is_narration
+						}
+						self.semantic_voxels[voxel_key] = semantic_info
+						confirmed_count += 1
+						
+						if not was_confirmed:
+							newly_confirmed_count += 1
 			
-			self.get_logger().info(f"✓ Applied semantic labels to {len(voxel_keys)} voxels for '{vlm_answer}' - these will appear RED in the colored cloud")
+			hotspot_type = "narration" if is_narration else "operational"
+			self.get_logger().info(
+				f"Semantic observation ({hotspot_type}): {len(voxel_keys)} voxels for '{vlm_answer}', "
+				f"{confirmed_count} confirmed ({newly_confirmed_count} newly), threshold: {confirmation_threshold}"
+			)
 			
 		except Exception as e:
 			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
+			import traceback
+			traceback.print_exc()
+	
+	def _get_voxel_key_from_point(self, point) -> tuple:
+		"""Convert world point to voxel key. Handles both numpy arrays and torch tensors."""
+		# Convert torch tensor to numpy if needed
+		if torch.is_tensor(point):
+			point = point.cpu().numpy()
+		
+		# Ensure it's a numpy array
+		if not isinstance(point, np.ndarray):
+			point = np.array(point)
+		
+		voxel_coords = np.floor(point / self.voxel_resolution).astype(np.int32)
+		return tuple(voxel_coords)
 		
 	def depth_callback(self, msg: Image):
 		if self.camera_intrinsics is None:
@@ -1564,16 +2026,30 @@ class SemanticDepthOctoMapNode(Node):
 				self.depth_buffer.append((depth_time, depth_m))
 				self._prune_sync_buffers()
 			
-			# Regular mapping: project full depth using latest pose (when available)
+			# Regular VDB occupancy mapping: use VDB mapper with latest pose (when available)
 			if self.latest_pose is not None:
-				points_world, u_indices, v_indices = self._depth_to_world_points(depth_m, self.camera_intrinsics, self.latest_pose)
-				if points_world is not None and len(points_world) > 0:
-					origin = self._pose_position(self.latest_pose)
-					dist = np.linalg.norm(points_world - origin, axis=1)
-					mask = (dist >= float(self.min_range)) & (dist <= float(self.max_range))
-					points_world = points_world[mask]
-					if points_world.size > 0:
-						self.voxel_helper.update_map(points_world, origin, hit_confidences=None, voxel_embeddings=None)
+				try:
+					# Convert to torch tensors
+					device = self.vdb_mapper.device
+					depth_tensor = torch.from_numpy(depth_m).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+					
+					# Create dummy RGB (VDB needs it but we're focusing on occupancy)
+					h, w = depth_m.shape
+					rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+					
+					# Convert pose to 4x4 matrix
+					pose_4x4 = self._pose_to_4x4_matrix(self.latest_pose)
+					
+					# Process with VDB mapper for regular occupancy
+					update_info = self.vdb_mapper.process_posed_rgbd(
+						rgb_img=rgb_tensor,
+						depth_img=depth_tensor,
+						pose_4x4=pose_4x4
+					)
+					# After occupancy update, compute and publish regular frontiers
+					self._compute_and_publish_regular_frontiers()
+				except Exception as e:
+					self.get_logger().warn(f"VDB mapping error: {e}")
 			
 		except Exception as e:
 			self.get_logger().error(f"Error storing depth frame: {e}")
@@ -1581,12 +2057,68 @@ class SemanticDepthOctoMapNode(Node):
 		# Activity update
 		self.last_data_time = time.time()
 
-		# OPTIMIZATION: Queue processing removed - messages are now processed immediately
-		# No periodic batch processing needed
+		# Process queue periodically
+		current_time = time.time()
+		if (current_time - self.last_queue_process_time) >= self.queue_processing_interval:
+			self._process_bridge_message_queue()
+			self.last_queue_process_time = current_time
 
 
 		# Periodic publishing
 		self._periodic_publishing()
+
+	def _compute_and_publish_regular_frontiers(self):
+		try:
+			if self.vdb_mapper is None or self.vdb_mapper.is_empty():
+				return
+			# Derive active bbox from current occupied points
+			pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
+			if torch.is_tensor(pc_xyz_occ_size):
+				pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
+			if pc_xyz_occ_size.shape[0] == 0:
+				return
+			xyz = pc_xyz_occ_size[:, :3]
+			bbox_min = torch.from_numpy(np.min(xyz, axis=0)).float().to(self.vdb_mapper.device)
+			bbox_max = torch.from_numpy(np.max(xyz, axis=0)).float().to(self.vdb_mapper.device)
+			# Update frontiers for the whole active region
+			self.vdb_mapper.update_frontiers(bbox_min, bbox_max)
+			# Publish as PointCloud2
+			if self.vdb_mapper.frontiers is not None and self.vdb_mapper.frontiers.shape[0] > 0:
+				frontiers_np = self.vdb_mapper.frontiers.detach().cpu().numpy()
+				cloud = self._create_cloud_xyz(frontiers_np)
+				if cloud is not None:
+					self.frontiers_pub.publish(cloud)
+		except Exception as e:
+			self.get_logger().warn(f"Regular frontiers publishing failed: {e}")
+
+	def _create_cloud_xyz(self, points: np.ndarray) -> Optional[PointCloud2]:
+		try:
+			if points is None or len(points) == 0:
+				return None
+			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+			header = Header()
+			header.stamp = self.get_clock().now().to_msg()
+			header.frame_id = self.map_frame
+			cloud_data = np.empty(pts.shape[0], dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32)])
+			cloud_data['x'] = pts[:, 0]
+			cloud_data['y'] = pts[:, 1]
+			cloud_data['z'] = pts[:, 2]
+			msg = PointCloud2()
+			msg.header = header
+			msg.fields = [
+				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1)
+			]
+			msg.point_step = 12
+			msg.width = pts.shape[0]
+			msg.height = 1
+			msg.row_step = msg.point_step * msg.width
+			msg.is_dense = True
+			msg.data = cloud_data.tobytes()
+			return msg
+		except Exception:
+			return None
 
 	def _prune_sync_buffers(self):
 		"""Keep only recent entries within sync window."""
@@ -1641,75 +2173,91 @@ class SemanticDepthOctoMapNode(Node):
 			return None, None, None
 
 	def _create_semantic_colored_cloud(self, max_points: int) -> Optional[PointCloud2]:
-		"""Create a colored point cloud that shows semantic voxels with VLM answer colors."""
+		"""Create a colored point cloud that shows both regular occupancy voxels and semantic voxels."""
 		try:
-			# Get all voxels from the helper using the correct attribute
-			all_voxels = list(self.voxel_helper.voxels.keys())
-			if not all_voxels:
-				return None
-			
-			# Limit the number of points
-			if len(all_voxels) > max_points:
-				all_voxels = all_voxels[:max_points]
-			
-			# Create point cloud data
-			points = []
-			colors = []
-			semantic_count = 0
-			regular_count = 0
-			
-			# Check if semantic mapper is available
-			has_semantic_mapper = (hasattr(self.voxel_helper, 'semantic_mapper') and 
-					  self.voxel_helper.semantic_mapper is not None)
-			
-			if has_semantic_mapper:
-				semantic_mapper = self.voxel_helper.semantic_mapper
-				with semantic_mapper.voxel_semantics_lock:
-					for voxel_key in all_voxels:
-						# Get voxel center position using the correct method
-						voxel_center = self._get_voxel_center_from_key(voxel_key)
-						if voxel_center is None:
-							continue
-						
-						# Check if this voxel has semantic information
-						if voxel_key in semantic_mapper.voxel_semantics:
-							# Get VLM answer and use consistent color
-							semantic_info = semantic_mapper.voxel_semantics[voxel_key]
+			# Get occupancy voxels from VDB
+			if self.vdb_mapper.is_empty():
+				# If VDB is empty, only show semantic voxels
+				with self.semantic_voxels_lock:
+					if not self.semantic_voxels:
+						return None
+					
+					points = []
+					colors = []
+					for voxel_key, semantic_info in self.semantic_voxels.items():
+						voxel_center = semantic_info['position']
+						if voxel_center is not None:
+							points.append(voxel_center)
 							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
-							
-							# Use consistent color based on VLM answer
+							color = self._get_vlm_answer_color(vlm_answer)
+							colors.append(color)
+			else:
+				# Get occupancy data from VDB
+				pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
+				
+				# Convert to numpy if it's a torch tensor
+				if torch.is_tensor(pc_xyz_occ_size):
+					pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
+				
+				# Filter occupied voxels
+				occupied_mask = pc_xyz_occ_size[:, -2] > 0
+				occupied_points_data = pc_xyz_occ_size[occupied_mask]
+				
+				# Create point cloud data
+				points = []
+				colors = []
+				semantic_count = 0
+				regular_count = 0
+				
+				# Add regular occupancy voxels
+				for point_data in occupied_points_data:
+					point = point_data[:3]  # xyz
+					voxel_key = self._get_voxel_key_from_point(point)
+					
+					# Check if this voxel is semantic
+					with self.semantic_voxels_lock:
+						if voxel_key in self.semantic_voxels:
+							# Semantic voxel - use VLM answer color
+							semantic_info = self.semantic_voxels[voxel_key]
+							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
 							color = self._get_vlm_answer_color(vlm_answer)
 							semantic_count += 1
 						else:
-							# Regular voxel - use default color (gray)
-							color = [128, 128, 128]  # Gray for regular voxels
+							# Regular occupancy voxel - use gray
+							color = [128, 128, 128]
 							regular_count += 1
-						
-						points.append(voxel_center)
-						colors.append(color)
-			else:
-				# No semantic mapper - just create regular colored voxels
-				for voxel_key in all_voxels:
-					# Get voxel center position using the correct method
-					voxel_center = self._get_voxel_center_from_key(voxel_key)
-					if voxel_center is None:
-						continue
 					
-					# Regular voxel - use default color (gray)
-					color = [128, 128, 128]  # Gray for all voxels
-					regular_count += 1
-					
-					points.append(voxel_center)
+					points.append(point)
 					colors.append(color)
+					
+					# Limit points
+					if len(points) >= max_points:
+						break
+				
+				# Add any semantic voxels that aren't in VDB occupancy
+				with self.semantic_voxels_lock:
+					for voxel_key, semantic_info in self.semantic_voxels.items():
+						if len(points) >= max_points:
+							break
+						# Check if this semantic voxel is already added
+						voxel_center = semantic_info['position']
+						if voxel_center is not None:
+							# Simple check: if voxel_key not in occupancy voxels
+							# (This is approximate, but good enough for visualization)
+							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+							color = self._get_vlm_answer_color(vlm_answer)
+							points.append(voxel_center)
+							colors.append(color)
+							semantic_count += 1
 			
 			if not points:
 				return None
 			
 			# Log the coloring information
-			if has_semantic_mapper and semantic_count > 0:
-				self.get_logger().info(f"Creating colored cloud: {semantic_count} semantic voxels (colored by VLM answer), {regular_count} regular voxels (GRAY)")
+			if 'semantic_count' in locals() and semantic_count > 0:
+				self.get_logger().info(f"Creating VDB colored cloud: {semantic_count} semantic voxels (colored by VLM answer), {regular_count if 'regular_count' in locals() else 0} regular voxels (GRAY)")
 			else:
-				self.get_logger().info(f"Creating colored cloud: {regular_count} regular voxels (GRAY)")
+				self.get_logger().info(f"Creating VDB colored cloud: {len(points)} voxels")
 			
 			# Convert to numpy arrays
 			points_array = np.array(points, dtype=np.float32)
@@ -1808,27 +2356,122 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().warn(f"Error getting voxel center for key {voxel_key}: {e}")
 			return None
 	
-	def _create_semantic_only_cloud(self) -> Optional[PointCloud2]:
-		"""Create a point cloud containing all accumulated semantic voxels (red)."""
+	def _create_vdb_markers(self, max_markers: int) -> Optional[MarkerArray]:
+		"""Create visualization markers from VDB occupancy data."""
 		try:
-			if not hasattr(self.voxel_helper, 'semantic_mapper') or not self.voxel_helper.semantic_mapper:
+			if self.vdb_mapper.is_empty():
 				return None
 			
-			semantic_mapper = self.voxel_helper.semantic_mapper
+			# Get occupancy data from VDB
+			pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
 			
+			# Convert to numpy if it's a torch tensor
+			if torch.is_tensor(pc_xyz_occ_size):
+				pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
+			
+			# Filter occupied voxels
+			occupied_mask = pc_xyz_occ_size[:, -2] > 0
+			occupied_points = pc_xyz_occ_size[occupied_mask]
+			
+			if len(occupied_points) == 0:
+				return None
+			
+			# Limit number of markers
+			if len(occupied_points) > max_markers:
+				indices = np.random.choice(len(occupied_points), max_markers, replace=False)
+				occupied_points = occupied_points[indices]
+			
+			# Create marker array
+			marker_array = MarkerArray()
+			
+			if bool(self.use_cube_list_markers):
+				# Create single CUBE_LIST marker for all voxels
+				marker = Marker()
+				marker.header.frame_id = self.map_frame
+				marker.header.stamp = self.get_clock().now().to_msg()
+				marker.ns = "vdb_occupancy"
+				marker.id = 0
+				marker.type = Marker.CUBE_LIST
+				marker.action = Marker.ADD
+				marker.scale.x = float(self.voxel_resolution)
+				marker.scale.y = float(self.voxel_resolution)
+				marker.scale.z = float(self.voxel_resolution)
+				
+				for point_data in occupied_points:
+					p = Point()
+					p.x, p.y, p.z = float(point_data[0]), float(point_data[1]), float(point_data[2])
+					marker.points.append(p)
+					
+					# Check if semantic voxel
+					voxel_key = self._get_voxel_key_from_point(point_data[:3])
+					with self.semantic_voxels_lock:
+						if voxel_key in self.semantic_voxels:
+							# Semantic voxel - use VLM answer color
+							semantic_info = self.semantic_voxels[voxel_key]
+							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+							color_rgb = self._get_vlm_answer_color(vlm_answer)
+							color = ColorRGBA()
+							color.r, color.g, color.b, color.a = color_rgb[0]/255.0, color_rgb[1]/255.0, color_rgb[2]/255.0, 1.0
+						else:
+							# Regular voxel - gray
+							color = ColorRGBA()
+							color.r, color.g, color.b, color.a = 0.5, 0.5, 0.5, 0.8
+					marker.colors.append(color)
+				
+				marker_array.markers.append(marker)
+			else:
+				# Create individual cube markers
+				for i, point_data in enumerate(occupied_points):
+					marker = Marker()
+					marker.header.frame_id = self.map_frame
+					marker.header.stamp = self.get_clock().now().to_msg()
+					marker.ns = "vdb_occupancy"
+					marker.id = i
+					marker.type = Marker.CUBE
+					marker.action = Marker.ADD
+					marker.pose.position.x = float(point_data[0])
+					marker.pose.position.y = float(point_data[1])
+					marker.pose.position.z = float(point_data[2])
+					marker.pose.orientation.w = 1.0
+					marker.scale.x = float(self.voxel_resolution)
+					marker.scale.y = float(self.voxel_resolution)
+					marker.scale.z = float(self.voxel_resolution)
+					
+					# Check if semantic voxel
+					voxel_key = self._get_voxel_key_from_point(point_data[:3])
+					with self.semantic_voxels_lock:
+						if voxel_key in self.semantic_voxels:
+							# Semantic voxel - use VLM answer color
+							semantic_info = self.semantic_voxels[voxel_key]
+							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+							color_rgb = self._get_vlm_answer_color(vlm_answer)
+							marker.color.r, marker.color.g, marker.color.b, marker.color.a = color_rgb[0]/255.0, color_rgb[1]/255.0, color_rgb[2]/255.0, 1.0
+						else:
+							# Regular voxel - gray
+							marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.5, 0.5, 0.5, 0.8
+					
+					marker_array.markers.append(marker)
+			
+			return marker_array
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating VDB markers: {e}")
+			return None
+	
+	def _create_semantic_only_cloud(self) -> Optional[PointCloud2]:
+		"""Create a point cloud containing all accumulated semantic voxels."""
+		try:
 			# Get all accumulated semantic voxels
-			with semantic_mapper.voxel_semantics_lock:
-				semantic_voxel_keys = list(semantic_mapper.voxel_semantics.keys())
-			
-			if not semantic_voxel_keys:
-				return None
-			
-			# Create point cloud data for all accumulated semantic voxels
-			points = []
-			for voxel_key in semantic_voxel_keys:
-				voxel_center = self._get_voxel_center_from_key(voxel_key)
-				if voxel_center is not None:
-					points.append(voxel_center)
+			with self.semantic_voxels_lock:
+				if not self.semantic_voxels:
+					return None
+				
+				# Create point cloud data for all accumulated semantic voxels
+				points = []
+				for voxel_key, semantic_info in self.semantic_voxels.items():
+					voxel_center = semantic_info['position']
+					if voxel_center is not None:
+						points.append(voxel_center)
 			
 			if not points:
 				return None
@@ -1881,48 +2524,36 @@ class SemanticDepthOctoMapNode(Node):
 	def _periodic_publishing(self):
 		now = time.time()
 		
-		# OPTIMIZATION: Queue processing removed - messages are now processed immediately
-		# No periodic batch processing needed
+		# Process bridge message queue regularly
+		if (now - self.last_queue_process_time) >= self.queue_processing_interval:
+			self._process_bridge_message_queue()
+			self.last_queue_process_time = now
 		
 		if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
-			markers = self.voxel_helper.create_markers(int(self.max_markers), bool(self.use_cube_list_markers))
+			markers = self._create_vdb_markers(int(self.max_markers))
 			
-			# Fix timestamps for all markers
-			current_time = self.get_clock().now().to_msg()
-			for marker in markers.markers:
-				marker.header.stamp = current_time
-			
-			self.marker_pub.publish(markers)
-			marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
-			self.get_logger().info(f"Published {marker_count} voxel markers")
+			if markers is not None:
+				# Fix timestamps for all markers
+				current_time = self.get_clock().now().to_msg()
+				for marker in markers.markers:
+					marker.header.stamp = current_time
+				
+				self.marker_pub.publish(markers)
+				marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
+				self.get_logger().info(f"Published {marker_count} VDB voxel markers")
 			self.last_marker_pub = now
 		
 		if self.cloud_pub:
 			try:
-				# Try to create semantic-aware colored cloud first
+				# Create VDB-based semantic-aware colored cloud
 				semantic_cloud = self._create_semantic_colored_cloud(int(self.max_markers))
 				if semantic_cloud:
 					self.cloud_pub.publish(semantic_cloud)
-					self.get_logger().debug(f"Published semantic colored cloud with {len(semantic_cloud.data)//16} points")
+					self.get_logger().debug(f"Published VDB semantic colored cloud with {len(semantic_cloud.data)//16} points")
 				else:
-					# Fallback to regular colored cloud
-					self.get_logger().debug("Semantic cloud creation returned None, falling back to regular colored cloud")
-					cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
-					if cloud:
-						self.cloud_pub.publish(cloud)
-						self.get_logger().debug("Published regular colored cloud")
-					else:
-						self.get_logger().warn("Both semantic and regular colored cloud creation returned None")
+					self.get_logger().debug("VDB cloud creation returned None (map may be empty)")
 			except Exception as e:
-				self.get_logger().warn(f"Failed to create semantic colored cloud: {e}")
-				# Try fallback to regular colored cloud even if semantic failed
-				try:
-					cloud = self.voxel_helper.create_colored_cloud(int(self.max_markers))
-					if cloud:
-						self.cloud_pub.publish(cloud)
-						self.get_logger().debug("Published regular colored cloud as fallback")
-				except Exception as fallback_e:
-					self.get_logger().error(f"Both semantic and regular colored cloud creation failed: {fallback_e}")
+				self.get_logger().warn(f"Failed to create VDB colored cloud: {e}")
 		
 		# Publish semantic-only point cloud (XYZ only, no RGB)
 		if self.semantic_only_pub:
@@ -1935,26 +2566,43 @@ class SemanticDepthOctoMapNode(Node):
 				self.get_logger().warn(f"Failed to create semantic-only cloud: {e}")
 		
 		if self.stats_pub and (now - self.last_stats_pub) >= float(self.stats_publish_rate):
-			# Get statistics from voxel helper
-			stats = self.voxel_helper.get_statistics()
+			# Get statistics from VDB mapper
+			try:
+				if not self.vdb_mapper.is_empty():
+					pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
+					
+					# Convert to numpy if it's a torch tensor
+					if torch.is_tensor(pc_xyz_occ_size):
+						pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
+					
+					occupied_mask = pc_xyz_occ_size[:, -2] > 0
+					total_voxels = int(np.sum(occupied_mask))
+				else:
+					total_voxels = 0
+			except:
+				total_voxels = 0
 			
 			# Add semantic mapping status and counts
 			semantic_voxel_count = 0
 			queue_size = 0
-			if hasattr(self.voxel_helper, 'semantic_mapper') and self.voxel_helper.semantic_mapper:
-				with self.voxel_helper.semantic_mapper.voxel_semantics_lock:
-					semantic_voxel_count = len(self.voxel_helper.semantic_mapper.voxel_semantics)
+			
+			with self.semantic_voxels_lock:
+				semantic_voxel_count = len(self.semantic_voxels)
 			
 			with self.bridge_queue_lock:
 				queue_size = len(self.bridge_message_queue)
 			
-			stats['semantic_mapping'] = {
-				'enabled': self.enable_semantic_mapping,
-				'status': 'active' if self.enable_semantic_mapping else 'disabled',
-				'semantic_voxel_count': semantic_voxel_count,
-				'total_voxel_count': stats.get('total_voxels', 0),
-				'bridge_queue_size': queue_size,
-				'queue_max_size': self.max_queue_size
+			stats = {
+				'mapper_type': 'VDB OccupancyMap',
+				'total_voxels': total_voxels,
+				'voxel_resolution': float(self.voxel_resolution),
+				'semantic_mapping': {
+					'enabled': self.enable_semantic_mapping,
+					'status': 'active' if self.enable_semantic_mapping else 'disabled',
+					'semantic_voxel_count': semantic_voxel_count,
+					'bridge_queue_size': queue_size,
+					'queue_max_size': self.max_queue_size
+				}
 			}
 			
 			self.stats_pub.publish(String(data=json.dumps(stats)))
@@ -1993,6 +2641,197 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception:
 			return np.eye(3, dtype=np.float32)
 
+	def _pose_to_4x4_matrix(self, pose: PoseStamped) -> torch.Tensor:
+		"""Convert PoseStamped to 4x4 transformation matrix with proper coordinate frame handling."""
+		# Position
+		p = np.array([pose.pose.position.x, pose.pose.position.y, pose.pose.position.z], dtype=np.float32)
+		
+		# Orientation (quaternion to rotation matrix)
+		q = np.array([pose.pose.orientation.x, pose.pose.orientation.y, 
+					 pose.pose.orientation.z, pose.pose.orientation.w], dtype=np.float32)
+		R = self._quat_to_rot(q)
+		
+		# Apply coordinate frame transformation if pose is in base_link frame
+		if bool(self.pose_is_base_link):
+			# Transform from base_link to camera frame
+			# This is the inverse of the transformation used in depth projection
+			
+			# Step 1: Transform pose from base_link to camera frame
+			# Apply camera-to-base transformation (inverse)
+			p = p - self.t_cam_to_base_extra
+			R = R @ self.R_cam_to_base_extra
+			
+			# Step 2: Apply optical frame rotation (inverse)
+			if bool(self.apply_optical_frame_rotation):
+				R = R @ self.R_opt_to_base
+		
+		# Create 4x4 matrix
+		T = np.eye(4, dtype=np.float32)
+		T[:3, :3] = R
+		T[:3, 3] = p
+		
+		# Convert to tensor and move to same device as mapper
+		device = self.vdb_mapper.device
+		return torch.from_numpy(T).unsqueeze(0).to(device)  # 1x4x4
+
+	def _publish_mask_frontiers_and_rays(self):
+		try:
+			if self.vdb_mapper is None:
+				return
+			# Mask frontiers
+			if self.vdb_mapper.frontiers is not None and self.vdb_mapper.frontiers.shape[0] > 0:
+				frontiers_np = self.vdb_mapper.frontiers.detach().cpu().numpy()
+				cloud = self._create_cloud_xyz(frontiers_np)
+				if cloud is not None:
+					self.mask_frontiers_pub.publish(cloud)
+			# Rays as arrows
+			def _offset_origin(base: np.ndarray, direction: np.ndarray, idx: int) -> np.ndarray:
+				offset_dir = np.cross(direction, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+				if np.linalg.norm(offset_dir) < 1e-6:
+					offset_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+				offset_dir /= np.linalg.norm(offset_dir) + 1e-9
+				offset_mag = float(self.voxel_resolution) * 0.3 * ((idx % 5) - 2)
+				return base + offset_dir * offset_mag
+
+			if (self.vdb_mapper.global_rays_orig_angles is not None and
+				self.vdb_mapper.global_rays_orig_angles.shape[0] > 0):
+				msg = MarkerArray()
+				now = self.get_clock().now().to_msg()
+				# Publish ALL global angle rays without clustering to avoid dropping true positives
+				data = self.vdb_mapper.global_rays_orig_angles.detach().cpu().numpy()
+				length = 0.75
+				for i, row in enumerate(data):
+					x, y, z, theta_deg, phi_deg = row
+					theta = np.deg2rad(theta_deg)
+					phi = np.deg2rad(phi_deg)
+					dir_world = np.array([
+						np.cos(theta) * np.sin(phi),
+						np.sin(theta) * np.sin(phi),
+						np.cos(phi)
+					], dtype=np.float32)
+					dir_world /= np.linalg.norm(dir_world) + 1e-9
+					start = _offset_origin(np.array([x, y, z], dtype=np.float32), dir_world, i)
+					end = start + dir_world * length
+					m = Marker()
+					m.header.frame_id = self.map_frame
+					m.header.stamp = now
+					m.ns = "mask_rays_frontier"
+					m.id = i
+					m.type = Marker.ARROW
+					m.action = Marker.ADD
+					m.scale.x = float(self.voxel_resolution) * 0.4
+					m.scale.y = float(self.voxel_resolution) * 0.6
+					m.scale.z = float(self.voxel_resolution) * 0.6
+					m.color.r = 1.0
+					m.color.g = 0.3
+					m.color.b = 0.0
+					m.color.a = 0.95
+					m.points = [Point(x=float(start[0]), y=float(start[1]), z=float(start[2])),
+						Point(x=float(end[0]), y=float(end[1]), z=float(end[2]))]
+					msg.markers.append(m)
+				if len(msg.markers) > 0:
+					self.mask_rays_pub.publish(msg)
+
+			if self._latest_pose_rays is not None:
+				origin_world, dir_world = self._latest_pose_rays
+				now = self.get_clock().now().to_msg()
+				# Use the same binning method as RayFronts for consistency
+				try:
+					# Convert numpy to torch tensors
+					dirs_torch = torch.from_numpy(dir_world).float().to(self.vdb_mapper.device)
+					origin_torch = torch.from_numpy(origin_world).float().to(self.vdb_mapper.device)
+					
+					# Convert cartesian to spherical coordinates (same as RayFronts)
+					r, theta, phi = g3d.cartesian_to_spherical(
+						dirs_torch[:, 0], dirs_torch[:, 1], dirs_torch[:, 2])
+					
+					# Create ray_orig_angle format: [x, y, z, theta_deg, phi_deg]
+					ray_orig_angle = torch.cat([
+						origin_torch.repeat(dir_world.shape[0], 1),  # Duplicate origin for each ray
+						torch.rad2deg(theta).unsqueeze(-1),
+						torch.rad2deg(phi).unsqueeze(-1)
+					], dim=-1)
+					
+					# Create dummy features with uniform weights (1.0 for all)
+					dummy_feat_weights = torch.ones(ray_orig_angle.shape[0], 1, 
+						device=self.vdb_mapper.device, dtype=torch.float32)
+					
+					# Accumulate bins similar to SemanticRayFrontiersMap (weighted_mean)
+					# Use weights only (no extra features). Shape Nx1 with last column as weight.
+					weights_only = torch.ones(ray_orig_angle.shape[0], 1, device=self.vdb_mapper.device, dtype=torch.float32)
+					if self.pose_rays_orig_angles is None:
+						self.pose_rays_orig_angles, self.pose_rays_feats_cnt = g3d.bin_rays(
+							ray_orig_angle,
+							vox_size=float(self.voxel_resolution),
+							bin_size=self.vdb_mapper.angle_bin_size,
+							feat=weights_only,
+							aggregation="weighted_mean"
+						)
+					else:
+						self.pose_rays_orig_angles, self.pose_rays_feats_cnt = g3d.add_weighted_binned_rays(
+							self.pose_rays_orig_angles,
+							self.pose_rays_feats_cnt,
+							ray_orig_angle,
+							weights_only,
+							vox_size=float(self.voxel_resolution),
+							bin_size=self.vdb_mapper.angle_bin_size
+						)
+					
+					# Convert accumulated bins back to numpy for visualization
+					binned_rays_np = self.pose_rays_orig_angles.detach().cpu().numpy()
+					
+					# Extract origins and angles
+					origins_np = binned_rays_np[:, :3]
+					theta_deg = binned_rays_np[:, 3]
+					phi_deg = binned_rays_np[:, 4]
+					
+					# Convert spherical back to cartesian directions
+					theta_rad = np.deg2rad(theta_deg)
+					phi_rad = np.deg2rad(phi_deg)
+					sin_phi = np.sin(phi_rad)
+					dirs_np = np.stack([
+						np.cos(theta_rad) * sin_phi,
+						np.sin(theta_rad) * sin_phi,
+						np.cos(phi_rad)
+					], axis=1)
+					
+					# Normalize directions
+					dirs_np = dirs_np / (np.linalg.norm(dirs_np, axis=1, keepdims=True) + 1e-9)
+					
+					# Create visualization
+					length = 0.75
+					msg_pose = MarkerArray()
+					for i in range(len(binned_rays_np)):
+						start = origins_np[i]
+						end = start + dirs_np[i] * length
+						m = Marker()
+						m.header.frame_id = self.map_frame
+						m.header.stamp = now
+						m.ns = "mask_rays_pose"
+						m.id = i
+						m.type = Marker.ARROW
+						m.action = Marker.ADD
+						m.scale.x = float(self.voxel_resolution) * 0.4
+						m.scale.y = float(self.voxel_resolution) * 0.6
+						m.scale.z = float(self.voxel_resolution) * 0.6
+						m.color.r = 0.0
+						m.color.g = 0.7
+						m.color.b = 1.0
+						m.color.a = 0.95
+						m.points = [Point(x=float(start[0]), y=float(start[1]), z=float(start[2])),
+							Point(x=float(end[0]), y=float(end[1]), z=float(end[2]))]
+						msg_pose.markers.append(m)
+					
+					if len(msg_pose.markers) > 0:
+						self.mask_rays_pub.publish(msg_pose)
+						
+				except Exception as e:
+					self.get_logger().warn(f"Pose ray binning failed: {e}")
+					import traceback
+					traceback.print_exc()
+		except Exception as e:
+			self.get_logger().warn(f"Publishing mask rays/frontiers failed: {e}")
+
 
 
 
@@ -2017,3 +2856,4 @@ def main():
 
 if __name__ == '__main__':
 	main() 
+

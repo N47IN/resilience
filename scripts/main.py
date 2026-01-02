@@ -1249,7 +1249,7 @@ class ResilienceNode(Node):
                 return False
 
             # Get threshold from config
-            threshold = 0.6
+            threshold = 0.9
             if hasattr(self.naradio_processor, 'segmentation_config'):
                 threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
             

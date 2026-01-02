@@ -33,6 +33,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 import threading
 import cv2
 import os
+import bisect
 
 # Import RayFronts VDB mapping
 try:
@@ -121,8 +122,6 @@ class SemanticDepthOctoMapNode(Node):
 			('enable_semantic_mapping', True),
 			('semantic_similarity_threshold', 0.6),
 			('buffers_directory', '/home/navin/ros2_ws/src/buffers'),
-			('bridge_queue_max_size', 100),
-			('bridge_queue_process_interval', 0.1),
 			('enable_voxel_mapping', True),
 			('sync_buffer_seconds', 2.0),
 			('inactivity_threshold_seconds', 2.5),
@@ -138,7 +137,7 @@ class SemanticDepthOctoMapNode(Node):
 			'probability_miss', 'occupancy_threshold', 'publish_markers', 'publish_stats',
 			'publish_colored_cloud', 'use_cube_list_markers', 'max_markers', 'marker_publish_rate', 'stats_publish_rate',
 			'pose_is_base_link', 'apply_optical_frame_rotation', 'cam_to_base_rpy_deg', 'cam_to_base_xyz', 'embedding_dim',
-			'enable_semantic_mapping', 'semantic_similarity_threshold', 'buffers_directory', 'bridge_queue_max_size', 'bridge_queue_process_interval',
+			'enable_semantic_mapping', 'semantic_similarity_threshold', 'buffers_directory',
 			'enable_voxel_mapping', 'sync_buffer_seconds', 'inactivity_threshold_seconds', 'semantic_export_directory', 'mapping_config_path', 'nominal_path', 'main_config_path'
 		])
 
@@ -148,9 +147,9 @@ class SemanticDepthOctoMapNode(Node):
 		 self.prob_miss, self.occ_thresh, self.publish_markers, self.publish_stats, self.publish_colored_cloud,
 		 self.use_cube_list_markers, self.max_markers, self.marker_publish_rate, self.stats_publish_rate,
 		 self.pose_is_base_link, self.apply_optical_frame_rotation, self.cam_to_base_rpy_deg, self.cam_to_base_xyz,
-		 self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
-		 self.buffers_directory, self.bridge_queue_max_size, self.bridge_queue_process_interval,
-		 self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds,
+			self.embedding_dim, self.enable_semantic_mapping, self.semantic_similarity_threshold,
+			self.buffers_directory,
+			self.enable_voxel_mapping, self.sync_buffer_seconds, self.inactivity_threshold_seconds,
 		 self.semantic_export_directory, self.mapping_config_path, self.nominal_path, self.main_config_path) = [p.value for p in params]
 
 		# Read nominal path separately (optional for GP)
@@ -175,6 +174,11 @@ class SemanticDepthOctoMapNode(Node):
 		self.mask_buffer = []
 		self.sync_buffer_duration = float(self.sync_buffer_seconds)
 		self.sync_lock = threading.Lock()
+		
+		# Cache for latest buffer subfolder (avoid repeated file system calls)
+		self._cached_latest_subfolder = None
+		self._cached_subfolder_time = 0.0
+		self._subfolder_cache_ttl = 1.0  # Refresh cache every 1 second
 		
 		# GP fitting state
 		self.gp_fit_lock = threading.Lock()
@@ -215,12 +219,7 @@ class SemanticDepthOctoMapNode(Node):
 			except Exception as e:
 				self.get_logger().warn(f"Failed to initialize PathManager: {e}")
 		
-		# Queue system for bridge messages
-		self.bridge_message_queue = []
-		self.bridge_queue_lock = threading.Lock()
-		self.max_queue_size = int(self.bridge_queue_max_size)
-		self.queue_processing_interval = float(self.bridge_queue_process_interval)
-		self.last_queue_process_time = 0.0
+		# Simple event-driven processing - messages processed directly in callback
 		self._latest_pose_rays = None  # (origin_world np.array(3,), dirs np.array(N,3))
 		
 		# Initialize unified VDB mapper (occupancy + frontiers + rays)
@@ -236,9 +235,14 @@ class SemanticDepthOctoMapNode(Node):
 		# Temporal confirmation: track observations for each voxel
 		self.semantic_voxel_observations = {}  # voxel_key -> [{'vlm_answer': str, 'timestamp': float, 'frame_id': int}, ...]
 		self.narration_confirmation_threshold = 1  # Narration: instant confirmation (1 frame)
-		self.operational_confirmation_threshold = 3  # Operational: need 3 different frames
+		self.operational_confirmation_threshold = 2  # Operational: require 2 frames for noise rejection (non-blocking, incremental)
 		self.semantic_observation_max_age = 5.0  # Keep observations for 5 seconds
 		self.frame_counter = 0  # Track unique frames for operational hotspots
+		
+		# OPTIMIZED: Incremental spatial observation counts for fast threshold checks
+		# Structure: (voxel_key, vlm_answer) -> {'count': int, 'unique_frames': set, 'last_update': float}
+		# Updated incrementally when observations are added (O(1) threshold checks)
+		self.spatial_observation_counts = {}  # (voxel_key, vlm_answer) -> {'count': int, 'unique_frames': set, 'last_update': float}
 		# Accumulated pose-ray bins (match RayFronts behavior)
 		self.pose_rays_orig_angles = None
 		self.pose_rays_feats_cnt = None
@@ -373,7 +377,7 @@ class SemanticDepthOctoMapNode(Node):
 				vox_accum_period=2,  # Accumulate over 2 frames for smoother updates
 				max_empty_pts_per_frame=2000,  # Increased for better free space clearing
 				max_rays_per_frame=2000,
-				max_depth_sensing=1.5,  # 1.5m for voxelization and frontiers
+				max_depth_sensing=2.5,  # 1.5m for voxelization and frontiers
 				max_empty_cnt=8,  # Increased: require more evidence before removing voxels (reduces flicker)
 				max_occ_cnt=7,  # Increased: require more confirmation before marking occupied (reduces noise)
 				occ_observ_weight=3,  # Reduced: less aggressive updates per observation (smoother)
@@ -458,68 +462,23 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().warn(f"Failed to buffer hotspot mask image: {e}")
 
 	def semantic_hotspot_callback(self, msg: String):
-		"""Queue incoming semantic hotspot metadata for batch processing."""
+		"""Process incoming semantic hotspot metadata directly in callback."""
 		try:
 			if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
 				return
 			
-			# Add message to queue with timestamp
-			with self.bridge_queue_lock:
-				# Prevent queue from growing too large
-				if len(self.bridge_message_queue) >= self.max_queue_size:
-					# Remove oldest message
-					self.bridge_message_queue.pop(0)
-					self.get_logger().warn(f"Bridge message queue full, dropped oldest message")
-				
-				# Add new message with timestamp
-				self.bridge_message_queue.append({
-					'msg_data': msg.data,
-					'received_time': time.time()
-				})
-				
-				queue_size = len(self.bridge_message_queue)
+			# Process message directly in background thread (non-blocking)
+			threading.Thread(
+				target=self._process_single_bridge_message,
+				args=(msg.data,),
+				daemon=True
+			).start()
 			
-			self.get_logger().info(f"Queued hotspot message (queue size: {queue_size})")
 			# Update activity
 			self.last_data_time = time.time()
 			
 		except Exception as e:
-			self.get_logger().error(f"Error queuing semantic hotspot message: {e}")
-			import traceback
-			traceback.print_exc()
-	
-	def _process_bridge_message_queue(self):
-		"""Process all queued bridge messages in batch."""
-		try:
-			# Get all messages from queue
-			messages_to_process = []
-			with self.bridge_queue_lock:
-				if not self.bridge_message_queue:
-					return
-				
-				# Copy all messages and clear the queue
-				messages_to_process = self.bridge_message_queue.copy()
-				self.bridge_message_queue.clear()
-			
-			if not messages_to_process:
-				return
-			
-			self.get_logger().info(f"Processing {len(messages_to_process)} queued bridge messages")
-			
-			# Process each message
-			processed_count = 0
-			for msg_info in messages_to_process:
-				try:
-					success = self._process_single_bridge_message(msg_info['msg_data'])
-					if success:
-						processed_count += 1
-				except Exception as e:
-					self.get_logger().warn(f"Failed to process bridge message: {e}")
-			
-			self.get_logger().info(f"Successfully processed {processed_count}/{len(messages_to_process)} bridge messages")
-			
-		except Exception as e:
-			self.get_logger().error(f"Error processing bridge message queue: {e}")
+			self.get_logger().error(f"Error processing semantic hotspot message: {e}")
 			import traceback
 			traceback.print_exc()
 	
@@ -527,8 +486,10 @@ class SemanticDepthOctoMapNode(Node):
 		"""Process a single bridge message and apply to voxel map by timestamp lookup."""
 		try:
 			# Parse the JSON message
+			time_start = time.time()
 			data = json.loads(msg_data)
-			
+			json_load_time = time.time() - time_start
+			self.get_logger().warn(f"Time taken to load JSON: {json_load_time}")
 			if data.get('type') == 'merged_similarity_hotspots':
 				return self._process_merged_hotspot_message(data)
 			else:
@@ -537,6 +498,31 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().error(f"Error processing single bridge message: {e}")
 			return False
+	
+	def _precompute_color_indices(self, merged_mask: np.ndarray, vlm_info: dict) -> dict:
+		"""Pre-compute pixel indices for each color once (fixes bottleneck #1).
+		
+		Returns dict mapping vlm_answer -> (v_coords, u_coords) numpy arrays.
+		"""
+		color_to_indices = {}
+		h, w = merged_mask.shape[:2]
+		
+		# Vectorized approach: flatten and find matches
+		mask_flat = merged_mask.reshape(-1, 3)  # (H*W, 3)
+		
+		for vlm_answer, info in vlm_info.items():
+			color = np.array(info.get('color', [0, 0, 0]), dtype=np.uint8)
+			# Vectorized comparison (much faster than per-pixel loop)
+			matches = np.all(mask_flat == color, axis=1)
+			if np.any(matches):
+				indices = np.where(matches)[0]
+				v_coords = indices // w
+				u_coords = indices % w
+				color_to_indices[vlm_answer] = (v_coords, u_coords)
+			else:
+				color_to_indices[vlm_answer] = (np.array([], dtype=np.int32), np.array([], dtype=np.int32))
+		
+		return color_to_indices
 	
 	def _process_merged_hotspot_message(self, data: dict) -> bool:
 		"""Process merged hotspot metadata; fetch mask image by timestamp and apply."""
@@ -549,37 +535,60 @@ class SemanticDepthOctoMapNode(Node):
 			if rgb_timestamp <= 0.0:
 				self.get_logger().warn(f"Incomplete hotspot data (no timestamp)")
 				return False
+			start = time.time()
 			
 			# Lookup merged mask image by timestamp
 			merged_mask = self._lookup_mask(rgb_timestamp)
+			mask_lookup_time = time.time() - start
+			self.get_logger().warn(f"Time taken to lookup mask: {mask_lookup_time}")
 			if merged_mask is None:
 				self.get_logger().warn(f"No matching hotspot mask found for timestamp {rgb_timestamp:.6f}")
 				return False
 			
 			# Lookup closest depth frame and pose by timestamp
 			depth_image, pose_msg, used_ts = self._lookup_depth_and_pose(rgb_timestamp)
+			depth_lookup_time = time.time() - start - mask_lookup_time
+			self.get_logger().warn(f"Time taken to lookup depth: {depth_lookup_time}")
 			if depth_image is None or pose_msg is None:
 				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
 				return False
 			
-			# Process each VLM answer based on color
+			# OPTIMIZATION: Pre-compute color indices once (fixes bottleneck #1)
+			color_to_indices = self._precompute_color_indices(merged_mask, vlm_info)
+			
+			# Process each VLM answer using pre-computed indices
 			processed_count = 0
 			for vlm_answer, info in vlm_info.items():
-				color = info.get('color', [0, 0, 0])
-				# Create binary mask for this VLM answer based on color
-				vlm_mask = np.all(merged_mask == color, axis=2)
-				if np.any(vlm_mask):
-					success = self._process_hotspot_with_depth(
-						vlm_mask, pose_msg, depth_image, vlm_answer, 
-						info.get('hotspot_threshold', 0.6), 
-						{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
-						rgb_timestamp, used_ts, is_narration, buffer_id
-					)
-					if success:
-						processed_count += 1
-						if len(vlm_info) == 1:
-							self.get_logger().info(f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels")
+				if vlm_answer not in color_to_indices:
+					continue
+				
+				v_coords, u_coords = color_to_indices[vlm_answer]
+				if len(v_coords) == 0:
+					continue
+				
+				# Create sparse mask directly from indices (much faster than full image comparison)
+				h, w = merged_mask.shape[:2]
+				vlm_mask = np.zeros((h, w), dtype=bool)
+				vlm_mask[v_coords, u_coords] = True
+				
+				vlm_mask_time = time.time() - start - mask_lookup_time - depth_lookup_time
+				self.get_logger().debug(f"Time taken to create vlm mask: {vlm_mask_time:.4f}s (optimized)")
+				
+				success = self._process_hotspot_with_depth(
+					vlm_mask, pose_msg, depth_image, vlm_answer, 
+					info.get('hotspot_threshold', 0.6), 
+					{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
+					rgb_timestamp, used_ts, is_narration, buffer_id
+				)
+				hotspot_processing_time = time.time() - start - mask_lookup_time - depth_lookup_time - vlm_mask_time
+				self.get_logger().debug(f"Time taken to process hotspot: {hotspot_processing_time:.4f}s")
+				if success:
+					processed_count += 1
+					if len(vlm_info) == 1:
+						self.get_logger().info(f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels")
 			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots")
+			total_time = time.time() - start
+			self.get_logger().warn(f"Total time taken to process merged hotspot: {total_time}")
 			return processed_count > 0
 			
 		except Exception as e:
@@ -587,30 +596,17 @@ class SemanticDepthOctoMapNode(Node):
 			return False
 	
 	def _lookup_depth_and_pose(self, target_ts: float):
-		"""Find closest depth frame and pose to target timestamp within buffer window."""
+		"""Find closest depth frame and pose to target timestamp within buffer window using binary search."""
 		with self.sync_lock:
-			best_depth = None
-			best_pose = None
-			best_depth_dt = float('inf')
-			best_pose_dt = float('inf')
-			best_depth_ts = None
-			best_pose_ts = None
+			# Optimized binary search for depth
+			best_depth, best_depth_ts = self._binary_search_closest(
+				self.depth_buffer, target_ts, self.sync_buffer_duration
+			)
 			
-			# Find closest depth
-			for ts, depth in self.depth_buffer:
-				dt = abs(ts - target_ts)
-				if dt < best_depth_dt and dt <= self.sync_buffer_duration:
-					best_depth_dt = dt
-					best_depth = depth
-					best_depth_ts = ts
-			
-			# Find closest pose
-			for ts, pose in self.pose_buffer:
-				dt = abs(ts - target_ts)
-				if dt < best_pose_dt and dt <= self.sync_buffer_duration:
-					best_pose_dt = dt
-					best_pose = pose
-					best_pose_ts = ts
+			# Optimized binary search for pose
+			best_pose, best_pose_ts = self._binary_search_closest(
+				self.pose_buffer, target_ts, self.sync_buffer_duration
+			)
 			
 			# Return if both found
 			if best_depth is not None and best_pose is not None:
@@ -618,16 +614,65 @@ class SemanticDepthOctoMapNode(Node):
 			
 			return None, None, (None, None)
 	
-	def _lookup_mask(self, target_ts: float) -> Optional[np.ndarray]:
-		"""Find closest merged mask image to target timestamp within buffer window."""
-		with self.sync_lock:
-			best_mask = None
+	def _binary_search_closest(self, buffer: List, target_ts: float, max_dt: float):
+		"""Binary search to find closest timestamp entry in sorted buffer. Returns (data, timestamp) or (None, None).
+		
+		Optimized O(log n) lookup using numpy's searchsorted for better performance.
+		"""
+		if not buffer:
+			return None, None
+		
+		# Fast path: if buffer is very small, linear search is faster
+		if len(buffer) < 5:
+			best_data = None
+			best_ts = None
 			best_dt = float('inf')
-			for ts, mask in self.mask_buffer:
+			for ts, data in buffer:
 				dt = abs(ts - target_ts)
-				if dt < best_dt and dt <= self.sync_buffer_duration:
+				if dt < best_dt and dt <= max_dt:
 					best_dt = dt
-					best_mask = mask
+					best_data = data
+					best_ts = ts
+			return best_data, best_ts
+		
+		# Use numpy for efficient timestamp extraction and binary search
+		# Convert to numpy array once - much faster than list comprehension for large buffers
+		timestamps = np.array([ts for ts, _ in buffer], dtype=np.float64)
+		
+		# Use numpy's searchsorted - optimized C implementation, faster than bisect for numpy arrays
+		idx = np.searchsorted(timestamps, target_ts, side='left')
+		
+		# Check candidate positions: idx-1, idx (if exists)
+		best_data = None
+		best_ts = None
+		best_dt = float('inf')
+		
+		# Check element at idx (if exists)
+		if idx < len(buffer):
+			ts, data = buffer[idx]
+			dt = abs(ts - target_ts)
+			if dt < best_dt and dt <= max_dt:
+				best_dt = dt
+				best_data = data
+				best_ts = ts
+		
+		# Check element before idx (if exists)
+		if idx > 0:
+			ts, data = buffer[idx - 1]
+			dt = abs(ts - target_ts)
+			if dt < best_dt and dt <= max_dt:
+				best_dt = dt
+				best_data = data
+				best_ts = ts
+		
+		return best_data, best_ts
+	
+	def _lookup_mask(self, target_ts: float) -> Optional[np.ndarray]:
+		"""Find closest merged mask image to target timestamp within buffer window using binary search."""
+		with self.sync_lock:
+			best_mask, _ = self._binary_search_closest(
+				self.mask_buffer, target_ts, self.sync_buffer_duration
+			)
 			return best_mask
 	
 	def _process_hotspot_with_depth(self, mask: np.ndarray, pose: PoseStamped, depth_m: np.ndarray,
@@ -639,156 +684,88 @@ class SemanticDepthOctoMapNode(Node):
 				return False
 			
 			# Get hotspot pixel coordinates
-			hotspot_coords = np.where(mask > 0)
-			if len(hotspot_coords[0]) == 0:
+			v_coords, u_coords = np.where(mask > 0)
+			if len(u_coords) == 0:
 				self.get_logger().warn("No hotspot pixels found in mask")
 				return False
 			
-			# Build a depth image using only hotspot pixels (others zero)
+			# Extract only hotspot pixels from depth (no full array creation)
 			h, w = mask.shape
-			depth_hot = np.zeros((h, w), dtype=np.float32)
-			# Ensure depth_m shape matches mask; if not, resize
 			if depth_m.shape != (h, w):
 				depth_resized = cv2.resize(depth_m, (w, h), interpolation=cv2.INTER_NEAREST)
-				depth_hot[hotspot_coords] = depth_resized[hotspot_coords]
+				depth_values = depth_resized[v_coords, u_coords]
 			else:
-				depth_hot[hotspot_coords] = depth_m[hotspot_coords]
+				depth_values = depth_m[v_coords, u_coords]
 			
-			# Convert depth hotspots to world points
-			points_world, u_indices, v_indices = self._depth_to_world_points(depth_hot, self.camera_intrinsics, pose)
+			# Filter valid depth values
+			valid_mask = np.isfinite(depth_values) & (depth_values > 0.0)
+			if not np.any(valid_mask):
+				self.get_logger().warn("No valid depth values in hotspot")
+				return False
+			
+			# Only process valid hotspot pixels directly (skip meshgrid)
+			u_valid = u_coords[valid_mask]
+			v_valid = v_coords[valid_mask]
+			z_valid = depth_values[valid_mask]
+			
+			# Convert to world points using only hotspot pixels
+			points_world = self._depth_to_world_points_sparse(u_valid, v_valid, z_valid, self.camera_intrinsics, pose)
 			if points_world is None or len(points_world) == 0:
 				self.get_logger().warn("Failed to project hotspot points to world coordinates")
 				return False
 			
-			# Range filter for semantic updates (keep raw points for ray casting)
+			if points_world is None or len(points_world) == 0:
+				self.get_logger().warn("Failed to project hotspot points to world coordinates")
+				return False
+			
+			# Range filter using squared distance (faster than norm)
 			origin = self._pose_position(pose)
-			dist = np.linalg.norm(points_world - origin, axis=1)
-			mask_range = (dist >= float(self.min_range)) & (dist <= float(self.max_range))
+			diff = points_world - origin
+			dist_sq = np.sum(diff * diff, axis=1)
+			min_range_sq = float(self.min_range) * float(self.min_range)
+			max_range_sq = 10.0 * 10.0
+			mask_range = (dist_sq >= min_range_sq) & (dist_sq <= max_range_sq)
 			points_world_near = points_world[mask_range]
 			if points_world_near.size == 0:
 				self.get_logger().debug("Hotspot points beyond semantic max_range; skipping semantic voxel update but continuing with ray casting")
 			
-			# Update VDB map with hotspot points for semantic voxels (only if within range)
+			# GP fitting for narration hotspots (background thread)
 			if is_narration and points_world_near.size > 0:
-				# Save PCD to the specific buffer directory if buffer_id is provided
-				
 				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
-				
-				# Check if poses.npy is available before starting GP fit
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
-					# Use voxelized points for GP fitting to avoid memory issues
 					voxelized_points = self._voxelize_pointcloud(points_world_near, float(self.voxel_resolution), max_points=200)
 					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points, vlm_answer)
 
-			# Update VDB map with semantic hotspot using masked depth
-			try:
-				device = self.vdb_mapper.device
-				depth_tensor = torch.from_numpy(depth_hot).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
-				
-				# Create dummy RGB
-				h, w = depth_hot.shape
-				rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
-				
-				# Convert pose to 4x4 matrix
-				pose_4x4 = self._pose_to_4x4_matrix(pose)
-				
-				# Process with VDB mapper for semantic occupancy
-				update_info = self.vdb_mapper.process_posed_rgbd(
-					rgb_img=rgb_tensor,
-					depth_img=depth_tensor,
-					pose_4x4=pose_4x4
-				)
-			except Exception as e:
-				self.get_logger().warn(f"VDB semantic mapping error: {e}")
+			# Build depth image with only hotspot pixels (same as tmp.py) - prepare for threading
+			h, w = mask.shape
+			depth_hot = np.zeros((h, w), dtype=np.float32)
+			if depth_m.shape != (h, w):
+				depth_resized = cv2.resize(depth_m, (w, h), interpolation=cv2.INTER_NEAREST)
+				depth_hot[mask > 0] = depth_resized[mask > 0]
+			else:
+				depth_hot[mask > 0] = depth_m[mask > 0]
+			
+			# Update VDB map with semantic hotspot using masked depth - run in separate thread (optimized)
+			mask_copy = mask.copy()
+			depth_hot_copy = depth_hot.copy()
+			pose_copy = PoseStamped()
+			pose_copy.header = pose.header
+			pose_copy.pose = pose.pose
+			
+			threading.Thread(
+				target=self._update_semantic_vdb_mapping,
+				args=(mask_copy, depth_hot_copy, pose_copy),
+				daemon=True
+			).start()
 
-			# Use SemanticRayFrontiersMap to compute mask-specific frontiers and rays beyond max_range
-			try:
-				if self.vdb_mapper is not None:
-					# Prepare masked depth for rays-only beyond max_range
-					depth_for_rays = np.zeros_like(depth_hot, dtype=np.float32)
-					masked = (mask > 0)
-					if depth_m.shape != depth_for_rays.shape:
-						depth_resized_full = cv2.resize(depth_m, (depth_for_rays.shape[1], depth_for_rays.shape[0]), interpolation=cv2.INTER_NEAREST)
-					else:
-						depth_resized_full = depth_m
-					masked_depth_vals = depth_resized_full[masked]
-					threshold = float(self.max_range)
-					beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
-					dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
-					dr[beyond_or_missing] = np.inf
-					# fill back
-					depth_for_rays[masked] = dr
-					mask_far = np.zeros_like(depth_for_rays, dtype=bool)
-					mask_far[masked] = beyond_or_missing
-					if np.any(mask_far) and self.camera_intrinsics is not None:
-						try:
-							far_v, far_u = np.where(mask_far)
-							fx, fy, cx, cy = self.camera_intrinsics
-							fx = float(fx)
-							fy = float(fy)
-							cx = float(cx)
-							cy = float(cy)
-							u = far_u.astype(np.float32)
-							v = far_v.astype(np.float32)
-							dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
-							dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
-							pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
-							R_world_cam = pose_mat[:3, :3]
-							origin_world = pose_mat[:3, 3]
-							dir_world = dir_cam @ R_world_cam.T
-							dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
-							self._latest_pose_rays = (origin_world, dir_world)
-						except Exception:
-							self._latest_pose_rays = None
-					else:
-						# Fallback: if no far pixels, still derive rays from all masked pixels (sampled)
-						try:
-							if self.camera_intrinsics is not None and np.any(masked):
-								fx, fy, cx, cy = self.camera_intrinsics
-								fx = float(fx)
-								fy = float(fy)
-								cx = float(cx)
-								cy = float(cy)
-								all_v, all_u = np.where(masked)
-								max_samples = 800
-								if all_u.shape[0] > max_samples:
-									idx = np.random.choice(all_u.shape[0], size=max_samples, replace=False)
-									all_u = all_u[idx]
-									all_v = all_v[idx]
-								u = all_u.astype(np.float32)
-								v = all_v.astype(np.float32)
-								dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
-								dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
-								pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
-								R_world_cam = pose_mat[:3, :3]
-								origin_world = pose_mat[:3, 3]
-								dir_world = dir_cam @ R_world_cam.T
-								dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
-								self._latest_pose_rays = (origin_world, dir_world)
-							else:
-								self._latest_pose_rays = None
-						except Exception:
-							self._latest_pose_rays = None
-					# Tensors
-					rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=self.vdb_mapper.device)
-					depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(self.vdb_mapper.device)
-					pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(self.vdb_mapper.device)
-					# conf_map restricts to mask
-					conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.vdb_mapper.device)
-					# Update intrinsics if available
-					if self.camera_intrinsics is not None:
-						fx, fy, cx, cy = self.camera_intrinsics
-						self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=self.vdb_mapper.device)
-					# Process rays (no encoding used due to global_encoding=True)
-					self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
-					# Publish mask-specific frontiers and rays
-					self._publish_mask_frontiers_and_rays()
-			except Exception as e:
-				self.get_logger().warn(f"Mask rays/frontiers failed: {e}")
-
-			# Apply semantic labels only if we have near-range points
+			# Semantic label application - run in separate thread to avoid blocking
 			if points_world_near.size > 0:
-				self._apply_semantic_labels_to_voxels(points_world_near, vlm_answer, threshold, stats, is_narration)
+				points_copy = points_world_near.copy()
+				threading.Thread(
+					target=self._update_semantic_voxels,
+					args=(points_copy, vlm_answer, threshold, stats, is_narration),
+					daemon=True
+				).start()
 				near_count = points_world_near.shape[0]
 			else:
 				near_count = 0
@@ -810,6 +787,8 @@ class SemanticDepthOctoMapNode(Node):
 		Voxelize a point cloud by taking the centroid of points within each voxel.
 		This reduces the number of points while preserving the spatial distribution.
 		If still too many points after voxelization, randomly sample down to max_points.
+		
+		OPTIMIZED: Uses vectorized numpy operations instead of Python loops.
 		"""
 		if len(points) == 0:
 			return points
@@ -817,25 +796,30 @@ class SemanticDepthOctoMapNode(Node):
 		# Convert points to voxel coordinates
 		voxel_coords = np.floor(points / voxel_size).astype(np.int32)
 		
-		# Find unique voxels and their indices
+		# Find unique voxels and their inverse indices
 		unique_voxels, inverse_indices = np.unique(voxel_coords, axis=0, return_inverse=True)
 		
-		# Compute centroids for each voxel
-		voxelized_points = []
-		for i in range(len(unique_voxels)):
-			# Find all points belonging to this voxel
-			voxel_mask = inverse_indices == i
-			voxel_points = points[voxel_mask]
-			
-			# Take centroid
-			centroid = np.mean(voxel_points, axis=0)
-			voxelized_points.append(centroid)
+		# OPTIMIZED: Vectorized centroid computation using bincount approach
+		# This avoids Python loops and boolean masking per voxel
+		num_voxels = len(unique_voxels)
 		
-		voxelized_points = np.array(voxelized_points)
+		# Compute centroids using cumsum trick for each coordinate dimension
+		voxelized_points = np.zeros((num_voxels, points.shape[1]), dtype=points.dtype)
+		voxel_counts = np.bincount(inverse_indices, minlength=num_voxels)
 		
-		# If still too many points, randomly sample down
+		# For each dimension, compute sum of points per voxel, then divide by count
+		for dim in range(points.shape[1]):
+			# Sum points per voxel using bincount
+			sums = np.bincount(inverse_indices, weights=points[:, dim], minlength=num_voxels)
+			# Avoid division by zero
+			nonzero_mask = voxel_counts > 0
+			voxelized_points[nonzero_mask, dim] = sums[nonzero_mask] / voxel_counts[nonzero_mask]
+		
+		# Random sampling if too many points (deterministic seed for reproducibility)
 		if len(voxelized_points) > max_points:
-			indices = np.random.choice(len(voxelized_points), size=max_points, replace=False)
+			# Use deterministic sampling instead of random for reproducibility
+			step = len(voxelized_points) / max_points
+			indices = np.arange(0, len(voxelized_points), step, dtype=np.int32)[:max_points]
 			voxelized_points = voxelized_points[indices]
 			self.get_logger().info(f"Voxelized {len(points)} points to {len(voxelized_points)} points (voxel_size={voxel_size:.3f}m, sampled to max {max_points})")
 		else:
@@ -877,20 +861,30 @@ class SemanticDepthOctoMapNode(Node):
 		# Voxelize points before saving to reduce density for GP fitting
 		voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
 
-    	# Step 1: find latest subfolder1
-		subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
-		               if os.path.isdir(os.path.join(known_folder, d))]
-		if not subfolders1:
-			print(f"No subfolders found inside {known_folder}")
-			return None, None
-		latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
-    	# Step 2: find latest subfolder2 inside latest_subfolder1
-		subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
-		               if os.path.isdir(os.path.join(latest_subfolder1, d))]
-		if not subfolders2:
-			print(f"No subfolders found inside {latest_subfolder1}")
-			return None, None
-		latest_subfolder2 = max(subfolders2, key=os.path.getmtime)		
+		# Use cached subfolder if available and recent
+		current_time = time.time()
+		if (self._cached_latest_subfolder is not None and 
+		    os.path.exists(self._cached_latest_subfolder) and
+		    (current_time - self._cached_subfolder_time) < self._subfolder_cache_ttl):
+			latest_subfolder2 = self._cached_latest_subfolder
+		else:
+			# Step 1: find latest subfolder1
+			subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
+			               if os.path.isdir(os.path.join(known_folder, d))]
+			if not subfolders1:
+				print(f"No subfolders found inside {known_folder}")
+				return None, None
+			latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
+			# Step 2: find latest subfolder2 inside latest_subfolder1
+			subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
+			               if os.path.isdir(os.path.join(latest_subfolder1, d))]
+			if not subfolders2:
+				print(f"No subfolders found inside {latest_subfolder1}")
+				return None, None
+			latest_subfolder2 = max(subfolders2, key=os.path.getmtime)
+			# Cache the result
+			self._cached_latest_subfolder = latest_subfolder2
+			self._cached_subfolder_time = current_time		
 		# Step 3: save voxelized PCD inside latest_subfolder2
 		save_path = os.path.join(latest_subfolder2, filename)
 		arr = np.mean(voxelized_points, axis=0)
@@ -1452,22 +1446,47 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 	
 	def _calculate_adaptive_radius(self, semantic_points: np.ndarray) -> float:
-		"""Calculate adaptive radius based on voxel density and distribution."""
+		"""Calculate adaptive radius using nearest neighbor (O(N log N) instead of O(N²))."""
 		try:
 			if len(semantic_points) < 2:
 				return self.base_radius
 			
-			# Calculate average distance between voxels
-			distances = []
-			for i in range(len(semantic_points)):
-				for j in range(i + 1, len(semantic_points)):
-					dist = np.linalg.norm(semantic_points[i] - semantic_points[j])
-					distances.append(dist)
-			
-			if len(distances) == 0:
-				return self.base_radius
-			
-			avg_distance = np.mean(distances)
+			# Use nearest neighbor distance (much faster than all pairs - fixes O(N²) bottleneck)
+			try:
+				from scipy.spatial import cKDTree
+				tree = cKDTree(semantic_points)
+				# Query for 2 nearest neighbors (self + 1 neighbor)
+				k = min(2, len(semantic_points))
+				distances, _ = tree.query(semantic_points, k=k)
+				
+				if distances.ndim == 2:
+					# Get distance to nearest neighbor (skip self)
+					nn_distances = distances[:, 1] if distances.shape[1] > 1 else distances[:, 0]
+				else:
+					# Single point case
+					nn_distances = distances if isinstance(distances, np.ndarray) else np.array([distances])
+				
+				avg_distance = np.mean(nn_distances)
+				
+			except ImportError:
+				# Fallback: sample subset of points for speed if scipy not available
+				if len(semantic_points) > 100:
+					sample_idx = np.random.choice(len(semantic_points), 100, replace=False)
+					sample_points = semantic_points[sample_idx]
+					# Compute pairwise distances for sample only
+					from scipy.spatial.distance import pdist
+					distances = pdist(sample_points)
+					avg_distance = np.mean(distances)
+				else:
+					# Small dataset, use original approach
+					distances = []
+					for i in range(len(semantic_points)):
+						for j in range(i + 1, len(semantic_points)):
+							dist = np.linalg.norm(semantic_points[i] - semantic_points[j])
+							distances.append(dist)
+					if len(distances) == 0:
+						return self.base_radius
+					avg_distance = np.mean(distances)
 			
 			# Adaptive radius: smaller for dense clusters, larger for sparse voxels
 			adaptive_radius = max(self.min_radius, min(self.max_radius, avg_distance * 0.8))
@@ -1515,20 +1534,41 @@ class SemanticDepthOctoMapNode(Node):
 			return np.array([])
 	
 	def _filter_grid_points_fast(self, grid_points: np.ndarray, voxel_positions: np.ndarray, max_distance: float) -> np.ndarray:
-		"""FAST filtering using vectorized operations."""
+		"""FAST filtering using KD-tree (O(N log M) instead of O(N*M) full distance matrix)."""
 		try:
 			if len(grid_points) == 0 or len(voxel_positions) == 0:
 				return grid_points
 			
-			# Vectorized distance computation - much faster
-			distances = np.linalg.norm(grid_points[:, np.newaxis, :] - voxel_positions[np.newaxis, :, :], axis=2)
-			min_distances = np.min(distances, axis=1)
-			
-			# Keep points within max_distance
-			mask = min_distances <= max_distance
-			filtered_points = grid_points[mask]
-			
-			return filtered_points
+			# Use KD-tree for O(N log M) instead of O(N*M) full distance matrix
+			try:
+				from scipy.spatial import cKDTree
+				# Build KD-tree once (O(M log M))
+				tree = cKDTree(voxel_positions)
+				
+				# Query all grid points (O(N log M))
+				distances, _ = tree.query(grid_points, k=1)
+				
+				# Filter points within max_distance
+				mask = distances <= max_distance
+				filtered_points = grid_points[mask]
+				
+				return filtered_points
+				
+			except ImportError:
+				# Fallback: chunked computation to avoid large memory allocation
+				chunk_size = 10000
+				mask = np.zeros(len(grid_points), dtype=bool)
+				
+				for i in range(0, len(grid_points), chunk_size):
+					chunk = grid_points[i:i+chunk_size]
+					distances = np.linalg.norm(
+						chunk[:, np.newaxis, :] - voxel_positions[np.newaxis, :, :], 
+						axis=2
+					)
+					min_distances = np.min(distances, axis=1)
+					mask[i:i+chunk_size] = min_distances <= max_distance
+				
+				return grid_points[mask]
 			
 		except Exception as e:
 			self.get_logger().error(f"Error in fast grid filtering: {e}")
@@ -1725,36 +1765,76 @@ class SemanticDepthOctoMapNode(Node):
 					neighbors.append((vx + dx, vy + dy, vz + dz))
 		return neighbors
 	
-	def _count_observations_with_spatial_support(self, voxel_key: tuple, vlm_answer: str) -> int:
-		"""Count observations for this voxel and its spatial neighbors (loose spatial consistency)."""
+	def _increment_spatial_observation_counts(self, voxel_key: tuple, vlm_answer: str, frame_id: int, timestamp: float):
+		"""OPTIMIZED: Incrementally update spatial observation counts for all 27 neighbors (including self).
+		
+		This maintains pre-computed counts so threshold checks are O(1) instead of O(neighbors * observations).
+		"""
 		neighbors = self._get_neighboring_voxel_keys(voxel_key)
-		count = 0
 		current_time = time.time()
 		
 		for nkey in neighbors:
-			if nkey in self.semantic_voxel_observations:
-				# Count recent observations with matching VLM answer
-				for obs in self.semantic_voxel_observations[nkey]:
-					if (obs['vlm_answer'] == vlm_answer and 
-					    (current_time - obs['timestamp']) <= self.semantic_observation_max_age):
-						count += 1
-		return count
+			key = (nkey, vlm_answer)
+			if key not in self.spatial_observation_counts:
+				self.spatial_observation_counts[key] = {
+					'count': 0,
+					'unique_frames': set(),
+					'last_update': current_time
+				}
+			
+			entry = self.spatial_observation_counts[key]
+			
+			# Increment count (for narration)
+			entry['count'] += 1
+			
+			# Add unique frame (for operational)
+			if frame_id is not None:
+				entry['unique_frames'].add(frame_id)
+			
+			entry['last_update'] = current_time
 	
-	def _count_unique_frames_with_spatial_support(self, voxel_key: tuple, vlm_answer: str) -> int:
-		"""Count unique frames for this voxel and its spatial neighbors (for operational hotspots)."""
-		neighbors = self._get_neighboring_voxel_keys(voxel_key)
-		unique_frames = set()
-		current_time = time.time()
+	def _cleanup_old_spatial_counts(self, current_time: float):
+		"""Periodically cleanup old entries from spatial_observation_counts."""
+		# Only cleanup if dict is getting large (avoid overhead on every call)
+		if len(self.spatial_observation_counts) < 1000:
+			return
 		
-		for nkey in neighbors:
-			if nkey in self.semantic_voxel_observations:
-				# Count unique frames with matching VLM answer
-				for obs in self.semantic_voxel_observations[nkey]:
-					if (obs['vlm_answer'] == vlm_answer and 
-					    (current_time - obs['timestamp']) <= self.semantic_observation_max_age and
-					    'frame_id' in obs):
-						unique_frames.add(obs['frame_id'])
-		return len(unique_frames)
+		# Remove entries older than max_age
+		keys_to_remove = []
+		for key, entry in self.spatial_observation_counts.items():
+			if (current_time - entry['last_update']) > self.semantic_observation_max_age:
+				keys_to_remove.append(key)
+		
+		for key in keys_to_remove:
+			del self.spatial_observation_counts[key]
+	
+	def _get_observation_count_fast(self, voxel_key: tuple, vlm_answer: str) -> int:
+		"""OPTIMIZED: Fast O(1) lookup for observation count with spatial support."""
+		key = (voxel_key, vlm_answer)
+		entry = self.spatial_observation_counts.get(key)
+		if entry is None:
+			return 0
+		
+		# Check if entry is still valid (not expired)
+		current_time = time.time()
+		if (current_time - entry['last_update']) > self.semantic_observation_max_age:
+			return 0
+		
+		return entry['count']
+	
+	def _get_unique_frames_count_fast(self, voxel_key: tuple, vlm_answer: str) -> int:
+		"""OPTIMIZED: Fast O(1) lookup for unique frames count with spatial support."""
+		key = (voxel_key, vlm_answer)
+		entry = self.spatial_observation_counts.get(key)
+		if entry is None:
+			return 0
+		
+		# Check if entry is still valid (not expired)
+		current_time = time.time()
+		if (current_time - entry['last_update']) > self.semantic_observation_max_age:
+			return 0
+		
+		return len(entry['unique_frames'])
 	
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 									 threshold: float, stats: dict, is_narration: bool = False):
@@ -1766,47 +1846,64 @@ class SemanticDepthOctoMapNode(Node):
 			if not is_narration:
 				self.frame_counter += 1
 			
-			# Get voxel keys for the world points
-			voxel_keys = set()
-			for point in points_world:
-				voxel_key = self._get_voxel_key_from_point(point)
-				voxel_keys.add(voxel_key)
+			# Vectorized voxel key computation (much faster than loop)
+			voxel_coords = np.floor(points_world / self.voxel_resolution).astype(np.int32)
+			voxel_keys = set(tuple(coord) for coord in voxel_coords)
 			
-			# Add observations to temporal buffer
+			# Add observations (cleanup only when list gets too long to avoid per-voxel overhead)
+			frame_id = 0 if is_narration else self.frame_counter
+			obs_data = {
+				'vlm_answer': vlm_answer,
+				'timestamp': current_time,
+				'frame_id': frame_id,
+				'similarity': stats.get('avg_similarity', threshold + 0.1)
+			}
+			
+			# OPTIMIZED: Incrementally update spatial observation counts for all voxels
+			# This pre-computes counts so threshold checks are O(1) instead of O(neighbors * observations)
 			for voxel_key in voxel_keys:
 				if voxel_key not in self.semantic_voxel_observations:
 					self.semantic_voxel_observations[voxel_key] = []
 				
-				# Add observation with frame_id
-				frame_id = 0 if is_narration else self.frame_counter
-				self.semantic_voxel_observations[voxel_key].append({
-					'vlm_answer': vlm_answer,
-					'timestamp': current_time,
-					'frame_id': frame_id,
-					'similarity': stats.get('avg_similarity', threshold + 0.1)
-				})
+				self.semantic_voxel_observations[voxel_key].append(obs_data)
 				
-				# Clean old observations
-				self.semantic_voxel_observations[voxel_key] = [
-					obs for obs in self.semantic_voxel_observations[voxel_key]
-					if (current_time - obs['timestamp']) <= self.semantic_observation_max_age
-				]
+				# Incrementally update spatial counts for all 27 neighbors (including self)
+				# This makes threshold checks O(1) instead of scanning all neighbors
+				self._increment_spatial_observation_counts(
+					voxel_key, vlm_answer, 
+					frame_id if not is_narration else None,  # Only track frames for operational
+					current_time
+				)
+				
+				# Only cleanup if list is getting long (reduces overhead)
+				if len(self.semantic_voxel_observations[voxel_key]) > 20:
+					self.semantic_voxel_observations[voxel_key] = [
+						obs for obs in self.semantic_voxel_observations[voxel_key]
+						if (current_time - obs['timestamp']) <= self.semantic_observation_max_age
+					]
+			
+			# Periodic cleanup of old spatial counts (only if dict is large)
+			self._cleanup_old_spatial_counts(current_time)
 			
 			# Apply different confirmation logic based on hotspot type
 			confirmation_threshold = self.narration_confirmation_threshold if is_narration else self.operational_confirmation_threshold
 			
-			# Confirm voxels that have enough evidence
+			# NON-BLOCKING MULTI-FRAME CONFIRMATION:
+			# - Observations are added immediately (non-blocking)
+			# - Frame counts are tracked incrementally as new frames arrive
+			# - Voxels are confirmed automatically when threshold is reached (no waiting/blocking)
+			# - This provides noise rejection while maintaining low latency
 			with self.semantic_voxels_lock:
 				confirmed_count = 0
 				for voxel_key in voxel_keys:
 					if is_narration:
-						# Narration: count observations with spatial support
-						observation_count = self._count_observations_with_spatial_support(voxel_key, vlm_answer)
+						# FAST: O(1) lookup instead of scanning 27 neighbors
+						observation_count = self._get_observation_count_fast(voxel_key, vlm_answer)
 						meets_threshold = observation_count >= confirmation_threshold
 						confidence = observation_count
 					else:
-						# Operational: count unique frames
-						unique_frames = self._count_unique_frames_with_spatial_support(voxel_key, vlm_answer)
+						# FAST: O(1) lookup - checks unique frames seen so far (incremental, non-blocking)
+						unique_frames = self._get_unique_frames_count_fast(voxel_key, vlm_answer)
 						meets_threshold = unique_frames >= confirmation_threshold
 						confidence = unique_frames
 					
@@ -1866,30 +1963,20 @@ class SemanticDepthOctoMapNode(Node):
 				self.depth_buffer.append((depth_time, depth_m))
 				self._prune_sync_buffers()
 			
-			# Regular VDB occupancy mapping: use VDB mapper with latest pose (when available)
+			# Regular VDB occupancy mapping: run in separate thread to avoid blocking
 			if self.latest_pose is not None:
-				try:
-					# Convert to torch tensors
-					device = self.vdb_mapper.device
-					depth_tensor = torch.from_numpy(depth_m).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
-					
-					# Create dummy RGB (VDB needs it but we're focusing on occupancy)
-					h, w = depth_m.shape
-					rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
-					
-					# Convert pose to 4x4 matrix
-					pose_4x4 = self._pose_to_4x4_matrix(self.latest_pose)
-					
-					# Process with VDB mapper for regular occupancy
-					update_info = self.vdb_mapper.process_posed_rgbd(
-						rgb_img=rgb_tensor,
-						depth_img=depth_tensor,
-						pose_4x4=pose_4x4
-					)
-					# After occupancy update, compute and publish regular frontiers
-					self._compute_and_publish_regular_frontiers()
-				except Exception as e:
-					self.get_logger().warn(f"VDB mapping error: {e}")
+				# Make a copy of depth and pose for thread safety
+				depth_copy = depth_m.copy()
+				pose_copy = PoseStamped()
+				pose_copy.header = self.latest_pose.header
+				pose_copy.pose = self.latest_pose.pose
+				
+				# Run regular mapping in background thread
+				threading.Thread(
+					target=self._update_regular_mapping,
+					args=(depth_copy, pose_copy),
+					daemon=True
+				).start()
 			
 		except Exception as e:
 			self.get_logger().error(f"Error storing depth frame: {e}")
@@ -1897,15 +1984,157 @@ class SemanticDepthOctoMapNode(Node):
 		# Activity update
 		self.last_data_time = time.time()
 
-		# Process queue periodically
-		current_time = time.time()
-		if (current_time - self.last_queue_process_time) >= self.queue_processing_interval:
-			self._process_bridge_message_queue()
-			self.last_queue_process_time = current_time
-
-
-		# Periodic publishing
+		# Periodic publishing (includes deferred frontier computation)
 		self._periodic_publishing()
+		
+		# Compute regular frontiers periodically (not on every depth frame to reduce contention)
+		now = time.time()
+		if not hasattr(self, 'last_frontier_compute_time'):
+			self.last_frontier_compute_time = 0.0
+		if (now - self.last_frontier_compute_time) >= 0.1:  # Every 0.5s instead of every frame
+			self._compute_and_publish_regular_frontiers()
+			self.last_frontier_compute_time = now
+
+	def _update_regular_mapping(self, depth_m: np.ndarray, pose: PoseStamped):
+		"""Update regular VDB occupancy mapping in a separate thread."""
+		try:
+			# Convert to torch tensors
+			device = self.vdb_mapper.device
+			depth_tensor = torch.from_numpy(depth_m).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+			
+			# Create dummy RGB (VDB needs it but we're focusing on occupancy)
+			h, w = depth_m.shape
+			rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+			
+			# Convert pose to 4x4 matrix
+			pose_4x4 = self._pose_to_4x4_matrix(pose)
+			
+			# Process with VDB mapper for regular occupancy
+			update_info = self.vdb_mapper.process_posed_rgbd(
+				rgb_img=rgb_tensor,
+				depth_img=depth_tensor,
+				pose_4x4=pose_4x4
+			)
+		except Exception as e:
+			self.get_logger().warn(f"VDB mapping error: {e}")
+
+	def _update_semantic_vdb_mapping(self, mask: np.ndarray, depth_hot: np.ndarray, pose: PoseStamped):
+		"""Update VDB map with semantic hotspot using masked depth in a separate thread (optimized)."""
+		try:
+			device = self.vdb_mapper.device
+			h, w = mask.shape
+			
+			# Ensure minimum image size
+			if h < 1 or w < 1:
+				return
+			
+			# Create tensors with batch size 1 (critical for indexing)
+			depth_tensor = torch.from_numpy(depth_hot).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+			rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+			pose_4x4 = self._pose_to_4x4_matrix(pose)
+			
+			# Ensure pose_4x4 has correct batch dimension (1x4x4)
+			if pose_4x4.dim() == 2:
+				pose_4x4 = pose_4x4.unsqueeze(0)
+			elif pose_4x4.shape[0] != 1:
+				pose_4x4 = pose_4x4[:1]
+			
+			# Process with VDB mapper for semantic occupancy
+			update_info = self.vdb_mapper.process_posed_rgbd(
+				rgb_img=rgb_tensor,
+				depth_img=depth_tensor,
+				pose_4x4=pose_4x4
+			)
+			
+			# Process rays/frontiers with conf_map (same as tmp.py)
+			try:
+				# Prepare masked depth for rays-only beyond max_range
+				depth_for_rays = np.zeros_like(depth_hot, dtype=np.float32)
+				masked = (mask > 0)
+				if self.camera_intrinsics is not None:
+					# Use original depth_m if available, otherwise use depth_hot
+					# For rays, we want pixels beyond max_range or missing depth
+					masked_depth_vals = depth_hot[masked]
+					threshold = float(self.max_range)
+					beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
+					dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
+					dr[beyond_or_missing] = np.inf
+					depth_for_rays[masked] = dr
+					mask_far = np.zeros_like(depth_for_rays, dtype=bool)
+					mask_far[masked] = beyond_or_missing
+					
+					if np.any(mask_far):
+						try:
+							far_v, far_u = np.where(mask_far)
+							fx, fy, cx, cy = self.camera_intrinsics
+							fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
+							u = far_u.astype(np.float32)
+							v = far_v.astype(np.float32)
+							dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+							dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+							pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+							R_world_cam = pose_mat[:3, :3]
+							origin_world = pose_mat[:3, 3]
+							dir_world = dir_cam @ R_world_cam.T
+							dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+							self._latest_pose_rays = (origin_world, dir_world)
+						except Exception:
+							self._latest_pose_rays = None
+					else:
+						# Fallback: derive rays from all masked pixels (sampled)
+						try:
+							if np.any(masked):
+								fx, fy, cx, cy = self.camera_intrinsics
+								fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
+								all_v, all_u = np.where(masked)
+								max_samples = 800
+								if all_u.shape[0] > max_samples:
+									idx = np.random.choice(all_u.shape[0], size=max_samples, replace=False)
+									all_u = all_u[idx]
+									all_v = all_v[idx]
+								u = all_u.astype(np.float32)
+								v = all_v.astype(np.float32)
+								dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+								dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+								pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+								R_world_cam = pose_mat[:3, :3]
+								origin_world = pose_mat[:3, 3]
+								dir_world = dir_cam @ R_world_cam.T
+								dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+								self._latest_pose_rays = (origin_world, dir_world)
+							else:
+								self._latest_pose_rays = None
+						except Exception:
+							self._latest_pose_rays = None
+					
+					# Process rays with conf_map to restrict to mask
+					rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=device)
+					depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(device)
+					pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(device)
+					conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+					
+					# Update intrinsics if available
+					fx, fy, cx, cy = self.camera_intrinsics
+					self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+					
+					# Process rays (no encoding used due to global_encoding=True)
+					self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
+					# Publish mask-specific frontiers and rays immediately (same as tmp.py)
+					self._publish_mask_frontiers_and_rays()
+			except Exception as e:
+				self.get_logger().warn(f"Mask rays/frontiers processing failed: {e}")
+				
+		except Exception as e:
+			self.get_logger().warn(f"VDB semantic mapping error: {e}")
+
+	def _update_semantic_voxels(self, points_world: np.ndarray, vlm_answer: str, threshold: float, 
+								 stats: dict, is_narration: bool):
+		"""Update semantic voxel labels in a separate thread (optimized)."""
+		try:
+			if points_world.size > 0:
+				self._apply_semantic_labels_to_voxels(points_world, vlm_answer, threshold, stats, is_narration)
+		except Exception as e:
+			self.get_logger().warn(f"Semantic voxel update error: {e}")
 
 	def _compute_and_publish_regular_frontiers(self):
 		try:
@@ -1964,7 +2193,7 @@ class SemanticDepthOctoMapNode(Node):
 		"""Keep only recent entries within sync window."""
 		cutoff = time.time() - self.sync_buffer_duration
 		# Depth/mask/pose buffers capped by length (heuristic) to bound memory
-		max_entries = 200
+		max_entries = 50
 		if len(self.depth_buffer) > max_entries:
 			self.depth_buffer = self.depth_buffer[-max_entries:]
 		if len(self.pose_buffer) > max_entries:
@@ -1985,16 +2214,46 @@ class SemanticDepthOctoMapNode(Node):
 			return None
 	
 	def _depth_to_world_points(self, depth_m: np.ndarray, intrinsics, pose: PoseStamped):
+		# BOTTLENECK FUNCTION: This entire function is inefficient for sparse depth images
+		# Creates meshgrid for entire image (H x W), then filters - should process only valid pixels
 		try:
 			fx, fy, cx, cy = intrinsics
 			h, w = depth_m.shape
+			# BOTTLENECK: np.meshgrid() creates full H x W coordinate arrays even for sparse depth
+			# For 640x480 image, creates 307,200 coordinate pairs, most of which are discarded
 			u, v = np.meshgrid(np.arange(w), np.arange(h))
 			z = depth_m
+			# BOTTLENECK: Valid mask computation on full image
 			valid = np.isfinite(z) & (z > 0.0)
 			if not np.any(valid):
 				return None, None, None
 
+			# BOTTLENECK: Indexing full arrays to extract valid pixels (memory intensive)
 			u, v, z = u[valid], v[valid], z[valid]
+			x = (u - cx) * z / fx
+			y = (v - cy) * z / fy
+			pts_cam = np.stack([x, y, z], axis=1)
+
+			# Transform to base if needed
+			# BOTTLENECK: Matrix multiplication for all points (even if most are zeros)
+			if bool(self.pose_is_base_link):
+				pts_cam = pts_cam @ (self.R_opt_to_base.T if bool(self.apply_optical_frame_rotation) else np.eye(3, dtype=np.float32))
+				pts_cam = pts_cam @ self.R_cam_to_base_extra.T + self.t_cam_to_base_extra
+
+			# World transform
+			# BOTTLENECK: Another matrix multiplication for all points
+			R_world = self._quat_to_rot(self._pose_quat(pose))
+			p_world = self._pose_position(pose)
+			pts_world = pts_cam @ R_world.T + p_world
+			return pts_world, u, v
+		except Exception:
+			return None, None, None
+
+	def _depth_to_world_points_sparse(self, u: np.ndarray, v: np.ndarray, z: np.ndarray, intrinsics, pose: PoseStamped):
+		"""Optimized version that only processes sparse hotspot pixels (no meshgrid)."""
+		try:
+			fx, fy, cx, cy = intrinsics
+			# Direct computation for sparse pixels
 			x = (u - cx) * z / fx
 			y = (v - cy) * z / fy
 			pts_cam = np.stack([x, y, z], axis=1)
@@ -2008,9 +2267,9 @@ class SemanticDepthOctoMapNode(Node):
 			R_world = self._quat_to_rot(self._pose_quat(pose))
 			p_world = self._pose_position(pose)
 			pts_world = pts_cam @ R_world.T + p_world
-			return pts_world, u, v
+			return pts_world
 		except Exception:
-			return None, None, None
+			return None
 
 	def _create_semantic_colored_cloud(self, max_points: int) -> Optional[PointCloud2]:
 		"""Create a colored point cloud that shows both regular occupancy voxels and semantic voxels."""
@@ -2043,6 +2302,11 @@ class SemanticDepthOctoMapNode(Node):
 				occupied_mask = pc_xyz_occ_size[:, -2] > 0
 				occupied_points_data = pc_xyz_occ_size[occupied_mask]
 				
+				# OPTIMIZED: Copy semantic voxels once with single lock acquisition
+				# This avoids thousands of lock acquisitions inside the loop
+				with self.semantic_voxels_lock:
+					semantic_voxels_copy = dict(self.semantic_voxels)  # Fast shallow copy
+				
 				# Create point cloud data
 				points = []
 				colors = []
@@ -2054,18 +2318,17 @@ class SemanticDepthOctoMapNode(Node):
 					point = point_data[:3]  # xyz
 					voxel_key = self._get_voxel_key_from_point(point)
 					
-					# Check if this voxel is semantic
-					with self.semantic_voxels_lock:
-						if voxel_key in self.semantic_voxels:
-							# Semantic voxel - use VLM answer color
-							semantic_info = self.semantic_voxels[voxel_key]
-							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
-							color = self._get_vlm_answer_color(vlm_answer)
-							semantic_count += 1
-						else:
-							# Regular occupancy voxel - use gray
-							color = [128, 128, 128]
-							regular_count += 1
+					# FAST: Check semantic voxels from copy (no lock needed)
+					if voxel_key in semantic_voxels_copy:
+						# Semantic voxel - use VLM answer color
+						semantic_info = semantic_voxels_copy[voxel_key]
+						vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+						color = self._get_vlm_answer_color(vlm_answer)
+						semantic_count += 1
+					else:
+						# Regular occupancy voxel - use gray
+						color = [128, 128, 128]
+						regular_count += 1
 					
 					points.append(point)
 					colors.append(color)
@@ -2075,20 +2338,20 @@ class SemanticDepthOctoMapNode(Node):
 						break
 				
 				# Add any semantic voxels that aren't in VDB occupancy
-				with self.semantic_voxels_lock:
-					for voxel_key, semantic_info in self.semantic_voxels.items():
-						if len(points) >= max_points:
-							break
-						# Check if this semantic voxel is already added
-						voxel_center = semantic_info['position']
-						if voxel_center is not None:
-							# Simple check: if voxel_key not in occupancy voxels
-							# (This is approximate, but good enough for visualization)
-							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
-							color = self._get_vlm_answer_color(vlm_answer)
-							points.append(voxel_center)
-							colors.append(color)
-							semantic_count += 1
+				# Use the copy we already have (no lock needed)
+				for voxel_key, semantic_info in semantic_voxels_copy.items():
+					if len(points) >= max_points:
+						break
+					# Check if this semantic voxel is already added
+					voxel_center = semantic_info['position']
+					if voxel_center is not None:
+						# Simple check: if voxel_key not in occupancy voxels
+						# (This is approximate, but good enough for visualization)
+						vlm_answer = semantic_info.get('vlm_answer', 'unknown')
+						color = self._get_vlm_answer_color(vlm_answer)
+						points.append(voxel_center)
+						colors.append(color)
+						semantic_count += 1
 			
 			if not points:
 				return None
@@ -2364,24 +2627,19 @@ class SemanticDepthOctoMapNode(Node):
 	def _periodic_publishing(self):
 		now = time.time()
 		
-		# Process bridge message queue regularly
-		if (now - self.last_queue_process_time) >= self.queue_processing_interval:
-			self._process_bridge_message_queue()
-			self.last_queue_process_time = now
-		
-		if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
-			markers = self._create_vdb_markers(int(self.max_markers))
+		# if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
+		# 	markers = self._create_vdb_markers(int(self.max_markers))
 			
-			if markers is not None:
-				# Fix timestamps for all markers
-				current_time = self.get_clock().now().to_msg()
-				for marker in markers.markers:
-					marker.header.stamp = current_time
+		# 	if markers is not None:
+		# 		# Fix timestamps for all markers
+		# 		current_time = self.get_clock().now().to_msg()
+		# 		for marker in markers.markers:
+		# 			marker.header.stamp = current_time
 				
-				self.marker_pub.publish(markers)
-				marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
-				self.get_logger().info(f"Published {marker_count} VDB voxel markers")
-			self.last_marker_pub = now
+		# 		self.marker_pub.publish(markers)
+		# 		marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
+		# 		self.get_logger().info(f"Published {marker_count} VDB voxel markers")
+		# 	self.last_marker_pub = now
 		
 		if self.cloud_pub:
 			try:
@@ -2405,7 +2663,7 @@ class SemanticDepthOctoMapNode(Node):
 			except Exception as e:
 				self.get_logger().warn(f"Failed to create semantic-only cloud: {e}")
 		
-		if self.stats_pub and (now - self.last_stats_pub) >= float(self.stats_publish_rate):
+		# if self.stats_pub and (now - self.last_stats_pub) >= float(self.stats_publish_rate):
 			# Get statistics from VDB mapper
 			try:
 				if not self.vdb_mapper.is_empty():
@@ -2424,13 +2682,9 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# Add semantic mapping status and counts
 			semantic_voxel_count = 0
-			queue_size = 0
 			
 			with self.semantic_voxels_lock:
 				semantic_voxel_count = len(self.semantic_voxels)
-			
-			with self.bridge_queue_lock:
-				queue_size = len(self.bridge_message_queue)
 			
 			stats = {
 				'mapper_type': 'VDB OccupancyMap',
@@ -2439,9 +2693,7 @@ class SemanticDepthOctoMapNode(Node):
 				'semantic_mapping': {
 					'enabled': self.enable_semantic_mapping,
 					'status': 'active' if self.enable_semantic_mapping else 'disabled',
-					'semantic_voxel_count': semantic_voxel_count,
-					'bridge_queue_size': queue_size,
-					'queue_max_size': self.max_queue_size
+					'semantic_voxel_count': semantic_voxel_count
 				}
 			}
 			

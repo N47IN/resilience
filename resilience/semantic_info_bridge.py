@@ -95,7 +95,7 @@ class SemanticHotspotPublisher:
         try:
             # Rate limiting
             current_time = time.time()
-            if current_time - self.last_publish_time < (1.0 / self.publish_rate_limit):
+            if current_time - self.last_publish_time < (1.0 / 30.0):
                 return False
             
             if not vlm_hotspots:
