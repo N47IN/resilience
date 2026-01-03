@@ -1,30 +1,52 @@
 #!/usr/bin/env python3
 """
-Disturbance Field Helper - Class-based utility for 3D disturbance modeling
+Disturbance Field Helper - Class-based utility for 3D disturbance modeling with GP uncertainty
 
-This helper wraps the core functionality from `resilience/scripts/voxel_gp.py` into a
-reusable class that can be imported in ROS2 nodes or other Python modules.
+This helper provides a reusable class for Gaussian Process (GP) modeling of 3D disturbance fields.
+It is designed for use in ROS2 nodes (e.g., frontier_mapping_node) to model spatial disturbances
+caused by environmental factors (e.g., obstacles, wind, terrain effects).
+
+Key Features:
+- Superposed Anisotropic RBF Model: Uses sum of anisotropic radial basis functions with
+  different length scales for horizontal (xy) vs vertical (z) dimensions
+- Bayesian Uncertainty Estimation: Supports both MSE and NLL objectives for fitting,
+  with optional epistemic uncertainty quantification via inverse Hessian
+- Flexible Input Sources: Can load data from buffer directories or accept direct inputs
+- Visualization Support: Provides 2D/3D plotting utilities for field visualization
 
 Primary capabilities:
 - Load actual trajectory and cause metadata from a buffer directory
 - Accept a nominal trajectory path or pass nominal directly
 - Accept a point cloud (Nx3 numpy array) representing cause points (PCD content)
 - Compute disturbances against nominal, fit a superposed anisotropic kernel model
+- Estimate epistemic uncertainty in GP parameters (for risk-aware planning)
 - Predict a 3D field on a grid around the trajectory and cause
 - Provide Matplotlib and optional PyVista visualizations
 
+GP Model:
+    disturbance(x) = A * phi(x) + b
+    where phi(x) = Σ_j exp(-0.5 * d²_j(x, c_j))
+    and d² uses anisotropic distance: (dx² + dy²)/lxy² + dz²/lz²
+
+Uncertainty Quantification:
+    - Aleatoric uncertainty: Observation noise (sigma² = MSE)
+    - Epistemic uncertainty: Parameter uncertainty (from inverse Hessian of lxy, lz)
+    - Predictive variance: Var(y*) = sigma² * (1 + v^T * (X^T X)^-1 * v)
+
 Inputs (main methods):
-- pointcloud: numpy.ndarray of shape (N, 3)
+- pointcloud: numpy.ndarray of shape (N, 3) - cause points
 - buffer_dir: directory containing `poses.npy` and `cause_location.json`/`metadata.json`
-- nominal_path or nominal_xyz
+- nominal_path or nominal_xyz: nominal trajectory for comparison
 
 Outputs:
-- Fitted parameters (lxy, lz, A, b) and quality metrics
+- Fitted parameters (lxy, lz, A, b) and quality metrics (mse, rmse, r2_score)
+- Uncertainty estimates (sigma2, nll, param_std, hess_inv)
 - Optional visualizations (2D scatter, orthogonal slices, 3D volume)
 
 Dependency policy:
-- Functions are directly adapted from `voxel_gp.py` to avoid cross-module script imports.
-- All public APIs accept numpy arrays and paths; no ROS messages are required.
+- Functions are directly adapted from `voxel_gp.py` and `gp_sampler.py` for clean reuse
+- All public APIs accept numpy arrays and paths; no ROS messages are required
+- Maintains backward compatibility with existing frontier_mapping_node usage
 """
 
 from __future__ import annotations
@@ -70,7 +92,30 @@ _DEFAULTS = {
 class DisturbanceFieldHelper:
     """
     Helper for computing and visualizing 3D disturbance fields using a superposed
-    anisotropic kernel model, refactored from `voxel_gp.py` for clean reuse.
+    anisotropic RBF (Radial Basis Function) GP model.
+    
+    This class provides a unified interface for GP-based disturbance field modeling,
+    supporting both traditional MSE-based fitting and Bayesian NLL-based fitting with
+    epistemic uncertainty quantification. It maintains backward compatibility with
+    existing code (e.g., frontier_mapping_node) while adding new capabilities.
+    
+    Key Features:
+        - Superposed Anisotropic RBF Model: Sum of RBF kernels with different
+          length scales for horizontal (lxy) vs vertical (lz) dimensions
+        - Dual Objective Support: "mse" (default, backward compatible) or "nll" (Bayesian)
+        - Uncertainty Quantification: Optional epistemic uncertainty via inverse Hessian
+        - Efficient Implementation: Chunked processing for large grids, vectorized operations
+    
+    Usage:
+        helper = DisturbanceFieldHelper()
+        result = helper.fit_from_pointcloud_and_buffer(
+            pointcloud_xyz=cause_points,
+            buffer_dir="/path/to/buffer",
+            nominal_path="/path/to/nominal.json",
+            objective="nll"  # or "mse" for backward compatibility
+        )
+        fit_params = result['fit']
+        # fit_params contains: lxy, lz, A, b, mse, rmse, r2_score, sigma2, nll, param_std, etc.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -150,11 +195,27 @@ class DisturbanceFieldHelper:
 
     @staticmethod
     def clip_nominal_to_actual_segment(nominal_xyz: np.ndarray, actual_xyz: np.ndarray, plane: str = 'xy') -> np.ndarray:
+        """
+        Clip nominal trajectory to the segment corresponding to the actual trajectory.
+        
+        Finds the start and end indices of the nominal trajectory that best match
+        the actual trajectory endpoints, then returns the clipped segment. This ensures
+        we only fit the GP model to the relevant portion of the nominal trajectory.
+        
+        Args:
+            nominal_xyz: (N, 3) full nominal trajectory
+            actual_xyz: (M, 3) actual trajectory (subset of nominal)
+            plane: 'xy' or 'xz' projection plane for matching endpoints
+        
+        Returns:
+            Clipped nominal trajectory segment (K, 3)
+        """
         if nominal_xyz is None or len(nominal_xyz) == 0 or actual_xyz is None or len(actual_xyz) == 0:
             return nominal_xyz
         plane = plane.lower()
         if plane not in ('xy', 'xz'):
             plane = 'xy'
+        # Project to 2D plane for endpoint matching
         if plane == 'xy':
             nom_proj = nominal_xyz[:, [0, 1]]
             act_start = actual_xyz[0, [0, 1]]
@@ -164,11 +225,13 @@ class DisturbanceFieldHelper:
             act_start = actual_xyz[0, [0, 2]]
             act_end = actual_xyz[-1, [0, 2]]
 
+        # Find closest nominal points to actual start/end
         d_start = np.linalg.norm(nom_proj - act_start[None, :], axis=1)
         d_end = np.linalg.norm(nom_proj - act_end[None, :], axis=1)
         i_start = int(np.argmin(d_start))
         i_end = int(np.argmin(d_end))
 
+        # Extract segment (handle reverse direction)
         lo, hi = (i_start, i_end) if i_start <= i_end else (i_end, i_start)
         lo = max(0, lo)
         hi = min(len(nominal_xyz) - 1, hi)
@@ -178,14 +241,32 @@ class DisturbanceFieldHelper:
 
     @staticmethod
     def compute_trajectory_drift_vectors(actual_xyz: np.ndarray, nominal_xyz: np.ndarray):
+        """
+        Compute drift vectors from nominal to actual trajectory.
+        
+        For each actual trajectory point, finds the closest nominal point and
+        computes the drift vector (difference). Used as a fallback when
+        compute_disturbance_at_nominal_points returns no valid points.
+        
+        Args:
+            actual_xyz: (N, 3) actual trajectory points
+            nominal_xyz: (M, 3) nominal trajectory points
+        
+        Returns:
+            tuple (drift_vectors, drift_magnitudes):
+                - drift_vectors: (N, 3) vectors from nominal to actual
+                - drift_magnitudes: (N,) Euclidean distances (disturbance magnitudes)
+        """
         if nominal_xyz is None or len(nominal_xyz) == 0:
             return None, None
         drift_vectors = []
         drift_magnitudes = []
         for actual_point in actual_xyz:
+            # Find closest nominal point
             diffs = nominal_xyz - actual_point
             dists = np.linalg.norm(diffs, axis=1)
             closest_idx = int(np.argmin(dists))
+            # Compute drift vector and magnitude
             drift_vec = actual_point - nominal_xyz[closest_idx]
             drift_mag = float(np.linalg.norm(drift_vec))
             drift_vectors.append(drift_vec)
@@ -194,8 +275,26 @@ class DisturbanceFieldHelper:
 
     @staticmethod
     def compute_disturbance_at_nominal_points(nominal_xyz: np.ndarray, actual_xyz: np.ndarray, cause_xyz: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute disturbance at nominal trajectory points near the actual trajectory bounds.
-        Signature mirrors voxel_gp.py (cause_xyz unused but kept for API parity).
+        """
+        Compute disturbance magnitudes at nominal trajectory points.
+        
+        For each nominal point, finds the closest actual trajectory point and computes
+        the Euclidean distance (disturbance magnitude). Only includes nominal points
+        that are within a reasonable distance (0.3m) of the actual trajectory.
+        
+        This provides the training data for GP fitting: we want to learn a field that
+        predicts disturbance at any nominal point based on the spatial distribution
+        of cause points.
+        
+        Args:
+            nominal_xyz: (N, 3) nominal trajectory points
+            actual_xyz: (M, 3) actual trajectory points (observed)
+            cause_xyz: Unused (kept for API compatibility with voxel_gp.py)
+        
+        Returns:
+            tuple (nominal_points_used, disturbance_magnitudes):
+                - nominal_points_used: (K, 3) nominal points with valid disturbances
+                - disturbance_magnitudes: (K,) disturbance magnitudes (Euclidean distances)
         """
         disturbances = []
         nominal_points_used = []
@@ -228,25 +327,81 @@ class DisturbanceFieldHelper:
 
     @staticmethod
     def _sum_of_anisotropic_rbf(grid_points: np.ndarray, centers: np.ndarray, lxy: float, lz: float) -> np.ndarray:
+        """
+        Compute superposed anisotropic RBF basis function phi(x) = Σ_j exp(-0.5 * d²_j).
+        
+        Uses anisotropic distance metric:
+            d²_j = (dx² + dy²) / lxy² + dz² / lz²
+        where dx, dy, dz are the differences in x, y, z coordinates between grid points
+        and cause centers, and lxy, lz are the length scales (different for horizontal vs vertical).
+        
+        This allows the GP to model different correlation scales in horizontal (xy) vs vertical (z)
+        directions, which is important for spatial disturbances that may vary more slowly
+        horizontally than vertically (e.g., wind, terrain effects).
+        
+        Args:
+            grid_points: (N, 3) query points where we evaluate the basis function
+            centers: (M, 3) cause points (centers of RBF kernels)
+            lxy: Length scale for horizontal (xy) dimensions (meters)
+            lz: Length scale for vertical (z) dimension (meters)
+        
+        Returns:
+            phi: (N,) array of basis function values (sum of RBF contributions)
+        """
         if centers.size == 0:
             return np.zeros(grid_points.shape[0], dtype=float)
         num_points = grid_points.shape[0]
         phi = np.zeros(num_points, dtype=float)
-        chunk = 200000
+        chunk = 200000  # Process in chunks to manage memory for large grids
+        # Precompute inverse squared length scales for efficiency
         inv_lxy2 = 1.0 / (lxy * lxy + 1e-12)
         inv_lz2 = 1.0 / (lz * lz + 1e-12)
         for start in range(0, num_points, chunk):
             end = min(num_points, start + chunk)
             gp_chunk = grid_points[start:end]
+            # Vectorized distance computation: (chunk_size, M, 3) difference array
             dx = gp_chunk[:, None, 0] - centers[None, :, 0]
             dy = gp_chunk[:, None, 1] - centers[None, :, 1]
             dz = gp_chunk[:, None, 2] - centers[None, :, 2]
+            # Anisotropic squared distance: horizontal and vertical components scaled separately
             d2 = (dx * dx + dy * dy) * inv_lxy2 + (dz * dz) * inv_lz2
+            # Compute RBF contributions: exp(-0.5 * d²) and sum over all centers
             np.exp(-0.5 * d2, out=d2)
-            phi[start:end] = d2.sum(axis=1)
+            phi[start:end] = d2.sum(axis=1)  # Sum over M centers for each query point
         return phi
 
-    def fit_direct_superposition_to_disturbances(self, nominal_points: np.ndarray, disturbance_magnitudes: np.ndarray, cause_points: np.ndarray) -> Dict[str, Any]:
+    def fit_direct_superposition_to_disturbances(self, nominal_points: np.ndarray, disturbance_magnitudes: np.ndarray, cause_points: np.ndarray, objective: str = "nll") -> Dict[str, Any]:
+        """
+        Fit GP parameters (lxy, lz, A, b) using superposed anisotropic RBF model.
+        
+        Model: disturbance(x) = A * phi(x) + b
+        where phi(x) = Σ_j exp(-0.5 * d²_j) is the sum of anisotropic RBF kernels
+        centered at cause points, and d² uses different length scales for xy and z.
+        
+        Fits parameters by optimizing lxy and lz (hyperparameters) and solving for
+        A and b (linear coefficients) via least squares.
+        
+        Objective functions:
+            - "mse": Minimize mean squared error (standard approach)
+            - "nll": Minimize negative log-likelihood (Bayesian approach, better uncertainty estimates)
+        
+        Args:
+            nominal_points: (N, 3) nominal trajectory points where disturbances were measured
+            disturbance_magnitudes: (N,) observed disturbance magnitudes
+            cause_points: (M, 3) cause points (e.g., from PCD file)
+            objective: "mse" or "nll" (default: "mse" for backward compatibility)
+        
+        Returns:
+            Dictionary with fitted parameters:
+                - lxy, lz: Optimized length scales (meters)
+                - A, b: Linear coefficients (A * phi + b)
+                - mse, rmse, mae, r2_score: Quality metrics
+                - sigma2: Noise variance estimate (for uncertainty quantification)
+                - nll: Negative log-likelihood (if objective="nll")
+                - hess_inv: Inverse Hessian matrix (for parameter uncertainty)
+                - param_std: Standard deviations of lxy, lz (for epistemic uncertainty)
+                - optimization_result: scipy.optimize.OptimizeResult object
+        """
         if cause_points.size == 0:
             return {
                 'lxy': None,
@@ -257,26 +412,34 @@ class DisturbanceFieldHelper:
                 'mse': float('inf'),
                 'r2_score': 0.0,
                 'mae': float('inf'),
-                'rmse': float('inf')
+                'rmse': float('inf'),
+                'sigma2': float('inf'),
+                'nll': float('inf'),
             }
+        obj = objective.lower()
         target = disturbance_magnitudes.astype(float)
+        # Normalize target for stable optimization (we'll denormalize later)
         target_mean = np.mean(target)
         target_std = np.std(target)
         if target_std < 1e-8:
             target_std = 1.0
         target_norm = (target - target_mean) / target_std
 
-        def objective(params):
+        def objective_fn(params):
+            """Optimization objective: find best lxy, lz hyperparameters."""
             lxy, lz = params
-            lxy = max(lxy, 0.01)
+            lxy = max(lxy, 0.01)  # Enforce minimum bounds
             lz = max(lz, 0.01)
+            # Compute basis function phi at training points
             phi = self._sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy, lz=lz)
             phi_mean = np.mean(phi)
             phi_std = np.std(phi)
             if phi_std < 1e-8:
-                return float('inf')
+                return float('inf')  # Invalid: constant phi
+            # Normalize phi for stable linear regression
             phi_norm = (phi - phi_mean) / phi_std
             n = phi_norm.shape[0]
+            # Linear model: target_norm = A_norm * phi_norm + b_norm
             X = np.column_stack([phi_norm, np.ones(n, dtype=float)])
             try:
                 XtX = X.T @ X
@@ -286,32 +449,43 @@ class DisturbanceFieldHelper:
                 params_ab = np.linalg.lstsq(X, target_norm, rcond=None)[0]
             A_norm, b_norm = params_ab[0], params_ab[1]
             recon_norm = A_norm * phi_norm + b_norm
-            mse = np.mean((recon_norm - target_norm) ** 2)
+            sse = np.sum((recon_norm - target_norm) ** 2)
+            mse = sse / n
+            # Choose objective: MSE or NLL
+            if obj == "nll":
+                # Gaussian negative log-likelihood: NLL = 0.5 * n * (log(σ²) + 1)
+                # where σ² = MSE (assuming Gaussian noise)
+                nll = 0.5 * n * (np.log(mse + 1e-12) + 1.0)
+                loss = nll
+            else:
+                loss = mse
+            # Regularization: prefer moderate length scales (avoid overfitting)
             reg_term = 0.05 * (1.0 / (lxy + 0.05) + 1.0 / (lz + 0.05))
-            return mse + reg_term
+            return loss + reg_term
 
+        # Multi-start optimization: try multiple initial guesses to avoid local minima
         initial_guesses = [
             [0.02, 0.02], [0.05, 0.05], [0.1, 0.1], [0.2, 0.2], [0.3, 0.3],
             [0.1, 0.05], [0.05, 0.1], [0.15, 0.08], [0.08, 0.15],
         ]
-        bounds = [(0.005, 1.0), (0.005, 1.0)]
+        bounds = [(0.005, 1.0), (0.005, 1.0)]  # Reasonable bounds for length scales (5mm to 1m)
 
         best_result = None
-        best_mse = float('inf')
+        best_loss = float('inf')
         for x0 in initial_guesses:
             try:
-                result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': 100, 'ftol': 1e-8, 'gtol': 1e-8})
-                if result.success and result.fun < best_mse:
+                result = minimize(objective_fn, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': 100, 'ftol': 1e-8, 'gtol': 1e-8})
+                if result.success and result.fun < best_loss:
                     best_result = result
-                    best_mse = result.fun
+                    best_loss = result.fun
             except Exception:
                 pass
 
         if best_result is None:
-            # Grid search fallback
+            # Grid search fallback if optimization fails
             lxy_grid = np.array([0.01, 0.02, 0.04, 0.06, 0.08, 0.12, 0.18, 0.25, 0.35, 0.5], dtype=float)
             lz_grid = np.array([0.01, 0.02, 0.04, 0.06, 0.10, 0.16, 0.24, 0.35, 0.5], dtype=float)
-            best = {'mse': float('inf')}
+            best = {'mse': float('inf'), 'nll': float('inf')}
             for lxy in lxy_grid:
                 for lz in lz_grid:
                     phi = self._sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy, lz=lz)
@@ -325,14 +499,27 @@ class DisturbanceFieldHelper:
                         params = np.linalg.lstsq(X, target, rcond=None)[0]
                     A, b = float(params[0]), float(params[1])
                     recon = A * phi + b
-                    mse = float(np.mean((recon - target) ** 2))
-                    if mse < best['mse']:
-                        best = {'lxy': lxy, 'lz': lz, 'A': A, 'b': b, 'recon': recon, 'mse': mse}
+                    mse_ = float(np.mean((recon - target) ** 2))
+                    sse_ = float(np.sum((recon - target) ** 2))
+                    nll_ = 0.5 * n * (np.log(mse_ + 1e-12) + 1.0)
+                    # Choose best based on objective
+                    if (obj == "nll" and nll_ < best.get('nll', float('inf'))) or (obj != "nll" and mse_ < best['mse']):
+                        best = {'lxy': lxy, 'lz': lz, 'A': A, 'b': b, 'recon': recon, 'mse': mse_, 'nll': nll_, 'sigma2': mse_}
+            # Add missing fields for consistency
+            best.setdefault('rmse', float(np.sqrt(best['mse'])))
+            best.setdefault('mae', float(np.mean(np.abs(best['recon'] - target))))
+            ss_res = np.sum((target - best['recon']) ** 2)
+            ss_tot = np.sum((target - np.mean(target)) ** 2)
+            best.setdefault('r2_score', float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0)
+            best.setdefault('optimization_result', None)
             return best
 
+        # Extract optimal hyperparameters
         lxy_opt, lz_opt = best_result.x
+        # Compute final basis function with optimal hyperparameters
         phi_opt = self._sum_of_anisotropic_rbf(nominal_points, cause_points, lxy=lxy_opt, lz=lz_opt)
         n = phi_opt.shape[0]
+        # Solve for linear coefficients A, b (in original scale, not normalized)
         X = np.column_stack([phi_opt, np.ones(n, dtype=float)])
         try:
             XtX = X.T @ X
@@ -341,6 +528,7 @@ class DisturbanceFieldHelper:
         except np.linalg.LinAlgError:
             params_ab = np.linalg.lstsq(X, target, rcond=None)[0]
         A_opt, b_opt = float(params_ab[0]), float(params_ab[1])
+        # Compute predictions and metrics
         recon_opt = A_opt * phi_opt + b_opt
         mse_opt = float(np.mean((recon_opt - target) ** 2))
         rmse_opt = float(np.sqrt(mse_opt))
@@ -348,6 +536,41 @@ class DisturbanceFieldHelper:
         ss_res = np.sum((target - recon_opt) ** 2)
         ss_tot = np.sum((target - np.mean(target)) ** 2)
         r2_score = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+        
+        # Noise variance estimate (used for uncertainty quantification)
+        sigma2_opt = mse_opt
+        
+        # Negative log-likelihood (for Bayesian methods)
+        nll_opt = 0.5 * n * (np.log(mse_opt + 1e-12) + 1.0)
+        
+        # Extract optimization diagnostics (JSON-friendly)
+        opt_info = {
+            "nit": int(getattr(best_result, "nit", -1)),
+            "nfev": int(getattr(best_result, "nfev", -1)),
+            "success": bool(getattr(best_result, "success", False)),
+            "message": str(getattr(best_result, "message", "")),
+        }
+        
+        # Approximate inverse Hessian (from L-BFGS-B) for parameter uncertainty
+        # This gives us epistemic uncertainty in hyperparameters lxy, lz
+        hess_inv_mat = None
+        param_std = None
+        try:
+            hinv = getattr(best_result, "hess_inv", None)
+            if hinv is not None:
+                # For L-BFGS-B this is an LbfgsInvHessProduct; convert to dense
+                if hasattr(hinv, "todense"):
+                    hess_inv_mat = np.asarray(hinv.todense(), dtype=float)
+                else:
+                    hess_inv_mat = np.asarray(hinv, dtype=float)
+                if hess_inv_mat.shape == (2, 2):
+                    # Standard deviations ≈ sqrt(diag(H^{-1}))
+                    stds = np.sqrt(np.maximum(np.diag(hess_inv_mat), 0.0))
+                    param_std = {"lxy": float(stds[0]), "lz": float(stds[1])}
+        except Exception:
+            hess_inv_mat = None
+            param_std = None
+        
         return {
             'lxy': float(lxy_opt),
             'lz': float(lz_opt),
@@ -358,7 +581,12 @@ class DisturbanceFieldHelper:
             'rmse': rmse_opt,
             'mae': mae_opt,
             'r2_score': r2_score,
+            'sigma2': sigma2_opt,  # Noise variance (for uncertainty quantification)
+            'nll': nll_opt,  # Negative log-likelihood
             'optimization_result': best_result,
+            'optimization': opt_info,  # JSON-friendly optimization info
+            'hess_inv': (hess_inv_mat.tolist() if hess_inv_mat is not None else None),  # Parameter covariance
+            'param_std': param_std,  # Standard deviations of lxy, lz (epistemic uncertainty)
         }
 
     # ----------------------------
@@ -366,6 +594,25 @@ class DisturbanceFieldHelper:
     # ----------------------------
 
     def create_3d_prediction_grid(self, xyz: np.ndarray, cause_xyz: Optional[np.ndarray], resolution_xy: Optional[float] = None, resolution_z: Optional[float] = None):
+        """
+        Create a 3D prediction grid around the trajectory and cause points.
+        
+        The grid is padded around the bounding box of the trajectory and cause points,
+        allowing us to predict the GP field at regular intervals in 3D space for
+        visualization and planning purposes.
+        
+        Args:
+            xyz: (N, 3) trajectory points to bound the grid
+            cause_xyz: Optional (3,) cause location to include in bounding box
+            resolution_xy: Grid resolution in xy plane (meters, default from config)
+            resolution_z: Grid resolution in z direction (meters, default from config)
+        
+        Returns:
+            tuple (Xg, Yg, Zg, grid_points, xs, ys, zs):
+                - Xg, Yg, Zg: 3D meshgrid arrays (for visualization)
+                - grid_points: (N_grid, 3) flattened grid points
+                - xs, ys, zs: 1D coordinate arrays
+        """
         pad = float(self.cfg['pad_bounds'])
         res_xy = float(resolution_xy or self.cfg['resolution_xy'])
         res_z = float(resolution_z or self.cfg['resolution_z'])
@@ -387,14 +634,40 @@ class DisturbanceFieldHelper:
         return Xg, Yg, Zg, grid_points, xs, ys, zs
 
     def predict_direct_field_3d(self, fit_params: Dict[str, Any], grid_points: np.ndarray, cause_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Predict GP field mean and standard deviation at grid points.
+        
+        Uses the fitted GP model to predict disturbance values at query points.
+        The mean prediction uses the learned parameters (A, b) and basis function phi.
+        The standard deviation is a simple heuristic (10% of mean std) - for full
+        Bayesian uncertainty, use the GPUncertaintyField class from gp_sampler.py.
+        
+        Args:
+            fit_params: Dictionary with fitted parameters (lxy, lz, A, b)
+            grid_points: (N, 3) query points where we want predictions
+            cause_points: (M, 3) cause points (centers of RBF kernels)
+        
+        Returns:
+            tuple (mean_pred, std_pred):
+                - mean_pred: (N,) mean disturbance predictions
+                - std_pred: (N,) standard deviation predictions (heuristic)
+        
+        Note:
+            For full Bayesian uncertainty (epistemic + aleatoric), consider using
+            the GPUncertaintyField class which implements proper variance computation
+            via Bayesian linear regression: Var(y*) = sigma² * (1 + v^T * (X^T X)^-1 * v)
+        """
         if fit_params is None or 'lxy' not in fit_params or fit_params['lxy'] is None:
             return np.zeros(grid_points.shape[0]), np.zeros(grid_points.shape[0])
         lxy = float(fit_params['lxy'])
         lz = float(fit_params['lz'])
         A = float(fit_params['A'])
         b = float(fit_params['b'])
+        # Compute basis function at query points
         phi = self._sum_of_anisotropic_rbf(grid_points, cause_points, lxy=lxy, lz=lz)
+        # Mean prediction: A * phi + b
         mean_pred = A * phi + b
+        # Simple heuristic for std (for full uncertainty, use GPUncertaintyField)
         std_pred = np.full(grid_points.shape[0], 0.1 * np.std(mean_pred))
         return mean_pred, std_pred
 
@@ -549,30 +822,54 @@ class DisturbanceFieldHelper:
     # High-level pipeline
     # ----------------------------
 
-    def fit_from_pointcloud_and_buffer(self, pointcloud_xyz: np.ndarray, buffer_dir: str, nominal_path: Optional[str] = None, nominal_xyz: Optional[np.ndarray] = None, clip_plane: str = 'xy') -> Dict[str, Any]:
+    def fit_from_pointcloud_and_buffer(self, pointcloud_xyz: np.ndarray, buffer_dir: str, nominal_path: Optional[str] = None, nominal_xyz: Optional[np.ndarray] = None, clip_plane: str = 'xy', objective: str = "nll") -> Dict[str, Any]:
         """
-        End-to-end fitting using a provided cause pointcloud and buffer directory.
-
+        End-to-end fitting pipeline using a provided cause pointcloud and buffer directory.
+        
+        This is the main entry point for GP fitting. It:
+        1. Loads actual trajectory and cause metadata from buffer directory
+        2. Loads/clips nominal trajectory to match actual trajectory segment
+        3. Computes disturbance magnitudes at nominal points
+        4. Fits GP parameters (lxy, lz, A, b) using the superposed RBF model
+        
         Args:
-            pointcloud_xyz: numpy array (N,3) of cause points
-            buffer_dir: path to buffer dir containing poses and metadata
-            nominal_path: optional path to nominal JSON
-            nominal_xyz: alternatively, pass nominal points directly
+            pointcloud_xyz: numpy array (N,3) of cause points (e.g., from PCD file)
+            buffer_dir: path to buffer directory containing poses.npy and metadata
+            nominal_path: optional path to nominal trajectory JSON file
+            nominal_xyz: alternatively, pass nominal points directly as numpy array
             clip_plane: 'xy' or 'xz' for clipping nominal to actual segment
+            objective: "mse" or "nll" (default: "mse" for backward compatibility)
+                      - "mse": Mean squared error (standard)
+                      - "nll": Negative log-likelihood (Bayesian, better uncertainty)
+        
         Returns:
-            dict with fitted parameters and diagnostics
+            Dictionary with:
+                - 'fit': Fitted GP parameters (lxy, lz, A, b) and metrics
+                - 'actual_xyz': Actual trajectory points
+                - 'nominal_used': Nominal trajectory points used for fitting
+                - 'disturbances': Disturbance magnitudes at nominal points
+                - 'cause': Cause name/description (if available)
+                - 'cause_xyz': Cause location (if available)
         """
+        # Load actual trajectory and cause metadata
         actual_xyz, cause, cause_xyz = self.load_buffer_xyz_drift(buffer_dir)
+        
+        # Load nominal trajectory (from file or direct input)
         if nominal_xyz is None and nominal_path:
             nominal_xyz = self.load_nominal_xyz(nominal_path)
+        
+        # Clip nominal trajectory to match actual trajectory segment
         clipped_nominal = None
         if nominal_xyz is not None:
             clipped_nominal = self.clip_nominal_to_actual_segment(nominal_xyz, actual_xyz, plane=clip_plane)
             if clipped_nominal is None or len(clipped_nominal) == 0:
                 clipped_nominal = nominal_xyz
+        
+        # Compute disturbance magnitudes at nominal points
         if clipped_nominal is not None:
             nominal_points_used, disturbance_magnitudes = self.compute_disturbance_at_nominal_points(clipped_nominal, actual_xyz, cause_xyz)
             if nominal_points_used.size == 0:
+                # Fallback: use drift vectors if no close matches
                 drift_vectors, drift_magnitudes = self.compute_trajectory_drift_vectors(actual_xyz, clipped_nominal)
                 if drift_vectors is None:
                     disturbance_magnitudes = np.zeros(len(clipped_nominal))
@@ -581,9 +878,18 @@ class DisturbanceFieldHelper:
                     disturbance_magnitudes = drift_magnitudes
                     nominal_points_used = clipped_nominal
         else:
+            # No nominal trajectory: use actual trajectory as baseline (zero disturbances)
             disturbance_magnitudes = np.zeros(len(actual_xyz))
             nominal_points_used = actual_xyz
-        fit = self.fit_direct_superposition_to_disturbances(nominal_points_used, disturbance_magnitudes, pointcloud_xyz if pointcloud_xyz is not None else np.empty((0, 3), dtype=float))
+        
+        # Fit GP parameters using the computed disturbances
+        fit = self.fit_direct_superposition_to_disturbances(
+            nominal_points_used, 
+            disturbance_magnitudes, 
+            pointcloud_xyz if pointcloud_xyz is not None else np.empty((0, 3), dtype=float),
+            objective=objective
+        )
+        
         return {
             'fit': fit,
             'actual_xyz': actual_xyz,

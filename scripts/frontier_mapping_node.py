@@ -184,6 +184,8 @@ class SemanticDepthOctoMapNode(Node):
 		self.gp_fit_lock = threading.Lock()
 		self.gp_fitting_active = False
 		self.global_gp_params = None
+		self.global_nominal_points = None  # Store nominal points for uncertainty computation
+		self.global_disturbances = None  # Store disturbances for uncertainty computation
 		self.last_gp_update_time = 0.0
 		self.gp_update_interval = 1.0
 		self.gp_computation_thread = None
@@ -285,6 +287,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.registry_query_lock = threading.Lock()
 		self.gp_visualization_pub = self.create_publisher(PointCloud2, '/gp_field_visualization', 10)
 		self.costmap_pub = self.create_publisher(PointCloud2, '/semantic_costmap', 10)
+		self.gp_uncertainty_pub = self.create_publisher(PointCloud2, '/gp_uncertainty_field', 10)
 		# New: frontiers and rays publishers
 		self.frontiers_pub = self.create_publisher(PointCloud2, '/vdb_frontiers', 10)
 		self.mask_frontiers_pub = self.create_publisher(PointCloud2, '/mask_frontiers', 10)
@@ -935,6 +938,7 @@ class SemanticDepthOctoMapNode(Node):
 
 	def _run_gp_fit_task(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Run GP fitting and save parameters to buffer directory."""
+		result = None
 		try:
 			self.get_logger().info(f"Starting GP fit for buffer: {buffer_dir}")
 			helper = DisturbanceFieldHelper()
@@ -971,7 +975,9 @@ class SemanticDepthOctoMapNode(Node):
 					'mse': fit.get('mse'),
 					'rmse': fit.get('rmse'),
 					'mae': fit.get('mae'),
-					'r2_score': fit.get('r2_score')
+					'r2_score': fit.get('r2_score'),
+					'sigma2': fit.get('sigma2'),  # Noise variance for uncertainty
+					'nll': fit.get('nll')  # Negative log-likelihood
 				},
 				'optimization': ({
 					'nit': getattr(opt, 'nit', None),
@@ -1003,16 +1009,18 @@ class SemanticDepthOctoMapNode(Node):
 			with self.gp_fit_lock:
 				self.gp_fitting_active = False
 			
-			# Store the latest GP parameters for global use
+			# Store the latest GP parameters and training data for global use
 			if result and 'fit' in result:
 				self.global_gp_params = result['fit']
+				self.global_nominal_points = result.get('nominal_used')  # Store for uncertainty computation
+				self.global_disturbances = result.get('disturbances')  # Store for uncertainty computation
 				self.get_logger().info(f"Updated global GP parameters: lxy={self.global_gp_params.get('lxy', 0):.3f}, lz={self.global_gp_params.get('lz', 0):.3f}, A={self.global_gp_params.get('A', 0):.3f}")
 			
 			# After GP fitting is complete, create and publish visualization
-			self._create_and_publish_gp_visualization(buffer_dir)
+			self._create_and_publish_gp_visualization(buffer_dir, result)
 
-	def _create_and_publish_gp_visualization(self, buffer_dir: str):
-		"""Create and publish GP field visualization using the SAME optimized method as semantic voxels."""
+	def _create_and_publish_gp_visualization(self, buffer_dir: str, result: Optional[Dict] = None):
+		"""Create and publish GP field visualization and epistemic uncertainty field."""
 		try:
 			if not GP_HELPER_AVAILABLE:
 				return
@@ -1063,6 +1071,20 @@ class SemanticDepthOctoMapNode(Node):
 			costmap_cloud = self._create_costmap_pointcloud(grid_points, gp_values)
 			if costmap_cloud:
 				self.costmap_pub.publish(costmap_cloud)
+			
+			# Compute and publish epistemic uncertainty field
+			if result is not None:
+				nominal_points = result.get('nominal_used')
+				disturbances = result.get('disturbances')
+				if nominal_points is not None and disturbances is not None and len(nominal_points) > 0:
+					uncertainty_std = self._compute_epistemic_uncertainty(
+						grid_points, cause_points, fit_params, nominal_points, disturbances
+					)
+					if uncertainty_std is not None:
+						uncertainty_cloud = self._create_uncertainty_pointcloud(grid_points, uncertainty_std)
+						if uncertainty_cloud:
+							self.gp_uncertainty_pub.publish(uncertainty_cloud)
+							self.get_logger().info(f"Published GP epistemic uncertainty field: {len(grid_points)} points")
 			
 			self.get_logger().info(f"Published cause.pcd GP visualization + costmap: {len(grid_points)} points, {len(cause_points)} cause voxels, radius={adaptive_radius:.2f}m (SAME method as semantic voxels)")
 			
@@ -1438,6 +1460,18 @@ class SemanticDepthOctoMapNode(Node):
 			if costmap_cloud:
 				self.costmap_pub.publish(costmap_cloud)
 			
+			# Compute and publish epistemic uncertainty if training data is available
+			if (self.global_nominal_points is not None and self.global_disturbances is not None and 
+			    len(self.global_nominal_points) > 0 and len(self.global_disturbances) > 0):
+				uncertainty_std = self._compute_epistemic_uncertainty(
+					grid_points, semantic_points, self.global_gp_params,
+					self.global_nominal_points, self.global_disturbances
+				)
+				if uncertainty_std is not None:
+					uncertainty_cloud = self._create_uncertainty_pointcloud(grid_points, uncertainty_std)
+					if uncertainty_cloud:
+						self.gp_uncertainty_pub.publish(uncertainty_cloud)
+			
 			self.get_logger().info(f"Published GP visualization + costmap: {len(grid_points)} points, {len(semantic_voxels)} voxels, radius={adaptive_radius:.2f}m")
 			
 		except Exception as e:
@@ -1621,6 +1655,143 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().error(f"Error in fast anisotropic RBF: {e}")
 			return np.zeros(grid_points.shape[0], dtype=float)
+	
+	def _compute_epistemic_uncertainty(self, grid_points: np.ndarray, cause_points: np.ndarray, 
+	                                   fit_params: dict, nominal_points: np.ndarray, 
+	                                   disturbances: np.ndarray) -> Optional[np.ndarray]:
+		"""
+		Compute epistemic uncertainty (standard deviation) at query points using Bayesian linear regression.
+		
+		Uncertainty = sqrt(sigma² * (1 + v^T * (X^T X)^-1 * v))
+		where v = [phi(x), 1] is the feature vector at query point x.
+		
+		This captures uncertainty in A and b parameters given fixed lxy, lz.
+		
+		Args:
+			grid_points: (N, 3) query points
+			cause_points: (M, 3) cause points
+			fit_params: Dictionary with lxy, lz, sigma2
+			nominal_points: (K, 3) training points where disturbances were measured
+			disturbances: (K,) observed disturbance magnitudes
+		
+		Returns:
+			(N,) predictive standard deviation (uncertainty)
+		"""
+		try:
+			lxy = fit_params.get('lxy')
+			lz = fit_params.get('lz')
+			sigma2_noise = fit_params.get('sigma2')
+			
+			if lxy is None or lz is None or sigma2_noise is None:
+				self.get_logger().warn("Missing GP parameters for uncertainty computation")
+				return None
+			
+			if len(nominal_points) == 0 or len(disturbances) == 0:
+				self.get_logger().warn("No training data for uncertainty computation")
+				return None
+			
+			# 1. Compute training feature matrix X
+			phi_train = self._sum_of_anisotropic_rbf_fast(nominal_points, cause_points, lxy, lz)
+			X_train = np.column_stack([phi_train, np.ones(len(phi_train))])  # (K, 2)
+			
+			# 2. Compute parameter covariance: Cov(A, b) = sigma² * (X^T X)^-1
+			XtX = X_train.T @ X_train
+			XtX[0, 0] += 1e-6  # Regularization for stability
+			XtX[1, 1] += 1e-6
+			
+			try:
+				XtX_inv = np.linalg.inv(XtX)
+				Cov_params = sigma2_noise * XtX_inv  # (2, 2)
+			except np.linalg.LinAlgError:
+				# Fallback: just return noise level
+				return np.full(len(grid_points), np.sqrt(sigma2_noise))
+			
+			# 3. Compute phi at query points
+			phi_query = self._sum_of_anisotropic_rbf_fast(grid_points, cause_points, lxy, lz)
+			
+			# 4. Epistemic variance: v^T * Cov * v where v = [phi, 1]
+			epistemic_var = (Cov_params[0, 0] * phi_query**2 + 
+			                 2 * Cov_params[0, 1] * phi_query + 
+			                 Cov_params[1, 1])
+			
+			# 5. Total variance = epistemic + aleatoric
+			total_variance = epistemic_var + sigma2_noise
+			
+			# Return standard deviation
+			return np.sqrt(np.maximum(total_variance, 0.0))
+			
+		except Exception as e:
+			self.get_logger().error(f"Error computing epistemic uncertainty: {e}")
+			import traceback
+			traceback.print_exc()
+			return None
+	
+	def _create_uncertainty_pointcloud(self, grid_points: np.ndarray, uncertainty_std: np.ndarray) -> Optional[PointCloud2]:
+		"""
+		Create point cloud for epistemic uncertainty visualization.
+		
+		Similar to _create_costmap_pointcloud but for uncertainty values instead of disturbance.
+		
+		Args:
+			grid_points: (N, 3) query points
+			uncertainty_std: (N,) uncertainty standard deviation values
+		
+		Returns:
+			PointCloud2 message with XYZ + uncertainty values
+		"""
+		try:
+			if len(grid_points) == 0 or len(uncertainty_std) == 0:
+				return None
+			
+			# Use actual uncertainty std values for visualization
+			uncertainty_values = uncertainty_std.astype(np.float32)
+			
+			# Create PointCloud2 message with XYZ + uncertainty values
+			header = Header()
+			header.stamp = self.get_clock().now().to_msg()
+			header.frame_id = self.map_frame
+			
+			# Create structured array with XYZ + uncertainty value
+			cloud_data_combined = np.empty(len(grid_points), dtype=[
+				('x', np.float32), ('y', np.float32), ('z', np.float32), 
+				('uncertainty', np.float32)
+			])
+			
+			# Fill in the data
+			cloud_data_combined['x'] = grid_points[:, 0]
+			cloud_data_combined['y'] = grid_points[:, 1]
+			cloud_data_combined['z'] = grid_points[:, 2]
+			cloud_data_combined['uncertainty'] = uncertainty_values
+			
+			# Create PointCloud2 message
+			cloud_msg = PointCloud2()
+			cloud_msg.header = header
+			
+			# Define the fields - XYZ + uncertainty value
+			cloud_msg.fields = [
+				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
+				pc2.PointField(name='uncertainty', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
+			]
+			
+			# Set the message properties
+			cloud_msg.point_step = 16  # 4 bytes per float * 4 fields (x, y, z, uncertainty)
+			cloud_msg.width = len(grid_points)
+			cloud_msg.height = 1
+			cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
+			cloud_msg.is_dense = True
+			
+			# Set the data
+			cloud_msg.data = cloud_data_combined.tobytes()
+			
+			self.get_logger().info(f"Created uncertainty point cloud: min={uncertainty_values.min():.3f}, max={uncertainty_values.max():.3f}")
+			
+			return cloud_msg
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating uncertainty point cloud: {e}")
+			return None
 	
 	def _create_costmap_pointcloud(self, grid_points: np.ndarray, gp_values: np.ndarray) -> Optional[PointCloud2]:
 		"""Create costmap point cloud with ACTUAL disturbance values for motion planning."""
