@@ -187,13 +187,30 @@ class SemanticDepthOctoMapNode(Node):
 		self.global_nominal_points = None  # Store nominal points for uncertainty computation
 		self.global_disturbances = None  # Store disturbances for uncertainty computation
 		self.last_gp_update_time = 0.0
-		self.gp_update_interval = 1.0
+		self.gp_update_interval = 0.5  # 2 Hz update rate for robot-centric grid
 		self.gp_computation_thread = None
 		self.gp_thread_lock = threading.Lock()
 		self.gp_thread_running = False
 		self.min_radius = 0.5
 		self.max_radius = 2.0
 		self.base_radius = 1.0
+		
+		# Robot-centric 3D grid parameters (NEW)
+		self.robot_grid_size_xy = 5.0  # 10m x 10m in XY plane
+		self.robot_grid_size_z = 3.0    # 4m in Z axis
+		self.robot_grid_resolution = 0.1  # 0.2m voxel resolution
+		self.robot_position = None  # Current robot position (from latest_pose)
+		
+		# GPU tensor for mean and uncertainty fields (Channel=2, Depth, Height, Width)
+		try:
+			import torch
+			self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+			self.gp_grid_tensor = None  # Will be initialized on first update
+			self.TORCH_AVAILABLE = True
+			self.get_logger().info(f"PyTorch GPU tensor backend: {self.device}")
+		except ImportError:
+			self.TORCH_AVAILABLE = False
+			self.get_logger().warn("PyTorch not available, using NumPy fallback")
 		
 		# PathManager initialization
 		self.path_manager = None
@@ -440,6 +457,12 @@ class SemanticDepthOctoMapNode(Node):
 
 	def pose_callback(self, msg: PoseStamped):
 		self.latest_pose = msg
+		# Update robot position for robot-centric grid (NEW)
+		self.robot_position = np.array([
+			msg.pose.position.x,
+			msg.pose.position.y,
+			msg.pose.position.z
+		], dtype=np.float32)
 		# Push into pose buffer with timestamp
 		try:
 			pose_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -1017,7 +1040,7 @@ class SemanticDepthOctoMapNode(Node):
 				self.get_logger().info(f"Updated global GP parameters: lxy={self.global_gp_params.get('lxy', 0):.3f}, lz={self.global_gp_params.get('lz', 0):.3f}, A={self.global_gp_params.get('A', 0):.3f}")
 			
 			# After GP fitting is complete, create and publish visualization
-			self._create_and_publish_gp_visualization(buffer_dir, result)
+			# self._create_and_publish_gp_visualization(buffer_dir, result)
 
 	def _create_and_publish_gp_visualization(self, buffer_dir: str, result: Optional[Dict] = None):
 		"""Create and publish GP field visualization and epistemic uncertainty field."""
@@ -1426,58 +1449,200 @@ class SemanticDepthOctoMapNode(Node):
 				self.gp_thread_running = False
 	
 	def _update_semantic_gp_visualization(self):
-		"""Update GP visualization for all semantic voxels using global GP parameters - optimized for speed."""
+		"""
+		Update GP visualization using a ROBOT-CENTRIC 3D grid.
+		
+		Instead of predicting near cause points, this creates a 3D grid around the robot
+		(e.g., 10m × 10m × 4m) and predicts GP mean and epistemic uncertainty on this grid.
+		Results are stored in a GPU tensor (Channel=2, Depth, Height, Width) where:
+		  - Channel 0 = GP Mean
+		  - Channel 1 = Epistemic Uncertainty
+		
+		Update rate: 2-5 Hz (asynchronous)
+		"""
 		try:
 			if self.global_gp_params is None:
 				return
 			
-			# Get all semantic voxels (these are like the cause points)
+			# Check if robot position is available
+			if self.robot_position is None:
+				self.get_logger().warn("Robot position not available yet, skipping GP update")
+				return
+			
+			# Get all semantic voxels (cause points)
 			semantic_voxels = self._get_all_semantic_voxels()
 			if len(semantic_voxels) == 0:
 				return
 			
-			# Convert to numpy array (like loading cause points from PCD)
+			# Convert to numpy array
 			semantic_points = np.array(semantic_voxels)
 			
-			# Calculate adaptive radius based on voxel density
-			adaptive_radius = self._calculate_adaptive_radius(semantic_points)
-			
-			# Create FAST, adaptive grids around semantic voxel clusters
-			grid_points = self._create_fast_adaptive_gp_grid(semantic_points, adaptive_radius)
+			# ============================================================
+			# ROBOT-CENTRIC 3D GRID GENERATION (NEW APPROACH)
+			# ============================================================
+			grid_points, grid_shape = self._create_robot_centric_3d_grid()
 			if len(grid_points) == 0:
+				self.get_logger().warn("Robot-centric grid is empty")
 				return
 			
-			# Predict GP field values using OPTIMIZED method
-			gp_values = self._predict_gp_field_fast(grid_points, semantic_points, self.global_gp_params)
+			# Predict GP mean on robot-centric grid
+			gp_mean = self._predict_gp_field_fast(grid_points, semantic_points, self.global_gp_params)
 			
-			# Create colored point cloud for visualization
-			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_values)
-			if colored_cloud:
-				self.gp_visualization_pub.publish(colored_cloud)
-			
-			# Create costmap (same data, different interpretation)
-			costmap_cloud = self._create_costmap_pointcloud(grid_points, gp_values)
-			if costmap_cloud:
-				self.costmap_pub.publish(costmap_cloud)
-			
-			# Compute and publish epistemic uncertainty if training data is available
+			# Compute epistemic uncertainty on robot-centric grid
+			uncertainty_std = None
 			if (self.global_nominal_points is not None and self.global_disturbances is not None and 
 			    len(self.global_nominal_points) > 0 and len(self.global_disturbances) > 0):
 				uncertainty_std = self._compute_epistemic_uncertainty(
 					grid_points, semantic_points, self.global_gp_params,
 					self.global_nominal_points, self.global_disturbances
 				)
-				if uncertainty_std is not None:
-					uncertainty_cloud = self._create_uncertainty_pointcloud(grid_points, uncertainty_std)
-					if uncertainty_cloud:
-						self.gp_uncertainty_pub.publish(uncertainty_cloud)
+			else:
+				# Fallback: use zeros for uncertainty if no training data
+				uncertainty_std = np.zeros(len(grid_points), dtype=np.float32)
 			
-			self.get_logger().info(f"Published GP visualization + costmap: {len(grid_points)} points, {len(semantic_voxels)} voxels, radius={adaptive_radius:.2f}m")
+			# ============================================================
+			# STORE IN GPU TENSOR (Channel=2, Depth, Height, Width)
+			# ============================================================
+			self._update_gp_gpu_tensor(gp_mean, uncertainty_std, grid_shape)
+			
+			# ============================================================
+			# PUBLISH POINTCLOUDS WITH INTENSITY AS MAGNITUDE
+			# ============================================================
+			# Publish GP mean field
+			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_mean)
+			if colored_cloud:
+				self.gp_visualization_pub.publish(colored_cloud)
+			
+			# Publish costmap (mean disturbance values)
+			costmap_cloud = self._create_costmap_pointcloud(grid_points, gp_mean)
+			if costmap_cloud:
+				self.costmap_pub.publish(costmap_cloud)
+			
+			# Publish epistemic uncertainty field
+			if uncertainty_std is not None:
+				uncertainty_cloud = self._create_uncertainty_pointcloud(grid_points, uncertainty_std)
+				if uncertainty_cloud:
+					self.gp_uncertainty_pub.publish(uncertainty_cloud)
+			
+			self.get_logger().info(
+				f"Published robot-centric GP fields: {len(grid_points)} points, "
+				f"grid_shape={grid_shape}, robot_pos=[{self.robot_position[0]:.2f}, {self.robot_position[1]:.2f}, {self.robot_position[2]:.2f}], "
+				f"mean_range=[{gp_mean.min():.3f}, {gp_mean.max():.3f}], "
+				f"uncertainty_range=[{uncertainty_std.min():.3f}, {uncertainty_std.max():.3f}]"
+			)
 			
 		except Exception as e:
-			self.get_logger().error(f"Error updating semantic GP visualization: {e}")
+			self.get_logger().error(f"Error updating robot-centric GP visualization: {e}")
 			import traceback
 			traceback.print_exc()
+	
+
+	# ============================================================
+	# ROBOT-CENTRIC 3D GRID GP PREDICTION METHODS
+	# ============================================================
+	
+	def _create_robot_centric_3d_grid(self):
+		"""
+		Create a 3D grid around the robot position for GP prediction.
+		
+		Grid size: 10m × 10m (XY) × 4m (Z)
+		Resolution: 0.2m
+		
+		Returns:
+			grid_points: (N, 3) numpy array of grid points in world coordinates
+			grid_shape: (D, H, W) tuple of grid dimensions
+		"""
+		try:
+			if self.robot_position is None:
+				self.get_logger().warn("Robot position not available for grid generation")
+				return np.array([]), (0, 0, 0)
+			
+			# Extract robot position
+			robot_x, robot_y, robot_z = self.robot_position
+			
+			# Define grid bounds centered around robot
+			half_size_xy = self.robot_grid_size_xy / 2.0  # 5m in each direction
+			half_size_z = self.robot_grid_size_z / 2.0    # 2m in each direction
+			
+			# Create 1D coordinate arrays
+			x_min = robot_x - half_size_xy
+			x_max = robot_x + half_size_xy
+			y_min = robot_y - half_size_xy
+			y_max = robot_y + half_size_xy
+			z_min = robot_z - half_size_z
+			z_max = robot_z + half_size_z
+			
+			# Generate grid coordinates
+			x_coords = np.arange(x_min, x_max, self.robot_grid_resolution)
+			y_coords = np.arange(y_min, y_max, self.robot_grid_resolution)
+			z_coords = np.arange(z_min, z_max, self.robot_grid_resolution)
+			
+			# Create meshgrid
+			X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+			
+			# Flatten to (N, 3) array
+			grid_points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1).astype(np.float32)
+			
+			# Grid shape for tensor reshaping (Depth, Height, Width)
+			grid_shape = (len(x_coords), len(y_coords), len(z_coords))
+			
+			self.get_logger().info(
+				f"Created robot-centric 3D grid: {grid_points.shape[0]} points, "
+				f"shape={grid_shape}, resolution={self.robot_grid_resolution}m"
+			)
+			
+			return grid_points, grid_shape
+			
+		except Exception as e:
+			self.get_logger().error(f"Error creating robot-centric 3D grid: {e}")
+			import traceback
+			traceback.print_exc()
+			return np.array([]), (0, 0, 0)
+	
+	def _update_gp_gpu_tensor(self, gp_mean, uncertainty_std, grid_shape):
+		"""
+		Update GPU tensor with GP mean and uncertainty fields.
+		
+		Tensor format: (Channel=2, Depth, Height, Width)
+		  - Channel 0: GP Mean
+		  - Channel 1: Epistemic Uncertainty
+		
+		Args:
+			gp_mean: (N,) GP mean predictions
+			uncertainty_std: (N,) Epistemic uncertainty predictions
+			grid_shape: (D, H, W) grid dimensions
+		"""
+		try:
+			if not self.TORCH_AVAILABLE:
+				# Skip GPU tensor update if PyTorch not available
+				return
+			
+			import torch
+			
+			# Reshape flattened arrays to 3D grid
+			D, H, W = grid_shape
+			mean_grid = gp_mean.reshape(D, H, W).astype(np.float32)
+			uncertainty_grid = uncertainty_std.reshape(D, H, W).astype(np.float32)
+			
+			# Stack into (2, D, H, W) tensor
+			# Channel 0 = Mean, Channel 1 = Uncertainty
+			combined_grid = np.stack([mean_grid, uncertainty_grid], axis=0)
+			
+			# Convert to PyTorch tensor and move to GPU
+			self.gp_grid_tensor = torch.from_numpy(combined_grid).to(self.device)
+			
+			self.get_logger().info(
+				f"Updated GPU tensor: shape={self.gp_grid_tensor.shape}, "
+				f"device={self.device}, "
+				f"mean_range=[{mean_grid.min():.3f}, {mean_grid.max():.3f}], "
+				f"uncertainty_range=[{uncertainty_grid.min():.3f}, {uncertainty_grid.max():.3f}]"
+			)
+			
+		except Exception as e:
+			self.get_logger().error(f"Error updating GP GPU tensor: {e}")
+			import traceback
+			traceback.print_exc()
+	
 	
 	def _calculate_adaptive_radius(self, semantic_points: np.ndarray) -> float:
 		"""Calculate adaptive radius using nearest neighbor (O(N log N) instead of O(N²))."""
@@ -2162,9 +2327,9 @@ class SemanticDepthOctoMapNode(Node):
 		now = time.time()
 		if not hasattr(self, 'last_frontier_compute_time'):
 			self.last_frontier_compute_time = 0.0
-		if (now - self.last_frontier_compute_time) >= 0.1:  # Every 0.5s instead of every frame
-			self._compute_and_publish_regular_frontiers()
-			self.last_frontier_compute_time = now
+		# if (now - self.last_frontier_compute_time) >= 0.1:  # Every 0.5s instead of every frame
+		# 	self._compute_and_publish_regular_frontiers()
+		# 	self.last_frontier_compute_time = now
 
 	def _update_regular_mapping(self, depth_m: np.ndarray, pose: PoseStamped):
 		"""Update regular VDB occupancy mapping in a separate thread."""
@@ -2289,9 +2454,9 @@ class SemanticDepthOctoMapNode(Node):
 					self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
 					
 					# Process rays (no encoding used due to global_encoding=True)
-					self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
+					# self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
 					# Publish mask-specific frontiers and rays immediately (same as tmp.py)
-					self._publish_mask_frontiers_and_rays()
+					# self._publish_mask_frontiers_and_rays()
 			except Exception as e:
 				self.get_logger().warn(f"Mask rays/frontiers processing failed: {e}")
 				
