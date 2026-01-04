@@ -261,6 +261,29 @@ def generate_launch_description():
             ('/vlm_answer', '/vlm_answer')
         ]
     )
+
+    mppi_control_node = Node(
+        package='resilience',  # Replace with your actual package name
+        executable='control_node.py',  # Or entry point name if set in setup.py
+        name='mppi_control_node',
+        output='screen',
+        emulate_tty=True,  # Better color output in terminal
+        parameters=[{
+            # Add any parameters your node needs here.
+            # Based on your code, there aren't explicitly declared ROS parameters yet,
+            # but usually you'd want to expose things like:
+            'control_frequency': 20.0,
+            'grid_topic': '/gp/grid',
+            'pose_topic': '/mavros/local_position/pose',
+            'nominal_path_topic': '/nominal_path'
+        }],
+        remappings=[
+            # Remap internal topic names to system topic names
+            ('/gp/grid', '/gp/local_field'),      # Remap to your GP grid topic
+            ('/nominal_path', '/plan'),           # Remap to your global planner path
+            ('/cmd_vel', '/mavros/setpoint_velocity/cmd_vel_unstamped') # Output command
+        ]
+    )
     
     return LaunchDescription([
         # Main resilience node arguments
@@ -296,5 +319,6 @@ def generate_launch_description():
         # Launch all nodes
         main_resilience_node,
         vdb_semantic_mapping_node,
-        narration_display_node
+        narration_display_node,
+        mppi_control_node
     ])

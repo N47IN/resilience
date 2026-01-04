@@ -25,6 +25,7 @@ install(PROGRAMS
   scripts/depth_octomap_node.py
   scripts/frontier_mapping_node.py
   scripts/publish_plan.py
+  scripts/control_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

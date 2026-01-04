@@ -21,6 +21,7 @@ from std_msgs.msg import ColorRGBA
 from std_msgs.msg import String
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
 import numpy as np
 import torch
@@ -309,6 +310,8 @@ class SemanticDepthOctoMapNode(Node):
 		self.frontiers_pub = self.create_publisher(PointCloud2, '/vdb_frontiers', 10)
 		self.mask_frontiers_pub = self.create_publisher(PointCloud2, '/mask_frontiers', 10)
 		self.mask_rays_pub = self.create_publisher(MarkerArray, '/mask_rays', 10)
+		# Raw GP grid publisher for control
+		self.gp_grid_raw_pub = self.create_publisher(Float32MultiArray, '/gp_grid_raw', 10)
 		
 		self.get_logger().info("=" * 60)
 		self.get_logger().info("SEMANTIC VDB MAPPING SYSTEM READY")
@@ -1038,83 +1041,7 @@ class SemanticDepthOctoMapNode(Node):
 				self.global_nominal_points = result.get('nominal_used')  # Store for uncertainty computation
 				self.global_disturbances = result.get('disturbances')  # Store for uncertainty computation
 				self.get_logger().info(f"Updated global GP parameters: lxy={self.global_gp_params.get('lxy', 0):.3f}, lz={self.global_gp_params.get('lz', 0):.3f}, A={self.global_gp_params.get('A', 0):.3f}")
-			
-			# After GP fitting is complete, create and publish visualization
-			# self._create_and_publish_gp_visualization(buffer_dir, result)
 
-	def _create_and_publish_gp_visualization(self, buffer_dir: str, result: Optional[Dict] = None):
-		"""Create and publish GP field visualization and epistemic uncertainty field."""
-		try:
-			if not GP_HELPER_AVAILABLE:
-				return
-			
-			# Load GP fit parameters
-			gp_fit_path = os.path.join(buffer_dir, 'voxel_gp_fit.json')
-			if not os.path.exists(gp_fit_path):
-				self.get_logger().warn(f"GP fit file not found: {gp_fit_path}")
-				return
-			
-			with open(gp_fit_path, 'r') as f:
-				gp_data = json.load(f)
-			
-			fit_params = gp_data.get('fit_params', {})
-			if not fit_params:
-				self.get_logger().warn("No GP fit parameters found")
-				return
-			
-			# Load cause points from PCD (these are semantic voxels from narration)
-			pcd_path = os.path.join(buffer_dir, 'points.pcd')
-			if not os.path.exists(pcd_path):
-				self.get_logger().warn(f"PCD file not found: {pcd_path}")
-				return
-			
-			cause_points = self._load_pcd_points(pcd_path)
-			if cause_points.size == 0:
-				self.get_logger().warn("No cause points loaded from PCD")
-				return
-			
-			# Use the SAME optimized method as semantic voxels
-			# Calculate adaptive radius based on cause points
-			adaptive_radius = self._calculate_adaptive_radius(cause_points)
-			
-			# Create FAST, adaptive grids around cause points (same as semantic voxels)
-			grid_points = self._create_fast_adaptive_gp_grid(cause_points, adaptive_radius)
-			if len(grid_points) == 0:
-				return
-			
-			# Predict GP field values using OPTIMIZED method (same as semantic voxels)
-			gp_values = self._predict_gp_field_fast(grid_points, cause_points, fit_params)
-			
-			# Create colored point cloud for visualization (same as semantic voxels)
-			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_values)
-			if colored_cloud:
-				self.gp_visualization_pub.publish(colored_cloud)
-			
-			# Create costmap (same as semantic voxels)
-			costmap_cloud = self._create_costmap_pointcloud(grid_points, gp_values)
-			if costmap_cloud:
-				self.costmap_pub.publish(costmap_cloud)
-			
-			# Compute and publish epistemic uncertainty field
-			if result is not None:
-				nominal_points = result.get('nominal_used')
-				disturbances = result.get('disturbances')
-				if nominal_points is not None and disturbances is not None and len(nominal_points) > 0:
-					uncertainty_std = self._compute_epistemic_uncertainty(
-						grid_points, cause_points, fit_params, nominal_points, disturbances
-					)
-					if uncertainty_std is not None:
-						uncertainty_cloud = self._create_uncertainty_pointcloud(grid_points, uncertainty_std)
-						if uncertainty_cloud:
-							self.gp_uncertainty_pub.publish(uncertainty_cloud)
-							self.get_logger().info(f"Published GP epistemic uncertainty field: {len(grid_points)} points")
-			
-			self.get_logger().info(f"Published cause.pcd GP visualization + costmap: {len(grid_points)} points, {len(cause_points)} cause voxels, radius={adaptive_radius:.2f}m (SAME method as semantic voxels)")
-			
-		except Exception as e:
-			self.get_logger().error(f"Error creating GP visualization: {e}")
-			import traceback
-			traceback.print_exc()
 	
 	def _update_registry_gp_params(self, cause_name: str, buffer_dir: str, fit: Dict):
 		"""Update cause registry with GP params via ROS topic query.
@@ -1524,6 +1451,9 @@ class SemanticDepthOctoMapNode(Node):
 				if uncertainty_cloud:
 					self.gp_uncertainty_pub.publish(uncertainty_cloud)
 			
+			# Publish raw grid for control node
+			self._publish_raw_gp_grid(gp_mean, uncertainty_std, grid_shape, grid_points)
+
 			self.get_logger().info(
 				f"Published robot-centric GP fields: {len(grid_points)} points, "
 				f"grid_shape={grid_shape}, robot_pos=[{self.robot_position[0]:.2f}, {self.robot_position[1]:.2f}, {self.robot_position[2]:.2f}], "
@@ -1639,9 +1569,61 @@ class SemanticDepthOctoMapNode(Node):
 			)
 			
 		except Exception as e:
-			self.get_logger().error(f"Error updating GP GPU tensor: {e}")
 			import traceback
 			traceback.print_exc()
+
+	def _publish_raw_gp_grid(self, gp_mean, uncertainty_std, grid_shape, grid_points):
+		"""Publish raw GP grid data for control node."""
+		try:
+			# grid_shape is (Nx, Ny, Nz) - corresponding to coords
+			# gp_mean is flattened (N,)
+			
+			msg = Float32MultiArray()
+			
+			# Encode metadata in the layout using labels or dimensions
+			# Dim 0: Meta [min_x, min_y, min_z, res, size_x, size_y, size_z]
+			# We'll just put metadata as the first few elements of the data array, or use a structured approach
+			# Let's pack metadata as a prefix to the data. 
+			
+			if self.robot_position is None:
+				return
+				
+			# Recalculate bounds from robot position and fixed params
+			half_size_xy = self.robot_grid_size_xy / 2.0
+			half_size_z = self.robot_grid_size_z / 2.0
+			min_x = self.robot_position[0] - half_size_xy
+			min_y = self.robot_position[1] - half_size_xy
+			min_z = self.robot_position[2] - half_size_z
+			
+			# Metadata header: 7 floats
+			metadata = [
+				min_x, min_y, min_z, 
+				self.robot_grid_resolution, 
+				float(grid_shape[0]), float(grid_shape[1]), float(grid_shape[2])
+			]
+			
+			# Concatenate: Metadata + Mean + Uncertainty
+			# Note: gp_mean and uncertainty_std are flattened
+			data_list = metadata + gp_mean.tolist() + uncertainty_std.tolist()
+			
+			msg.data = data_list
+			
+			# Describe layout
+			# Dim 0: Metadata (7)
+			# Dim 1: Mean (N)
+			# Dim 2: Uncertainty (N)
+			# This isn't a standard multiarray layout, but the receiver will know how to parse it.
+			# Or we can strictly use dimensions to describe the grid, but we need the origin offset.
+			
+			dim0 = MultiArrayDimension(label="metadata", size=7, stride=7)
+			dim1 = MultiArrayDimension(label="mean", size=len(gp_mean), stride=len(gp_mean))
+			dim2 = MultiArrayDimension(label="uncertainty", size=len(uncertainty_std), stride=len(uncertainty_std))
+			msg.layout.dim = [dim0, dim1, dim2]
+			
+			self.gp_grid_raw_pub.publish(msg)
+			
+		except Exception as e:
+			self.get_logger().error(f"Error publishing raw GP grid: {e}")
 	
 	
 	def _calculate_adaptive_radius(self, semantic_points: np.ndarray) -> float:
