@@ -102,7 +102,7 @@ class SemanticDepthOctoMapNode(Node):
 			('camera_info_topic', '/robot_1/sensors/front_stereo/left/camera_info'),
 			('pose_topic', '/robot_1/sensors/front_stereo/pose'),
 			('map_frame', 'map'),
-			('voxel_resolution', 0.1),
+			('voxel_resolution', 0.2),
 			('max_range', 1.5),
 			('min_range', 0.1),
 			('probability_hit', 0.7),
@@ -113,7 +113,7 @@ class SemanticDepthOctoMapNode(Node):
 			('publish_colored_cloud', True),
 			('use_cube_list_markers', True),
 			('max_markers', 30000),
-			('marker_publish_rate', 1.0),
+			('marker_publish_rate', 20.0),
 			('stats_publish_rate', 1.0),
 			('pose_is_base_link', True),
 			('apply_optical_frame_rotation', True),
@@ -188,7 +188,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.global_nominal_points = None  # Store nominal points for uncertainty computation
 		self.global_disturbances = None  # Store disturbances for uncertainty computation
 		self.last_gp_update_time = 0.0
-		self.gp_update_interval = 0.5  # 2 Hz update rate for robot-centric grid
+		self.gp_update_interval = 2.0
 		self.gp_computation_thread = None
 		self.gp_thread_lock = threading.Lock()
 		self.gp_thread_running = False
@@ -199,7 +199,7 @@ class SemanticDepthOctoMapNode(Node):
 		# Robot-centric 3D grid parameters (NEW)
 		self.robot_grid_size_xy = 5.0  # 10m x 10m in XY plane
 		self.robot_grid_size_z = 3.0    # 4m in Z axis
-		self.robot_grid_resolution = 0.1  # 0.2m voxel resolution
+		self.robot_grid_resolution = 0.2  # 0.2m voxel resolution
 		self.robot_position = None  # Current robot position (from latest_pose)
 		
 		# GPU tensor for mean and uncertainty fields (Channel=2, Depth, Height, Width)
@@ -255,7 +255,7 @@ class SemanticDepthOctoMapNode(Node):
 		# Temporal confirmation: track observations for each voxel
 		self.semantic_voxel_observations = {}  # voxel_key -> [{'vlm_answer': str, 'timestamp': float, 'frame_id': int}, ...]
 		self.narration_confirmation_threshold = 1  # Narration: instant confirmation (1 frame)
-		self.operational_confirmation_threshold = 2  # Operational: require 2 frames for noise rejection (non-blocking, incremental)
+		self.operational_confirmation_threshold = 3  # Operational: require 2 frames for noise rejection (non-blocking, incremental)
 		self.semantic_observation_max_age = 5.0  # Keep observations for 5 seconds
 		self.frame_counter = 0  # Track unique frames for operational hotspots
 		
@@ -312,7 +312,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.mask_rays_pub = self.create_publisher(MarkerArray, '/mask_rays', 10)
 		# Raw GP grid publisher for control
 		self.gp_grid_raw_pub = self.create_publisher(Float32MultiArray, '/gp_grid_raw', 10)
-		
+		self.voxel_resolution = 0.2
 		self.get_logger().info("=" * 60)
 		self.get_logger().info("SEMANTIC VDB MAPPING SYSTEM READY")
 		self.get_logger().info("=" * 60)
@@ -331,7 +331,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.get_logger().info(f"   Pose: {self.pose_topic}")
 		self.get_logger().info(f"   Semantic hotspots: {self.semantic_hotspots_topic}")
 		self.get_logger().info("=" * 60)
-
+		
 	def load_topic_configuration(self):
 		"""Load topic configuration from mapping config file."""
 		try:
@@ -780,6 +780,98 @@ class SemanticDepthOctoMapNode(Node):
 			pose_copy = PoseStamped()
 			pose_copy.header = pose.header
 			pose_copy.pose = pose.pose
+
+			device = self.vdb_mapper.device
+			h, w = mask.shape
+			
+			# Ensure minimum image size
+			if h < 1 or w < 1:
+				return
+			
+			# Create tensors with batch size 1 (critical for indexing)
+			depth_tensor = torch.from_numpy(depth_hot).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+			rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+			pose_4x4 = self._pose_to_4x4_matrix(pose)
+			
+			# Ensure pose_4x4 has correct batch dimension (1x4x4)
+			if pose_4x4.dim() == 2:
+				pose_4x4 = pose_4x4.unsqueeze(0)
+			elif pose_4x4.shape[0] != 1:
+				pose_4x4 = pose_4x4[:1]
+			
+			# Process with VDB mapper for semantic occupancy
+			
+			# Prepare masked depth for rays-only beyond max_range
+			depth_for_rays = np.zeros_like(depth_hot, dtype=np.float32)
+			masked = (mask > 0)
+			if self.camera_intrinsics is not None:
+				# Use original depth_m if available, otherwise use depth_hot
+				# For rays, we want pixels beyond max_range or missing depth
+				masked_depth_vals = depth_hot[masked]
+				threshold = float(self.max_range)
+				beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
+				dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
+				dr[beyond_or_missing] = np.inf
+				depth_for_rays[masked] = dr
+				mask_far = np.zeros_like(depth_for_rays, dtype=bool)
+				mask_far[masked] = beyond_or_missing
+				
+				if np.any(mask_far):
+					try:
+						far_v, far_u = np.where(mask_far)
+						fx, fy, cx, cy = self.camera_intrinsics
+						fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
+						u = far_u.astype(np.float32)
+						v = far_v.astype(np.float32)
+						dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+						dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+						pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+						R_world_cam = pose_mat[:3, :3]
+						origin_world = pose_mat[:3, 3]
+						dir_world = dir_cam @ R_world_cam.T
+						dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+						self._latest_pose_rays = (origin_world, dir_world)
+					except Exception:
+						self._latest_pose_rays = None
+				else:
+					# Fallback: derive rays from all masked pixels (sampled)
+					try:
+						if np.any(masked):
+							fx, fy, cx, cy = self.camera_intrinsics
+							fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
+							all_v, all_u = np.where(masked)
+							max_samples = 800
+							if all_u.shape[0] > max_samples:
+								idx = np.random.choice(all_u.shape[0], size=max_samples, replace=False)
+								all_u = all_u[idx]
+								all_v = all_v[idx]
+							u = all_u.astype(np.float32)
+							v = all_v.astype(np.float32)
+							dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
+							dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
+							pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
+							R_world_cam = pose_mat[:3, :3]
+							origin_world = pose_mat[:3, 3]
+							dir_world = dir_cam @ R_world_cam.T
+							dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
+							self._latest_pose_rays = (origin_world, dir_world)
+						else:
+							self._latest_pose_rays = None
+					except Exception:
+						self._latest_pose_rays = None
+				
+				# Process rays with conf_map to restrict to mask
+				rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=device)
+				depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(device)
+				pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(device)
+				conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+				
+				# Update intrinsics if available
+				fx, fy, cx, cy = self.camera_intrinsics
+				self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+				# self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
+				# Publish mask-specific frontiers and rays immediately (same as tmp.py)
+				self._publish_mask_frontiers_and_rays()
 			
 			threading.Thread(
 				target=self._update_semantic_vdb_mapping,
@@ -964,7 +1056,6 @@ class SemanticDepthOctoMapNode(Node):
 
 	def _run_gp_fit_task(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Run GP fitting and save parameters to buffer directory."""
-		result = None
 		try:
 			self.get_logger().info(f"Starting GP fit for buffer: {buffer_dir}")
 			helper = DisturbanceFieldHelper()
@@ -1035,12 +1126,13 @@ class SemanticDepthOctoMapNode(Node):
 			with self.gp_fit_lock:
 				self.gp_fitting_active = False
 			
-			# Store the latest GP parameters and training data for global use
+			# Store the latest GP parameters for global use
 			if result and 'fit' in result:
 				self.global_gp_params = result['fit']
 				self.global_nominal_points = result.get('nominal_used')  # Store for uncertainty computation
 				self.global_disturbances = result.get('disturbances')  # Store for uncertainty computation
 				self.get_logger().info(f"Updated global GP parameters: lxy={self.global_gp_params.get('lxy', 0):.3f}, lz={self.global_gp_params.get('lz', 0):.3f}, A={self.global_gp_params.get('A', 0):.3f}")
+			
 
 	
 	def _update_registry_gp_params(self, cause_name: str, buffer_dir: str, fit: Dict):
@@ -1163,95 +1255,7 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error loading PCD points: {e}")
 			return np.array([])
 	
-	def _create_gp_prediction_grid(self, cause_points: np.ndarray, grid_size: float = 2.0, resolution: float = 0.1) -> np.ndarray:
-		"""Create a 3D grid around the cause points for GP prediction."""
-		try:
-			# Find bounding box of cause points
-			min_coords = np.min(cause_points, axis=0)
-			max_coords = np.max(cause_points, axis=0)
-			center = (min_coords + max_coords) / 2.0
-			
-			# Extend bounding box by grid_size
-			extent = np.max(max_coords - min_coords) + grid_size
-			half_extent = extent / 2.0
-			
-			# Create grid
-			x_range = np.arange(center[0] - half_extent, center[0] + half_extent, resolution)
-			y_range = np.arange(center[1] - half_extent, center[1] + half_extent, resolution)
-			z_range = np.arange(center[2] - half_extent, center[2] + half_extent, resolution)
-			
-			# Create meshgrid
-			X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
-			grid_points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1)
-			
-			self.get_logger().info(f"Created GP prediction grid: {len(grid_points)} points around cause center {center}")
-			return grid_points
-			
-		except Exception as e:
-			self.get_logger().error(f"Error creating GP prediction grid: {e}")
-			return np.array([])
-	
-	def _predict_gp_field(self, grid_points: np.ndarray, cause_points: np.ndarray, fit_params: dict) -> np.ndarray:
-		"""Predict GP field values at grid points using the SAME anisotropic RBF method as cause.pcd."""
-		try:
-			# Extract GP parameters
-			lxy = fit_params.get('lxy', 0.5)
-			lz = fit_params.get('lz', 0.5)
-			A = fit_params.get('A', 1.0)
-			b = fit_params.get('b', 0.0)
-			
-			# Use the EXACT SAME anisotropic RBF computation as cause.pcd system
-			phi = self._sum_of_anisotropic_rbf(grid_points, cause_points, lxy, lz)
-			
-			# Apply the learned parameters: disturbance = A * phi + b (same as cause.pcd)
-			predictions = A * phi + b
-			
-			self.get_logger().info(f"GP field prediction using ANISOTROPIC RBF: min={predictions.min():.3f}, max={predictions.max():.3f}")
-			return predictions
-			
-		except Exception as e:
-			self.get_logger().error(f"Error predicting GP field: {e}")
-			return np.zeros(len(grid_points))
-	
-	def _sum_of_anisotropic_rbf(self, grid_points: np.ndarray, centers: np.ndarray, lxy: float, lz: float) -> np.ndarray:
-		"""Compute phi(x) = sum_j exp(-0.5 * [((dx/lxy)^2 + (dy/lxy)^2 + (dz/lz)^2)] ) for all grid points.
-		This is the EXACT SAME function used in the cause.pcd system for computing disturbance fields.
-		"""
-		try:
-			if centers.size == 0:
-				return np.zeros(grid_points.shape[0], dtype=float)
-			
-			num_points = grid_points.shape[0]
-			phi = np.zeros(num_points, dtype=float)
-			chunk = 200000  # Process in chunks for memory efficiency
-			
-			# Precompute inverse squared length scales (same as cause.pcd)
-			inv_lxy2 = 1.0 / (lxy * lxy + 1e-12)
-			inv_lz2 = 1.0 / (lz * lz + 1e-12)
-			
-			# Process grid points in chunks (same as cause.pcd)
-			for start in range(0, num_points, chunk):
-				end = min(num_points, start + chunk)
-				gp_chunk = grid_points[start:end]
-				
-				# Broadcast centers over chunk for efficient computation (same as cause.pcd)
-				dx = gp_chunk[:, None, 0] - centers[None, :, 0]
-				dy = gp_chunk[:, None, 1] - centers[None, :, 1]
-				dz = gp_chunk[:, None, 2] - centers[None, :, 2]
-				
-				# Compute anisotropic distance squared (same as cause.pcd)
-				d2 = (dx * dx + dy * dy) * inv_lxy2 + (dz * dz) * inv_lz2
-				
-				# Compute RBF contributions and sum over all centers (same as cause.pcd)
-				np.exp(-0.5 * d2, out=d2)
-				phi[start:end] = np.sum(d2, axis=1)
-			
-			return phi
-			
-		except Exception as e:
-			self.get_logger().error(f"Error computing anisotropic RBF: {e}")
-			return np.zeros(grid_points.shape[0], dtype=float)
-	
+
 	def _create_gp_colored_pointcloud(self, grid_points: np.ndarray, gp_values: np.ndarray) -> Optional[PointCloud2]:
 		"""Create colored point cloud from GP field predictions."""
 		try:
@@ -1401,7 +1405,7 @@ class SemanticDepthOctoMapNode(Node):
 			if len(semantic_voxels) == 0:
 				return
 			
-			# Convert to numpy array
+			# Convert to numpy array (like loading cause points from PCD)
 			semantic_points = np.array(semantic_voxels)
 			
 			# ============================================================
@@ -1409,7 +1413,6 @@ class SemanticDepthOctoMapNode(Node):
 			# ============================================================
 			grid_points, grid_shape = self._create_robot_centric_3d_grid()
 			if len(grid_points) == 0:
-				self.get_logger().warn("Robot-centric grid is empty")
 				return
 			
 			# Predict GP mean on robot-centric grid
@@ -1626,57 +1629,7 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error publishing raw GP grid: {e}")
 	
 	
-	def _calculate_adaptive_radius(self, semantic_points: np.ndarray) -> float:
-		"""Calculate adaptive radius using nearest neighbor (O(N log N) instead of O(N²))."""
-		try:
-			if len(semantic_points) < 2:
-				return self.base_radius
-			
-			# Use nearest neighbor distance (much faster than all pairs - fixes O(N²) bottleneck)
-			try:
-				from scipy.spatial import cKDTree
-				tree = cKDTree(semantic_points)
-				# Query for 2 nearest neighbors (self + 1 neighbor)
-				k = min(2, len(semantic_points))
-				distances, _ = tree.query(semantic_points, k=k)
-				
-				if distances.ndim == 2:
-					# Get distance to nearest neighbor (skip self)
-					nn_distances = distances[:, 1] if distances.shape[1] > 1 else distances[:, 0]
-				else:
-					# Single point case
-					nn_distances = distances if isinstance(distances, np.ndarray) else np.array([distances])
-				
-				avg_distance = np.mean(nn_distances)
-				
-			except ImportError:
-				# Fallback: sample subset of points for speed if scipy not available
-				if len(semantic_points) > 100:
-					sample_idx = np.random.choice(len(semantic_points), 100, replace=False)
-					sample_points = semantic_points[sample_idx]
-					# Compute pairwise distances for sample only
-					from scipy.spatial.distance import pdist
-					distances = pdist(sample_points)
-					avg_distance = np.mean(distances)
-				else:
-					# Small dataset, use original approach
-					distances = []
-					for i in range(len(semantic_points)):
-						for j in range(i + 1, len(semantic_points)):
-							dist = np.linalg.norm(semantic_points[i] - semantic_points[j])
-							distances.append(dist)
-					if len(distances) == 0:
-						return self.base_radius
-					avg_distance = np.mean(distances)
-			
-			# Adaptive radius: smaller for dense clusters, larger for sparse voxels
-			adaptive_radius = max(self.min_radius, min(self.max_radius, avg_distance * 0.8))
-			
-			return adaptive_radius
-			
-		except Exception as e:
-			self.get_logger().warn(f"Error calculating adaptive radius: {e}")
-			return self.base_radius
+	
 	
 	def _create_fast_adaptive_gp_grid(self, semantic_points: np.ndarray, radius: float) -> np.ndarray:
 		"""Create FAST, adaptive grid around semantic voxel clusters."""
@@ -2309,9 +2262,7 @@ class SemanticDepthOctoMapNode(Node):
 		now = time.time()
 		if not hasattr(self, 'last_frontier_compute_time'):
 			self.last_frontier_compute_time = 0.0
-		# if (now - self.last_frontier_compute_time) >= 0.1:  # Every 0.5s instead of every frame
-		# 	self._compute_and_publish_regular_frontiers()
-		# 	self.last_frontier_compute_time = now
+
 
 	def _update_regular_mapping(self, depth_m: np.ndarray, pose: PoseStamped):
 		"""Update regular VDB occupancy mapping in a separate thread."""
@@ -2363,85 +2314,6 @@ class SemanticDepthOctoMapNode(Node):
 				depth_img=depth_tensor,
 				pose_4x4=pose_4x4
 			)
-			
-			# Process rays/frontiers with conf_map (same as tmp.py)
-			try:
-				# Prepare masked depth for rays-only beyond max_range
-				depth_for_rays = np.zeros_like(depth_hot, dtype=np.float32)
-				masked = (mask > 0)
-				if self.camera_intrinsics is not None:
-					# Use original depth_m if available, otherwise use depth_hot
-					# For rays, we want pixels beyond max_range or missing depth
-					masked_depth_vals = depth_hot[masked]
-					threshold = float(self.max_range)
-					beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
-					dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
-					dr[beyond_or_missing] = np.inf
-					depth_for_rays[masked] = dr
-					mask_far = np.zeros_like(depth_for_rays, dtype=bool)
-					mask_far[masked] = beyond_or_missing
-					
-					if np.any(mask_far):
-						try:
-							far_v, far_u = np.where(mask_far)
-							fx, fy, cx, cy = self.camera_intrinsics
-							fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
-							u = far_u.astype(np.float32)
-							v = far_v.astype(np.float32)
-							dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
-							dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
-							pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
-							R_world_cam = pose_mat[:3, :3]
-							origin_world = pose_mat[:3, 3]
-							dir_world = dir_cam @ R_world_cam.T
-							dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
-							self._latest_pose_rays = (origin_world, dir_world)
-						except Exception:
-							self._latest_pose_rays = None
-					else:
-						# Fallback: derive rays from all masked pixels (sampled)
-						try:
-							if np.any(masked):
-								fx, fy, cx, cy = self.camera_intrinsics
-								fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
-								all_v, all_u = np.where(masked)
-								max_samples = 800
-								if all_u.shape[0] > max_samples:
-									idx = np.random.choice(all_u.shape[0], size=max_samples, replace=False)
-									all_u = all_u[idx]
-									all_v = all_v[idx]
-								u = all_u.astype(np.float32)
-								v = all_v.astype(np.float32)
-								dir_cam = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=1)
-								dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True) + 1e-9
-								pose_mat = self._pose_to_4x4_matrix(pose).detach().cpu().numpy()[0]
-								R_world_cam = pose_mat[:3, :3]
-								origin_world = pose_mat[:3, 3]
-								dir_world = dir_cam @ R_world_cam.T
-								dir_world /= np.linalg.norm(dir_world, axis=1, keepdims=True) + 1e-9
-								self._latest_pose_rays = (origin_world, dir_world)
-							else:
-								self._latest_pose_rays = None
-						except Exception:
-							self._latest_pose_rays = None
-					
-					# Process rays with conf_map to restrict to mask
-					rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=device)
-					depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(device)
-					pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(device)
-					conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
-					
-					# Update intrinsics if available
-					fx, fy, cx, cy = self.camera_intrinsics
-					self.vdb_mapper.intrinsics_3x3 = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
-					
-					# Process rays (no encoding used due to global_encoding=True)
-					# self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
-					# Publish mask-specific frontiers and rays immediately (same as tmp.py)
-					# self._publish_mask_frontiers_and_rays()
-			except Exception as e:
-				self.get_logger().warn(f"Mask rays/frontiers processing failed: {e}")
-				
 		except Exception as e:
 			self.get_logger().warn(f"VDB semantic mapping error: {e}")
 
@@ -2454,29 +2326,6 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().warn(f"Semantic voxel update error: {e}")
 
-	def _compute_and_publish_regular_frontiers(self):
-		try:
-			if self.vdb_mapper is None or self.vdb_mapper.is_empty():
-				return
-			# Derive active bbox from current occupied points
-			pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
-			if torch.is_tensor(pc_xyz_occ_size):
-				pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
-			if pc_xyz_occ_size.shape[0] == 0:
-				return
-			xyz = pc_xyz_occ_size[:, :3]
-			bbox_min = torch.from_numpy(np.min(xyz, axis=0)).float().to(self.vdb_mapper.device)
-			bbox_max = torch.from_numpy(np.max(xyz, axis=0)).float().to(self.vdb_mapper.device)
-			# Update frontiers for the whole active region
-			self.vdb_mapper.update_frontiers(bbox_min, bbox_max)
-			# Publish as PointCloud2
-			if self.vdb_mapper.frontiers is not None and self.vdb_mapper.frontiers.shape[0] > 0:
-				frontiers_np = self.vdb_mapper.frontiers.detach().cpu().numpy()
-				cloud = self._create_cloud_xyz(frontiers_np)
-				if cloud is not None:
-					self.frontiers_pub.publish(cloud)
-		except Exception as e:
-			self.get_logger().warn(f"Regular frontiers publishing failed: {e}")
 
 	def _create_cloud_xyz(self, points: np.ndarray) -> Optional[PointCloud2]:
 		try:
@@ -3103,45 +2952,6 @@ class SemanticDepthOctoMapNode(Node):
 				offset_mag = float(self.voxel_resolution) * 0.3 * ((idx % 5) - 2)
 				return base + offset_dir * offset_mag
 
-			if (self.vdb_mapper.global_rays_orig_angles is not None and
-				self.vdb_mapper.global_rays_orig_angles.shape[0] > 0):
-				msg = MarkerArray()
-				now = self.get_clock().now().to_msg()
-				# Publish ALL global angle rays without clustering to avoid dropping true positives
-				data = self.vdb_mapper.global_rays_orig_angles.detach().cpu().numpy()
-				length = 0.75
-				for i, row in enumerate(data):
-					x, y, z, theta_deg, phi_deg = row
-					theta = np.deg2rad(theta_deg)
-					phi = np.deg2rad(phi_deg)
-					dir_world = np.array([
-						np.cos(theta) * np.sin(phi),
-						np.sin(theta) * np.sin(phi),
-						np.cos(phi)
-					], dtype=np.float32)
-					dir_world /= np.linalg.norm(dir_world) + 1e-9
-					start = _offset_origin(np.array([x, y, z], dtype=np.float32), dir_world, i)
-					end = start + dir_world * length
-					m = Marker()
-					m.header.frame_id = self.map_frame
-					m.header.stamp = now
-					m.ns = "mask_rays_frontier"
-					m.id = i
-					m.type = Marker.ARROW
-					m.action = Marker.ADD
-					m.scale.x = float(self.voxel_resolution) * 0.4
-					m.scale.y = float(self.voxel_resolution) * 0.6
-					m.scale.z = float(self.voxel_resolution) * 0.6
-					m.color.r = 1.0
-					m.color.g = 0.3
-					m.color.b = 0.0
-					m.color.a = 0.95
-					m.points = [Point(x=float(start[0]), y=float(start[1]), z=float(start[2])),
-						Point(x=float(end[0]), y=float(end[1]), z=float(end[2]))]
-					msg.markers.append(m)
-				if len(msg.markers) > 0:
-					self.mask_rays_pub.publish(msg)
-
 			if self._latest_pose_rays is not None:
 				origin_world, dir_world = self._latest_pose_rays
 				now = self.get_clock().now().to_msg()
@@ -3266,4 +3076,3 @@ def main():
 
 if __name__ == '__main__':
 	main() 
-
