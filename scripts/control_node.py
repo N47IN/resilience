@@ -282,7 +282,7 @@ class MPPIControlNode(Node):
 
     def compute_local_goal(self, current_pos):
         if self.nominal_path_points is None:
-            return [current_pos.x + 3.0, current_pos.y, current_pos.z]
+            return [current_pos.x + 5.0, current_pos.y, current_pos.z]
         curr_vec = np.array([current_pos.x, current_pos.y, current_pos.z])
         dists = np.linalg.norm(self.nominal_path_points - curr_vec, axis=1)
         idx_min = np.argmin(dists)

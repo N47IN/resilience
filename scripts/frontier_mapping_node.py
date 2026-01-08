@@ -9,6 +9,7 @@ received via the semantic bridge using original RGB timestamps.
 """
 
 import rclpy
+import matplotlib.cm as cm  
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.logging import LoggingSeverity
@@ -188,7 +189,7 @@ class SemanticDepthOctoMapNode(Node):
 		self.global_nominal_points = None  # Store nominal points for uncertainty computation
 		self.global_disturbances = None  # Store disturbances for uncertainty computation
 		self.last_gp_update_time = 0.0
-		self.gp_update_interval = 2.0
+		self.gp_update_interval = 0.75
 		self.gp_computation_thread = None
 		self.gp_thread_lock = threading.Lock()
 		self.gp_thread_running = False
@@ -860,11 +861,7 @@ class SemanticDepthOctoMapNode(Node):
 					except Exception:
 						self._latest_pose_rays = None
 				
-				# Process rays with conf_map to restrict to mask
-				rgb_dummy = torch.zeros(1, 3, depth_for_rays.shape[0], depth_for_rays.shape[1], dtype=torch.float32, device=device)
-				depth_masked_t = torch.from_numpy(depth_for_rays).float().unsqueeze(0).unsqueeze(0).to(device)
-				pose_4x4_rf = self._pose_to_4x4_matrix(pose).to(device)
-				conf_map_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+				
 				
 				# Update intrinsics if available
 				fx, fy, cx, cy = self.camera_intrinsics
@@ -949,31 +946,31 @@ class SemanticDepthOctoMapNode(Node):
 		return voxelized_points
 
 	def save_points_to_latest_nested_subfolder(self, known_folder: str,
-	                                      points_world: np.ndarray,
-	                                      filename: str = "points.pcd"):
+										  points_world: np.ndarray,
+										  filename: str = "points.pcd"):
 		"""
-    	Find the latest subfolder1 inside known_folder, then the latest subfolder2 inside it,
-    	and save points_world as a binary PCD file in subfolder2.
-    	Voxelizes the points first to reduce density for GP fitting.
-    	"""
-    	# Helper to save PCD
+		Find the latest subfolder1 inside known_folder, then the latest subfolder2 inside it,
+		and save points_world as a binary PCD file in subfolder2.
+		Voxelizes the points first to reduce density for GP fitting.
+		"""
+		# Helper to save PCD
 		def _save_pcd(points: np.ndarray, out_path: str):
 			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
 			mask = np.isfinite(pts).all(axis=1)
 			pts = pts[mask]
 			header = (
-    	        "# .PCD v0.7 - Point Cloud Data file format\n"
-    	        "VERSION 0.7\n"
-    	        "FIELDS x y z\n"
-    	        "SIZE 4 4 4\n"
-    	        "TYPE F F F\n"
-    	        "COUNT 1 1 1\n"
-    	        f"WIDTH {pts.shape[0]}\n"
-    	        "HEIGHT 1\n"
-    	        "VIEWPOINT 0 0 0 1 0 0 0\n"
-    	        f"POINTS {pts.shape[0]}\n"
-    	        "DATA binary\n"
-    	    )
+				"# .PCD v0.7 - Point Cloud Data file format\n"
+				"VERSION 0.7\n"
+				"FIELDS x y z\n"
+				"SIZE 4 4 4\n"
+				"TYPE F F F\n"
+				"COUNT 1 1 1\n"
+				f"WIDTH {pts.shape[0]}\n"
+				"HEIGHT 1\n"
+				"VIEWPOINT 0 0 0 1 0 0 0\n"
+				f"POINTS {pts.shape[0]}\n"
+				"DATA binary\n"
+			)
 			with open(out_path, "wb") as f:
 				f.write(header.encode("ascii"))
 				f.write(pts.astype("<f4").tobytes())
@@ -985,20 +982,20 @@ class SemanticDepthOctoMapNode(Node):
 		# Use cached subfolder if available and recent
 		current_time = time.time()
 		if (self._cached_latest_subfolder is not None and 
-		    os.path.exists(self._cached_latest_subfolder) and
-		    (current_time - self._cached_subfolder_time) < self._subfolder_cache_ttl):
+			os.path.exists(self._cached_latest_subfolder) and
+			(current_time - self._cached_subfolder_time) < self._subfolder_cache_ttl):
 			latest_subfolder2 = self._cached_latest_subfolder
 		else:
 			# Step 1: find latest subfolder1
 			subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
-			               if os.path.isdir(os.path.join(known_folder, d))]
+						   if os.path.isdir(os.path.join(known_folder, d))]
 			if not subfolders1:
 				print(f"No subfolders found inside {known_folder}")
 				return None, None
 			latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
 			# Step 2: find latest subfolder2 inside latest_subfolder1
 			subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
-			               if os.path.isdir(os.path.join(latest_subfolder1, d))]
+						   if os.path.isdir(os.path.join(latest_subfolder1, d))]
 			if not subfolders2:
 				print(f"No subfolders found inside {latest_subfolder1}")
 				return None, None
@@ -1421,24 +1418,19 @@ class SemanticDepthOctoMapNode(Node):
 			# Compute epistemic uncertainty on robot-centric grid
 			uncertainty_std = None
 			if (self.global_nominal_points is not None and self.global_disturbances is not None and 
-			    len(self.global_nominal_points) > 0 and len(self.global_disturbances) > 0):
+				len(self.global_nominal_points) > 0 and len(self.global_disturbances) > 0):
 				uncertainty_std = self._compute_epistemic_uncertainty(
 					grid_points, semantic_points, self.global_gp_params,
 					self.global_nominal_points, self.global_disturbances
 				)
-			else:
-				# Fallback: use zeros for uncertainty if no training data
-				uncertainty_std = np.zeros(len(grid_points), dtype=np.float32)
+			
 			
 			# ============================================================
 			# STORE IN GPU TENSOR (Channel=2, Depth, Height, Width)
 			# ============================================================
 			self._update_gp_gpu_tensor(gp_mean, uncertainty_std, grid_shape)
 			
-			# ============================================================
-			# PUBLISH POINTCLOUDS WITH INTENSITY AS MAGNITUDE
-			# ============================================================
-			# Publish GP mean field
+
 			colored_cloud = self._create_gp_colored_pointcloud(grid_points, gp_mean)
 			if colored_cloud:
 				self.gp_visualization_pub.publish(colored_cloud)
@@ -1757,8 +1749,8 @@ class SemanticDepthOctoMapNode(Node):
 			return np.zeros(grid_points.shape[0], dtype=float)
 	
 	def _compute_epistemic_uncertainty(self, grid_points: np.ndarray, cause_points: np.ndarray, 
-	                                   fit_params: dict, nominal_points: np.ndarray, 
-	                                   disturbances: np.ndarray) -> Optional[np.ndarray]:
+									   fit_params: dict, nominal_points: np.ndarray, 
+									   disturbances: np.ndarray) -> Optional[np.ndarray]:
 		"""
 		Compute epistemic uncertainty (standard deviation) at query points using Bayesian linear regression.
 		
@@ -1811,8 +1803,8 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# 4. Epistemic variance: v^T * Cov * v where v = [phi, 1]
 			epistemic_var = (Cov_params[0, 0] * phi_query**2 + 
-			                 2 * Cov_params[0, 1] * phi_query + 
-			                 Cov_params[1, 1])
+							 2 * Cov_params[0, 1] * phi_query + 
+							 Cov_params[1, 1])
 			
 			# 5. Total variance = epistemic + aleatoric
 			total_variance = epistemic_var + sigma2_noise
@@ -1828,69 +1820,68 @@ class SemanticDepthOctoMapNode(Node):
 	
 	def _create_uncertainty_pointcloud(self, grid_points: np.ndarray, uncertainty_std: np.ndarray) -> Optional[PointCloud2]:
 		"""
-		Create point cloud for epistemic uncertainty visualization.
-		
-		Similar to _create_costmap_pointcloud but for uncertainty values instead of disturbance.
-		
-		Args:
-			grid_points: (N, 3) query points
-			uncertainty_std: (N,) uncertainty standard deviation values
-		
-		Returns:
-			PointCloud2 message with XYZ + uncertainty values
+		Creates a PointCloud2 with a sharp 'Inferno' colormap and percentile normalization.
 		"""
 		try:
 			if len(grid_points) == 0 or len(uncertainty_std) == 0:
 				return None
-			
-			# Use actual uncertainty std values for visualization
-			uncertainty_values = uncertainty_std.astype(np.float32)
-			
-			# Create PointCloud2 message with XYZ + uncertainty values
-			header = Header()
-			header.stamp = self.get_clock().now().to_msg()
-			header.frame_id = self.map_frame
-			
-			# Create structured array with XYZ + uncertainty value
+
+			# 1. Percentile Normalization (The secret to the "Sharp" look)
+			# Instead of min/max, use percentiles to ignore outliers and boost contrast
+			u_min = np.percentile(uncertainty_std, 5)
+			u_max = np.percentile(uncertainty_std, 95)
+	
+			# Avoid division by zero
+			diff = u_max - u_min if u_max > u_min else 1.0
+			normalized_values = np.clip((uncertainty_std - u_min) / diff, 0, 1)
+
+			# 2. Apply Sharp Colormap (inferno or magma)
+			# 'inferno' goes: Black -> Purple -> Red -> Bright Yellow
+			colors_mapped = cm.inferno(normalized_values) 
+
+			# Create structured array for PointCloud2
 			cloud_data_combined = np.empty(len(grid_points), dtype=[
-				('x', np.float32), ('y', np.float32), ('z', np.float32), 
-				('uncertainty', np.float32)
+				('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
 			])
-			
-			# Fill in the data
+	
 			cloud_data_combined['x'] = grid_points[:, 0]
 			cloud_data_combined['y'] = grid_points[:, 1]
 			cloud_data_combined['z'] = grid_points[:, 2]
-			cloud_data_combined['uncertainty'] = uncertainty_values
-			
-			# Create PointCloud2 message
+
+			# 3. Fast RGB Packing
+			# Pack RGBA (normalized 0-1) into a single UINT32 for RViz
+			r = (colors_mapped[:, 0] * 255).astype(np.uint32)
+			g = (colors_mapped[:, 1] * 255).astype(np.uint32)
+			b = (colors_mapped[:, 2] * 255).astype(np.uint32)
+	
+			# Bit-shift to pack into UINT32 (R << 16 | G << 8 | B)
+			rgb_packed = (r << 16) | (g << 8) | b
+			cloud_data_combined['rgb'] = rgb_packed
+
+			# 4. Standard PointCloud2 Message Creation
+			header = Header()
+			header.stamp = self.get_clock().now().to_msg()
+			header.frame_id = self.map_frame
+	
 			cloud_msg = PointCloud2()
 			cloud_msg.header = header
-			
-			# Define the fields - XYZ + uncertainty value
 			cloud_msg.fields = [
 				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
 				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
 				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='uncertainty', offset=12, datatype=pc2.PointField.FLOAT32, count=1)
+				pc2.PointField(name='rgb', offset=12, datatype=pc2.PointField.UINT32, count=1)
 			]
-			
-			# Set the message properties
-			cloud_msg.point_step = 16  # 4 bytes per float * 4 fields (x, y, z, uncertainty)
+			cloud_msg.point_step = 16
 			cloud_msg.width = len(grid_points)
 			cloud_msg.height = 1
 			cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
 			cloud_msg.is_dense = True
-			
-			# Set the data
 			cloud_msg.data = cloud_data_combined.tobytes()
-			
-			self.get_logger().info(f"Created uncertainty point cloud: min={uncertainty_values.min():.3f}, max={uncertainty_values.max():.3f}")
-			
+
 			return cloud_msg
-			
+
 		except Exception as e:
-			self.get_logger().error(f"Error creating uncertainty point cloud: {e}")
+			self.get_logger().error(f"Error creating sharp uncertainty cloud: {e}")
 			return None
 	
 	def _create_costmap_pointcloud(self, grid_points: np.ndarray, gp_values: np.ndarray) -> Optional[PointCloud2]:

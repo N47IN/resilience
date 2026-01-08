@@ -149,7 +149,10 @@ class MotionPrimitivePlannerNode(Node):
         super().__init__('motion_primitive_planner_node')
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"Motion Primitive Planner Node on {self.device}")
-        
+        self.latest_obstacles_indices = None
+        self.obstacle_grid_tensor = None
+        # ADD THIS LINE:
+        self.prev_best_idx = None
         self.nominal_path_file = '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json'
         
         self.gp_model = GridDisturbanceGP(device=self.device)
@@ -230,51 +233,49 @@ class MotionPrimitivePlannerNode(Node):
         return math.atan2(siny_cosp, cosy_cosp)
 
     def compute_costs(self, trajectories, goal):
-        # trajectories: [NumPrims, NumSteps, 3]
-        # goal: [3]
-        
         num_prims, num_steps, _ = trajectories.shape
         flat_traj = trajectories.reshape(-1, 3) # [NumPrims*NumSteps, 3]
-        
         costs = torch.zeros(num_prims, device=self.device)
         
-        # 1. Goal Cost (Distance to goal at last point)
+        # 1. Goal Cost (Distance to lookahead point)
         end_points = trajectories[:, -1, :]
-        d_goal = torch.norm(end_points - goal, dim=1)
-        costs += 5.0 * d_goal # Weight 5.0
+        costs += 5.0 * torch.norm(end_points - goal, dim=1)
         
-        # 2. Reference Path Cost (Average distance to nominal path)
+        # 2. Reference Path Cost (Whole-Trajectory)
         if self.nominal_path_points is not None:
-             # Just check distance of end points to nearest nominal point for efficiency
-             # Or check all points? Let's check a few points to be faster? 
-             # Let's check middle and end point
-             # Broadcost nominal path: [1, N_ref, 3] vs [NumPrims, 1, 3]
-             # This can be heavy. Let's simplfy: Dist from end_point to nearest ref point
-             dists = torch.cdist(end_points, self.nominal_path_points) # [NumPrims, N_ref]
-             min_dists, _ = torch.min(dists, dim=1)
-             costs += 2.0 * min_dists
+            # Check every point in every primitive against the nominal path
+            # Distances: [NumPrims*NumSteps, NumRefPoints]
+            dists = torch.cdist(flat_traj, self.nominal_path_points)
+            min_dists_per_pt, _ = torch.min(dists, dim=1)
+            # Average distance for each primitive
+            path_err = min_dists_per_pt.view(num_prims, num_steps).mean(dim=1)
+            costs += 8.0 * path_err # Increased weight for tighter tracking
         
-        # 3. Obstacle Cost
+        # 3. Obstacle Cost (Safety)
         if self.obstacle_grid_tensor is not None:
             norm_coords = self.gp_model.normalize_coords(flat_traj)
             grid_coords = norm_coords.view(1, 1, 1, -1, 3)
             samp = F.grid_sample(self.obstacle_grid_tensor, grid_coords, align_corners=True, mode='bilinear', padding_mode='zeros')
-            # samp shape: [1, 1, 1, 1, NumPrims*NumSteps] -> view
             obs_vals = samp.view(num_prims, num_steps)
-            # Sum up obstacle collision along trajectory
-            obs_cost = torch.sum(obs_vals, dim=1)
-            costs += 50.0 * obs_cost
-            
+            costs += 100.0 * torch.max(obs_vals, dim=1)[0] # Penalize ANY collision in the path
+
         # 4. GP Risk Cost
         if self.gp_model.grid_tensor is not None:
             mean, std = self.gp_model.forward_with_uncertainty(flat_traj)
             risk_val = mean + 2.0 * std
-            # Filter low risk to save compute or just apply barrier
-            # Exponential barrier
-            risk_cost_steps = torch.exp(2.0 * risk_val).view(num_prims, num_steps)
-            risk_cost = torch.mean(risk_cost_steps, dim=1)
-            costs += 15.0 * risk_cost
+            risk_cost_steps = torch.exp(2.5 * risk_val).view(num_prims, num_steps)
+            costs += 15.0 * torch.mean(risk_cost_steps, dim=1)
+
+        # 5. NEW: Smoothness Cost (Temporal Consistency)
+        if self.prev_best_idx is not None:
+            prev_w = self.primitive_lib.prim_ws[self.prev_best_idx]
+            prev_gamma = self.primitive_lib.prim_gammas[self.prev_best_idx]
             
+            # Penalize large changes in yaw rate and pitch
+            w_diff = (self.primitive_lib.prim_ws - prev_w)**2
+            g_diff = (self.primitive_lib.prim_gammas - prev_gamma)**2
+            costs += 2.0 * (w_diff + g_diff)
+
         return costs
 
     def find_local_goal(self, current_pos):
@@ -315,6 +316,7 @@ class MotionPrimitivePlannerNode(Node):
             
             # Find best
             best_idx = torch.argmin(costs)
+            self.prev_best_idx = best_idx.item()
             best_traj = trajectories[best_idx]
             
             # Visualize / Publish

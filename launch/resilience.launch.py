@@ -264,7 +264,7 @@ def generate_launch_description():
 
     mppi_control_node = Node(
         package='resilience',  # Replace with your actual package name
-        executable='control_node.py',  # Or entry point name if set in setup.py
+        executable='primitive_planner.py',  # Or entry point name if set in setup.py
         name='mppi_control_node',
         output='screen',
         emulate_tty=True,  # Better color output in terminal
