@@ -1,0 +1,6 @@
+*.pyc
+*eval*
+__pycache__
+*.log
+*.o
+*build*
