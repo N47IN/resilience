@@ -12,7 +12,7 @@ from geometry_msgs.msg import PoseStamped, Point, Vector3, Quaternion
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs_py.point_cloud2 as pc2
-
+import matplotlib.cm as cm  
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -257,12 +257,12 @@ class MotionPrimitivePlannerNode(Node):
             grid_coords = norm_coords.view(1, 1, 1, -1, 3)
             samp = F.grid_sample(self.obstacle_grid_tensor, grid_coords, align_corners=True, mode='bilinear', padding_mode='zeros')
             obs_vals = samp.view(num_prims, num_steps)
-            costs += 100.0 * torch.max(obs_vals, dim=1)[0] # Penalize ANY collision in the path
+            costs += 50.0 * torch.max(obs_vals, dim=1)[0] # Penalize ANY collision in the path
 
         # 4. GP Risk Cost
         if self.gp_model.grid_tensor is not None:
             mean, std = self.gp_model.forward_with_uncertainty(flat_traj)
-            risk_val = mean + 2.0 * std
+            risk_val = mean*std
             risk_cost_steps = torch.exp(2.5 * risk_val).view(num_prims, num_steps)
             costs += 15.0 * torch.mean(risk_cost_steps, dim=1)
 
@@ -341,36 +341,28 @@ class MotionPrimitivePlannerNode(Node):
 
     def publish_primitives(self, trajectories, costs):
         marker_array = MarkerArray()
-
-        # 1. Robust Normalization (Clip outliers to top 90% percentile to preserve color gradient for good paths)
-        #    Otherwise, one "infinite" cost obstacle path makes everything else look identical (green).
-        min_c = torch.min(costs)
-        
-        # Calculate 90th percentile to ignore extreme outliers for coloring
-        k = int(0.9 * len(costs))
-        if k < len(costs) - 1:
-            sorted_costs, _ = torch.sort(costs)
-            max_c = sorted_costs[k]
-        else:
-            max_c = torch.max(costs)
-            
-        # Avoid division by zero
-        denom = max_c - min_c
-        if denom < 1e-6:
-            denom = 1.0
-            
-        # Normalize to [0, 1] range, clipping anything above max_c to 1.0
-        norm_costs = torch.clamp((costs - min_c) / denom, 0.0, 1.0)
-
-        traj_cpu = trajectories.cpu().numpy()
-        costs_cpu = norm_costs.cpu().numpy()
-        
-        # Get index of the best path to highlight it
-        best_idx = torch.argmin(costs).item()
-
         timestamp = self.get_clock().now().to_msg()
         
-        # Create a "delete all" marker to clear stale paths if number of primitives changes
+        # --- SHARP NORMALIZATION & COLORMAP ---
+        # 1. Percentile Normalization: Ignore the top 10% of "horrible" paths 
+        # to preserve contrast for the viable candidates.
+        c_min = torch.min(costs)
+        c_90 = torch.quantile(costs, 0.9)
+        
+        # Avoid division by zero
+        denom = c_90 - c_min if c_90 > c_min else 1.0
+        
+        # Normalize to [0, 1] and clip outliers
+        norm_costs = torch.clamp((costs - c_min) / denom, 0.0, 1.0)
+        
+        # 2. Use a high-contrast colormap (Turbo is great for path costs)
+        # Low cost = Blue/Green, High cost = Red
+        colors_mapped = cm.turbo(norm_costs.cpu().numpy()) 
+
+        traj_cpu = trajectories.cpu().numpy()
+        best_idx = torch.argmin(costs).item()
+
+        # Clear old markers
         delete_marker = Marker()
         delete_marker.action = Marker.DELETEALL
         marker_array.markers.append(delete_marker)
@@ -385,42 +377,23 @@ class MotionPrimitivePlannerNode(Node):
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
             
-            # Scale: Thicker for best path
-            if i == best_idx:
-                marker.scale.x = 0.08  # Thick for best
-                marker.pose.position.z += 0.05 # Draw slightly above others
-            else:
-                marker.scale.x = 0.02  # Thin for candidates
+            # Use the mapped colors
+            r, g, b, _ = colors_mapped[i]
 
-            # Color Map: Turbo/Jet style manual implementation
-            # Low cost (0.0) -> Green/Blue
-            # Med cost (0.5) -> Yellow/Orange
-            # High cost (1.0) -> Red
-            
-            c_val = float(costs_cpu[i])
-            
             if i == best_idx:
-                # Best path is pure Cyan
+                marker.scale.x = 0.08  # Thick highlight
                 marker.color.r = 0.0
                 marker.color.g = 1.0
-                marker.color.b = 1.0
+                marker.color.b = 1.0 # Cyan for best
                 marker.color.a = 1.0
+                marker.pose.position.z += 0.02 # Lift slightly
             else:
-                # Gradient from Green (low cost) to Red (high cost)
-                # You can tweak this. Here is Green -> Yellow -> Red
-                if c_val < 0.5:
-                    # Green to Yellow
-                    marker.color.r = 2.0 * c_val
-                    marker.color.g = 1.0
-                    marker.color.b = 0.0
-                else:
-                    # Yellow to Red
-                    marker.color.r = 1.0
-                    marker.color.g = 2.0 * (1.0 - c_val)
-                    marker.color.b = 0.0
-                
-                # Make high cost paths more transparent so they don't clutter view
-                marker.color.a = 0.8 - (0.5 * c_val)
+                marker.scale.x = 0.02
+                marker.color.r = float(r)
+                marker.color.g = float(g)
+                marker.color.b = float(b)
+                # Alpha based on cost: high cost paths fade out
+                marker.color.a = float(0.7 - (0.5 * norm_costs[i].item()))
 
             for t in range(traj_cpu.shape[1]):
                 p = Point()

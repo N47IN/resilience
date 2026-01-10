@@ -50,6 +50,39 @@ def quat_to_rot(q: np.ndarray):
         [xz - wy, yz + wx, 1.0 - (xx + yy)]
     ], dtype=np.float32)
 
+import os
+import json
+import time 
+import open3d as o3d
+
+
+
+import math
+def _rpy_deg_to_rot(rpy_deg):
+		try:
+			roll, pitch, yaw = [math.radians(float(x)) for x in rpy_deg]
+			cr, sr, cp, sp, cy, sy = math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch), math.cos(yaw), math.sin(yaw)
+			Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+			Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32)
+			Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float32)
+			return Rz @ Ry @ Rx
+		except Exception:
+			return np.eye(3, dtype=np.float32)
+
+def _quat_to_rot( q: np.ndarray):
+		x, y, z, w = q
+		n = x*x + y*y + z*z + w*w
+		if n < 1e-8:
+			return np.eye(3, dtype=np.float32)
+		s = 2.0 / n
+		xx, yy, zz = x*x*s, y*y*s, z*z*s
+		xy, xz, yz = x*y*s, x*z*s, y*z*s
+		wx, wy, wz = w*x*s, w*y*s, w*z*s
+		return np.array([
+			[1.0 - (yy + zz), xy - wz, xz + wy],
+			[xy + wz, 1.0 - (xx + zz), yz - wx],
+			[xz - wy, yz + wx, 1.0 - (xx + yy)]
+		], dtype=np.float32)
 
 def depth_mask_to_world_points(depth_m: np.ndarray, mask: np.ndarray, intrinsics, pose: PoseStamped,
                               pose_is_base_link: bool = True,

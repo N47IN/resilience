@@ -62,6 +62,22 @@ warnings.filterwarnings('ignore')
 from resilience.cause_registry import CauseRegistry
 
 
+class _ZeroImageEncoder:
+	def __init__(self, embed_dim: int, device: str):
+		self.embed_dim = embed_dim
+		self.device = device
+
+	def encode_image_to_vector(self, rgb_img: torch.Tensor) -> torch.Tensor:
+		batch = rgb_img.shape[0]
+		return torch.zeros(batch, self.embed_dim, device=rgb_img.device, dtype=rgb_img.dtype)
+
+	def encode_image_to_feat_map(self, rgb_img: torch.Tensor) -> torch.Tensor:
+		batch, _, h, w = rgb_img.shape
+		return torch.zeros(batch, self.embed_dim, h, w, device=rgb_img.device, dtype=rgb_img.dtype)
+
+	def align_spatial_features_with_language(self, feat: torch.Tensor) -> torch.Tensor:
+		return feat
+
 class NARadioProcessor:
     """NARadio feature extraction and processing with robust error handling and optimizations."""
     

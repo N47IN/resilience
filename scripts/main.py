@@ -1140,35 +1140,6 @@ class ResilienceNode(Node):
             traceback.print_exc()
 
     def process_narration_chain_for_vlm_answer(self, vlm_answer: str) -> bool:
-        """
-        OPTIMIZED: Complete narration processing chain for a VLM answer.
-        This happens immediately when VLM answer is received.
-        
-        Optimizations:
-        - Early duplicate check (before any computation)
-        - Single feature extraction per image
-        - Reuse similarity map instead of recomputing
-        - Simplified flow with minimal intermediate computations
-        
-        Chain of events:
-        1. Early duplicate check (vec_id) - exit if already processed
-        2. Find buffer with this cause
-        3. Get narration image
-        4. Extract features ONCE
-        5. Compute similarity map ONCE
-        6. Build hotspot mask and publish
-        7. Compute enhanced embedding (non-blocking, uses pre-computed features)
-        
-        Note: Uses vec_id tracking to prevent double voxel publishing. Each cause (or group of
-        similar causes >0.8 similarity) gets only ONE narration mask published. The continuous
-        predictive similarity loop handles ongoing monitoring with enhanced embeddings.
-        
-        Args:
-            vlm_answer: The VLM answer/cause to process
-            
-        Returns:
-            True if narration processing was successful, False otherwise
-        """
         try:
             if not hasattr(self, 'naradio_processor') or not self.naradio_processor.is_segmentation_ready():
                 print(f"NARadio processor not ready for narration processing")

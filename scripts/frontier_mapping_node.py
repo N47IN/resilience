@@ -25,7 +25,10 @@ from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
 import numpy as np
+from collections import deque
 import torch
+import open3d as o3d
+import numpy as np
 from cv_bridge import CvBridge
 import time
 import json
@@ -157,7 +160,17 @@ class SemanticDepthOctoMapNode(Node):
 		# Read nominal path separately (optional for GP)
 		self.nominal_path = self.get_parameter('nominal_path').value
 		self.main_config_path = self.get_parameter('main_config_path').value
+		from collections import deque
 
+		
+		self.depth_buffer_data = deque(maxlen=100)
+		self.depth_buffer_ts = deque(maxlen=100)
+
+		self.pose_buffer_data = deque(maxlen=200)
+		self.pose_buffer_ts = deque(maxlen=200)
+
+		self.mask_buffer_data = deque(maxlen=50) # Smaller buffer usually okay for masks
+		self.mask_buffer_ts = deque(maxlen=50)
 		# Load topic configuration from mapping config
 		self.load_topic_configuration()
 		
@@ -171,8 +184,6 @@ class SemanticDepthOctoMapNode(Node):
 		self.semantic_pcd_exported = False
 		
 		# Timestamped buffers for sync
-		self.depth_buffer = []
-		self.pose_buffer = []
 		self.mask_buffer = []
 		self.sync_buffer_duration = float(self.sync_buffer_seconds)
 		self.sync_lock = threading.Lock()
@@ -468,66 +479,45 @@ class SemanticDepthOctoMapNode(Node):
 			msg.pose.position.z
 		], dtype=np.float32)
 		# Push into pose buffer with timestamp
-		try:
-			pose_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-			with self.sync_lock:
-				self.pose_buffer.append((pose_time, msg))
-				self._prune_sync_buffers()
-		except Exception:
-			pass
-		# Update activity
+		
+		pose_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+		self.pose_buffer_data.append(msg)
+		self.pose_buffer_ts.append(pose_time)
 		self.last_data_time = time.time()
 
 	def semantic_hotspot_mask_callback(self, msg: Image):
 		"""Buffer the merged hotspot mask image keyed by its stamp time."""
-		try:
-			mask_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-			mask_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-			with self.sync_lock:
-				self.mask_buffer.append((mask_time, mask_rgb))
-				self._prune_sync_buffers()
-			# Update activity
-			self.last_data_time = time.time()
-		except Exception as e:
-			self.get_logger().warn(f"Failed to buffer hotspot mask image: {e}")
+		mask_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+		mask_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+		self.mask_buffer_data.append(mask_rgb)
+		self.mask_buffer_ts.append(mask_time)
+		self.last_data_time = time.time()
+
 
 	def semantic_hotspot_callback(self, msg: String):
 		"""Process incoming semantic hotspot metadata directly in callback."""
-		try:
-			if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
-				return
-			
-			# Process message directly in background thread (non-blocking)
-			threading.Thread(
-				target=self._process_single_bridge_message,
-				args=(msg.data,),
-				daemon=True
-			).start()
-			
-			# Update activity
-			self.last_data_time = time.time()
-			
-		except Exception as e:
-			self.get_logger().error(f"Error processing semantic hotspot message: {e}")
-			import traceback
-			traceback.print_exc()
-	
+		if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
+			return
+		threading.Thread(
+			target=self._process_single_bridge_message,
+			args=(msg.data,),
+			daemon=True
+		).start()
+		self.last_data_time = time.time()
+
 	def _process_single_bridge_message(self, msg_data: str) -> bool:
 		"""Process a single bridge message and apply to voxel map by timestamp lookup."""
-		try:
-			# Parse the JSON message
-			time_start = time.time()
-			data = json.loads(msg_data)
-			json_load_time = time.time() - time_start
-			self.get_logger().warn(f"Time taken to load JSON: {json_load_time}")
-			if data.get('type') == 'merged_similarity_hotspots':
-				return self._process_merged_hotspot_message(data)
-			else:
-				return False
-			
-		except Exception as e:
-			self.get_logger().error(f"Error processing single bridge message: {e}")
+		
+		# Parse the JSON message
+		time_start = time.time()
+		data = json.loads(msg_data)
+		json_load_time = time.time() - time_start
+		self.get_logger().warn(f"Time taken to load JSON: {json_load_time}")
+		if data.get('type') == 'merged_similarity_hotspots':
+			return self._process_merged_hotspot_message(data)
+		else:
 			return False
+
 	
 	def _precompute_color_indices(self, merged_mask: np.ndarray, vlm_info: dict) -> dict:
 		"""Pre-compute pixel indices for each color once (fixes bottleneck #1).
@@ -576,11 +566,18 @@ class SemanticDepthOctoMapNode(Node):
 				return False
 			
 			# Lookup closest depth frame and pose by timestamp
-			depth_image, pose_msg, used_ts = self._lookup_depth_and_pose(rgb_timestamp)
+			depth_image, pose_msg = self._lookup_depth_and_pose(rgb_timestamp)
 			depth_lookup_time = time.time() - start - mask_lookup_time
 			self.get_logger().warn(f"Time taken to lookup depth: {depth_lookup_time}")
 			if depth_image is None or pose_msg is None:
 				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
+				return False
+			
+			try:
+				# Convert ROS Image message to numpy array (float32 for depth)
+				depth_image = self.bridge.imgmsg_to_cv2(depth_image, desired_encoding='32FC1')
+			except Exception as e:
+				self.get_logger().error(f"Failed to convert depth message: {e}")
 				return False
 			
 			# OPTIMIZATION: Pre-compute color indices once (fixes bottleneck #1)
@@ -603,7 +600,7 @@ class SemanticDepthOctoMapNode(Node):
 				
 				vlm_mask_time = time.time() - start - mask_lookup_time - depth_lookup_time
 				self.get_logger().debug(f"Time taken to create vlm mask: {vlm_mask_time:.4f}s (optimized)")
-				
+				used_ts = 1.0
 				success = self._process_hotspot_with_depth(
 					vlm_mask, pose_msg, depth_image, vlm_answer, 
 					info.get('hotspot_threshold', 0.6), 
@@ -625,83 +622,49 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error processing merged hotspot message: {e}")
 			return False
 	
-	def _lookup_depth_and_pose(self, target_ts: float):
-		"""Find closest depth frame and pose to target timestamp within buffer window using binary search."""
-		with self.sync_lock:
-			# Optimized binary search for depth
-			best_depth, best_depth_ts = self._binary_search_closest(
-				self.depth_buffer, target_ts, self.sync_buffer_duration
-			)
-			
-			# Optimized binary search for pose
-			best_pose, best_pose_ts = self._binary_search_closest(
-				self.pose_buffer, target_ts, self.sync_buffer_duration
-			)
-			
-			# Return if both found
-			if best_depth is not None and best_pose is not None:
-				return best_depth, best_pose, (best_depth_ts, best_pose_ts)
-			
-			return None, None, (None, None)
+	def _lookup_depth_and_pose(self, target_ts):
+		# Pass the dual deques for depth
+		depth_data, depth_ts = self._binary_search_closest(
+			self.depth_buffer_ts, self.depth_buffer_data, target_ts, 1
+		)
 	
-	def _binary_search_closest(self, buffer: List, target_ts: float, max_dt: float):
-		"""Binary search to find closest timestamp entry in sorted buffer. Returns (data, timestamp) or (None, None).
-		
-		Optimized O(log n) lookup using numpy's searchsorted for better performance.
-		"""
-		if not buffer:
+		# Pass the dual deques for pose
+		pose_data, pose_ts = self._binary_search_closest(
+			self.pose_buffer_ts, self.pose_buffer_data, target_ts, 1
+		)
+	
+		return depth_data, pose_data
+	
+	def _binary_search_closest(self, ts_deque: deque, data_deque: deque, target_ts: float, max_dt: float):
+		"""Vectorized search across synchronized deques."""
+		if not ts_deque:
 			return None, None
-		
-		# Fast path: if buffer is very small, linear search is faster
-		if len(buffer) < 5:
-			best_data = None
-			best_ts = None
-			best_dt = float('inf')
-			for ts, data in buffer:
-				dt = abs(ts - target_ts)
-				if dt < best_dt and dt <= max_dt:
-					best_dt = dt
-					best_data = data
-					best_ts = ts
-			return best_data, best_ts
-		
-		# Use numpy for efficient timestamp extraction and binary search
-		# Convert to numpy array once - much faster than list comprehension for large buffers
-		timestamps = np.array([ts for ts, _ in buffer], dtype=np.float64)
-		
-		# Use numpy's searchsorted - optimized C implementation, faster than bisect for numpy arrays
-		idx = np.searchsorted(timestamps, target_ts, side='left')
-		
-		# Check candidate positions: idx-1, idx (if exists)
-		best_data = None
-		best_ts = None
-		best_dt = float('inf')
-		
-		# Check element at idx (if exists)
-		if idx < len(buffer):
-			ts, data = buffer[idx]
-			dt = abs(ts - target_ts)
-			if dt < best_dt and dt <= max_dt:
-				best_dt = dt
-				best_data = data
-				best_ts = ts
-		
-		# Check element before idx (if exists)
-		if idx > 0:
-			ts, data = buffer[idx - 1]
-			dt = abs(ts - target_ts)
-			if dt < best_dt and dt <= max_dt:
-				best_dt = dt
-				best_data = data
-				best_ts = ts
-		
-		return best_data, best_ts
+		ts_array = np.array(ts_deque)
+		idx = np.searchsorted(ts_array, target_ts)
+		candidates = []
+		if idx < len(ts_array): candidates.append(idx)
+		if idx > 0: candidates.append(idx - 1)
+	
+		if not candidates:
+			return None, None
+	
+		diffs = np.abs(ts_array[candidates] - target_ts)
+		best_relative_idx = np.argmin(diffs)
+		best_idx = candidates[best_relative_idx]
+		if diffs[best_relative_idx] <= max_dt:
+			return data_deque[best_idx], ts_array[best_idx]
+	
+		return None, None
 	
 	def _lookup_mask(self, target_ts: float) -> Optional[np.ndarray]:
-		"""Find closest merged mask image to target timestamp within buffer window using binary search."""
+		"""Find closest merged mask image using optimized dual-deque binary search."""
 		with self.sync_lock:
+			# Pass the separate timestamp and data deques
 			best_mask, _ = self._binary_search_closest(
-				self.mask_buffer, target_ts, self.sync_buffer_duration
+				self.mask_buffer_ts, 
+				self.mask_buffer_data, 
+				target_ts, 
+				self.sync_buffer_duration
 			)
 			return best_mask
 	
@@ -764,7 +727,7 @@ class SemanticDepthOctoMapNode(Node):
 				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
 					voxelized_points = self._voxelize_pointcloud(points_world_near, float(self.voxel_resolution), max_points=200)
-					self._check_and_start_gp_fit_if_ready(buffer_dir, voxelized_points, vlm_answer)
+					self._check_and_start_gp_fit(buffer_dir, voxelized_points, vlm_answer)
 
 			# Build depth image with only hotspot pixels (same as tmp.py) - prepare for threading
 			h, w = mask.shape
@@ -890,7 +853,7 @@ class SemanticDepthOctoMapNode(Node):
 
 			hotspot_type = "NARRATION" if is_narration else "OPERATIONAL"
 			self.get_logger().info(
-				f"Applied hotspot processing for '{vlm_answer}' (within_range={near_count}, rgb_ts={rgb_ts:.6f}, depth_ts={used_ts[0]}, pose_ts={used_ts[1]}, type={hotspot_type})"
+				f"Applied hotspot processing for '{vlm_answer}' (within_range={near_count}, rgb_ts={rgb_ts:.6f}, type={hotspot_type})"
 			)
 			return True
 			
@@ -900,143 +863,99 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 			return False
 	
+
+
 	def _voxelize_pointcloud(self, points: np.ndarray, voxel_size: float, max_points: int = 200) -> np.ndarray:
 		"""
-		Voxelize a point cloud by taking the centroid of points within each voxel.
-		This reduces the number of points while preserving the spatial distribution.
-		If still too many points after voxelization, randomly sample down to max_points.
-		
-		OPTIMIZED: Uses vectorized numpy operations instead of Python loops.
+		High-performance voxelization using Open3D (C++ backend).
+		Reduces point density by averaging points within a spatial grid.
 		"""
-		if len(points) == 0:
+		if points.shape[0] == 0:
 			return points
-		
-		# Convert points to voxel coordinates
-		voxel_coords = np.floor(points / voxel_size).astype(np.int32)
-		
-		# Find unique voxels and their inverse indices
-		unique_voxels, inverse_indices = np.unique(voxel_coords, axis=0, return_inverse=True)
-		
-		# OPTIMIZED: Vectorized centroid computation using bincount approach
-		# This avoids Python loops and boolean masking per voxel
-		num_voxels = len(unique_voxels)
-		
-		# Compute centroids using cumsum trick for each coordinate dimension
-		voxelized_points = np.zeros((num_voxels, points.shape[1]), dtype=points.dtype)
-		voxel_counts = np.bincount(inverse_indices, minlength=num_voxels)
-		
-		# For each dimension, compute sum of points per voxel, then divide by count
-		for dim in range(points.shape[1]):
-			# Sum points per voxel using bincount
-			sums = np.bincount(inverse_indices, weights=points[:, dim], minlength=num_voxels)
-			# Avoid division by zero
-			nonzero_mask = voxel_counts > 0
-			voxelized_points[nonzero_mask, dim] = sums[nonzero_mask] / voxel_counts[nonzero_mask]
-		
-		# Random sampling if too many points (deterministic seed for reproducibility)
-		if len(voxelized_points) > max_points:
-			# Use deterministic sampling instead of random for reproducibility
-			step = len(voxelized_points) / max_points
-			indices = np.arange(0, len(voxelized_points), step, dtype=np.int32)[:max_points]
+
+		pcd = o3d.geometry.PointCloud()
+		pcd.points = o3d.utility.Vector3dVector(points)
+		downsampled_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+		voxelized_points = np.asarray(downsampled_pcd.points)
+		num_voxelized = voxelized_points.shape[0]
+		if num_voxelized > max_points:
+			step = num_voxelized / max_points
+			indices = np.arange(0, num_voxelized, step, dtype=np.int32)[:max_points]
 			voxelized_points = voxelized_points[indices]
-			self.get_logger().info(f"Voxelized {len(points)} points to {len(voxelized_points)} points (voxel_size={voxel_size:.3f}m, sampled to max {max_points})")
-		else:
-			self.get_logger().info(f"Voxelized {len(points)} points to {len(voxelized_points)} points (voxel_size={voxel_size:.3f}m)")
-		
+	
+			self.get_logger().info(
+				f"O3D Voxelized {points.shape[0]} -> {num_voxelized} points. "
+				f"Sampled to {max_points} (voxel_size={voxel_size:.3f}m)"
+			)
 		return voxelized_points
 
-	def save_points_to_latest_nested_subfolder(self, known_folder: str,
-										  points_world: np.ndarray,
+	def save_points_to_latest_nested_subfolder(self, known_folder: str, 
+										  points_world: np.ndarray, 
 										  filename: str = "points.pcd"):
 		"""
-		Find the latest subfolder1 inside known_folder, then the latest subfolder2 inside it,
-		and save points_world as a binary PCD file in subfolder2.
-		Voxelizes the points first to reduce density for GP fitting.
+		Finds latest nested subfolders and saves points as a binary PCD using Open3D.
 		"""
-		# Helper to save PCD
-		def _save_pcd(points: np.ndarray, out_path: str):
-			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-			mask = np.isfinite(pts).all(axis=1)
-			pts = pts[mask]
-			header = (
-				"# .PCD v0.7 - Point Cloud Data file format\n"
-				"VERSION 0.7\n"
-				"FIELDS x y z\n"
-				"SIZE 4 4 4\n"
-				"TYPE F F F\n"
-				"COUNT 1 1 1\n"
-				f"WIDTH {pts.shape[0]}\n"
-				"HEIGHT 1\n"
-				"VIEWPOINT 0 0 0 1 0 0 0\n"
-				f"POINTS {pts.shape[0]}\n"
-				"DATA binary\n"
-			)
-			with open(out_path, "wb") as f:
-				f.write(header.encode("ascii"))
-				f.write(pts.astype("<f4").tobytes())
-			print(f"Saved {pts.shape[0]} voxelized points to {out_path}")
-
-		# Voxelize points before saving to reduce density for GP fitting
+		if points_world.size == 0:
+			return None, None
+	
 		voxelized_points = self._voxelize_pointcloud(points_world, float(self.voxel_resolution), max_points=200)
-
-		# Use cached subfolder if available and recent
+	
 		current_time = time.time()
-		if (self._cached_latest_subfolder is not None and 
-			os.path.exists(self._cached_latest_subfolder) and
+		if (self._cached_latest_subfolder and os.path.exists(self._cached_latest_subfolder) and 
 			(current_time - self._cached_subfolder_time) < self._subfolder_cache_ttl):
 			latest_subfolder2 = self._cached_latest_subfolder
 		else:
-			# Step 1: find latest subfolder1
-			subfolders1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder)
-						   if os.path.isdir(os.path.join(known_folder, d))]
-			if not subfolders1:
-				print(f"No subfolders found inside {known_folder}")
+			try:
+				# Find latest subfolder1
+				s1 = [os.path.join(known_folder, d) for d in os.listdir(known_folder) if os.path.isdir(os.path.join(known_folder, d))]
+				if not s1: return None, None
+				latest_s1 = max(s1, key=os.path.getmtime)
+	
+				# Find latest subfolder2
+				s2 = [os.path.join(latest_s1, d) for d in os.listdir(latest_s1) if os.path.isdir(os.path.join(latest_s1, d))]
+				if not s2: return None, None
+				latest_subfolder2 = max(s2, key=os.path.getmtime)
+	
+				# Cache it
+				self._cached_latest_subfolder = latest_subfolder2
+				self._cached_subfolder_time = current_time
+			except Exception as e:
+				self.get_logger().error(f"Folder search failed: {e}")
 				return None, None
-			latest_subfolder1 = max(subfolders1, key=os.path.getmtime)		
-			# Step 2: find latest subfolder2 inside latest_subfolder1
-			subfolders2 = [os.path.join(latest_subfolder1, d) for d in os.listdir(latest_subfolder1)
-						   if os.path.isdir(os.path.join(latest_subfolder1, d))]
-			if not subfolders2:
-				print(f"No subfolders found inside {latest_subfolder1}")
-				return None, None
-			latest_subfolder2 = max(subfolders2, key=os.path.getmtime)
-			# Cache the result
-			self._cached_latest_subfolder = latest_subfolder2
-			self._cached_subfolder_time = current_time		
-		# Step 3: save voxelized PCD inside latest_subfolder2
+	
+		# 3. Save JSON Metadata (Mean position of the hazard)
 		save_path = os.path.join(latest_subfolder2, filename)
-		arr = np.mean(voxelized_points, axis=0)
+		mean_pos = np.mean(voxelized_points, axis=0).tolist()
 		with open(os.path.join(latest_subfolder2, "mean_cause.json"), "w") as f:
-			json.dump(arr.tolist(), f)
-		_save_pcd(voxelized_points, save_path)
+			json.dump(mean_pos, f)
+	
+		# 4. Save PCD using Open3D (Binary format is default and much faster)
+		pcd = o3d.geometry.PointCloud()
+		pcd.points = o3d.utility.Vector3dVector(voxelized_points)
+		o3d.io.write_point_cloud(save_path, pcd, write_ascii=False)
+	
+		self.get_logger().info(f"O3D saved {len(voxelized_points)} points to {save_path}")
 		return latest_subfolder2, save_path
 
-
-	def _check_and_start_gp_fit_if_ready(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
+	def _check_and_start_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Check if poses.npy is available and start GP fitting if ready."""
+		poses_path = os.path.join(buffer_dir, 'poses.npy')
+		if not os.path.exists(poses_path):
+			self.get_logger().info(f"poses.npy not yet available in {buffer_dir}, skipping GP fit for now")
+			return
+		
 		try:
-			# Check if poses.npy exists in the buffer directory
-			poses_path = os.path.join(buffer_dir, 'poses.npy')
-			if not os.path.exists(poses_path):
-				self.get_logger().info(f"poses.npy not yet available in {buffer_dir}, skipping GP fit for now")
+			poses_data = np.load(poses_path)
+			if len(poses_data) == 0:
+				self.get_logger().info(f"poses.npy is empty in {buffer_dir}, skipping GP fit for now")
 				return
-			
-			# Check if poses.npy has data
-			try:
-				poses_data = np.load(poses_path)
-				if len(poses_data) == 0:
-					self.get_logger().info(f"poses.npy is empty in {buffer_dir}, skipping GP fit for now")
-					return
-			except Exception as e:
-				self.get_logger().warn(f"Error reading poses.npy from {buffer_dir}: {e}")
-				return
-			
-			# Both PCD and poses are available, start GP fitting
-			self.get_logger().info(f"Both PCD and poses.npy available in {buffer_dir}, starting GP fit")
-			self._start_background_gp_fit(buffer_dir, pointcloud_xyz, cause_name)
-			
 		except Exception as e:
-			self.get_logger().warn(f"Error checking GP fit readiness: {e}")
+			self.get_logger().warn(f"Error reading poses.npy from {buffer_dir}: {e}")
+			return
+		
+		self.get_logger().info(f"Both PCD and poses.npy available in {buffer_dir}, starting GP fit")
+		self._start_background_gp_fit(buffer_dir, pointcloud_xyz, cause_name)
+			
 
 	def _start_background_gp_fit(self, buffer_dir: str, pointcloud_xyz: np.ndarray, cause_name: Optional[str] = None):
 		"""Start GP fitting in a background thread if not already running."""
@@ -1219,123 +1138,63 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().warn(f"Error handling registry response: {e}")
 	
+
 	def _load_pcd_points(self, pcd_path: str) -> np.ndarray:
-		"""Load points from PCD file."""
+		"""Load points from PCD file using Open3D for high compatibility and speed."""
 		try:
-			# Simple PCD loader for binary format
-			with open(pcd_path, 'rb') as f:
-				# Skip header
-				header_lines = []
-				while True:
-					line = f.readline().decode('ascii')
-					header_lines.append(line)
-					if line.startswith('DATA binary'):
-						break
-				
-				# Find POINTS count
-				points_count = 0
-				for line in header_lines:
-					if line.startswith('POINTS'):
-						points_count = int(line.split()[1])
-						break
-				
-				if points_count == 0:
-					return np.array([])
-				
-				# Read binary data (3 floats per point: x, y, z)
-				points_data = f.read(points_count * 3 * 4)  # 4 bytes per float
-				points = np.frombuffer(points_data, dtype=np.float32).reshape(-1, 3)
-				
-				return points
-				
-		except Exception as e:
-			self.get_logger().error(f"Error loading PCD points: {e}")
-			return np.array([])
+			pcd = o3d.io.read_point_cloud(pcd_path)
+			if pcd.is_empty():
+				return np.array([], dtype=np.float32)
+			return np.asarray(pcd.points, dtype=np.float32)
 	
+		except Exception as e:
+			self.get_logger().error(f"Error loading PCD points with Open3D: {e}")
+			return np.array([], dtype=np.float32)
 
 	def _create_gp_colored_pointcloud(self, grid_points: np.ndarray, gp_values: np.ndarray) -> Optional[PointCloud2]:
-		"""Create colored point cloud from GP field predictions."""
-		try:
-			if len(grid_points) == 0 or len(gp_values) == 0:
-				return None
-			
-			# Normalize GP values to [0, 1] for coloring
-			gp_min, gp_max = gp_values.min(), gp_values.max()
-			if gp_max > gp_min:
-				normalized_values = (gp_values - gp_min) / (gp_max - gp_min)
-			else:
-				normalized_values = np.zeros_like(gp_values)
-			
-			# Create BRIGHT, HIGH-CONTRAST color map with proper gradient
-			colors = np.zeros((len(grid_points), 3), dtype=np.uint8)
-			
-			# High-contrast colormap: Dark Blue -> Cyan -> Yellow -> Bright Red
-			# This gives much better visibility and contrast
-			for i, value in enumerate(normalized_values):
-				if value < 0.25:  # Low values: Dark Blue to Cyan
-					local_val = value / 0.25
-					colors[i] = [0, int(255 * local_val), 255]  # Blue to Cyan
-				elif value < 0.5:  # Medium-low: Cyan to Green
-					local_val = (value - 0.25) / 0.25
-					colors[i] = [0, 255, int(255 * (1 - local_val))]  # Cyan to Green
-				elif value < 0.75:  # Medium-high: Green to Yellow
-					local_val = (value - 0.5) / 0.25
-					colors[i] = [int(255 * local_val), 255, 0]  # Green to Yellow
-				else:  # High values: Yellow to Bright Red
-					local_val = (value - 0.75) / 0.25
-					colors[i] = [255, int(255 * (1 - local_val)), 0]  # Yellow to Red
-			
-			# Create PointCloud2 message
-			header = Header()
-			header.stamp = self.get_clock().now().to_msg()
-			header.frame_id = self.map_frame
-			
-			# Create structured array with XYZ + RGB
-			cloud_data_combined = np.empty(len(grid_points), dtype=[
-				('x', np.float32), ('y', np.float32), ('z', np.float32), 
-				('rgb', np.uint32)
-			])
-			
-			# Fill in the data
-			cloud_data_combined['x'] = grid_points[:, 0]
-			cloud_data_combined['y'] = grid_points[:, 1]
-			cloud_data_combined['z'] = grid_points[:, 2]
-			
-			# Pack RGB values as UINT32 (standard for PointCloud2 RGB)
-			rgb_packed = np.zeros(len(colors), dtype=np.uint32)
-			for i, c in enumerate(colors):
-				rgb_packed[i] = (int(c[0]) << 16) | (int(c[1]) << 8) | int(c[2])
-			cloud_data_combined['rgb'] = rgb_packed
-			
-			# Create PointCloud2 message
-			cloud_msg = PointCloud2()
-			cloud_msg.header = header
-			
-			# Define the fields
-			cloud_msg.fields = [
-				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='rgb', offset=12, datatype=pc2.PointField.UINT32, count=1)
-			]
-			
-			# Set the message properties
-			cloud_msg.point_step = 16  # 4 bytes per float * 4 fields (x, y, z, rgb)
-			cloud_msg.width = len(grid_points)
-			cloud_msg.height = 1
-			cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
-			cloud_msg.is_dense = True
-			
-			# Set the data
-			cloud_msg.data = cloud_data_combined.tobytes()
-			
-			return cloud_msg
-			
-		except Exception as e:
-			self.get_logger().error(f"Error creating GP colored point cloud: {e}")
-			import traceback
-			traceback.print_exc()
+		"""Create colored point cloud from GP field predictions using vectorized operations."""
+		if len(grid_points) == 0 or len(gp_values) == 0:
 			return None
+
+		gp_min, gp_max = gp_values.min(), gp_values.max()
+		if gp_max > gp_min:
+			normalized_values = (gp_values - gp_min) / (gp_max - gp_min)
+		else:
+			normalized_values = np.zeros_like(gp_values)
+
+		colors_rgba = cm.turbo(normalized_values)
+		colors_uint8 = (colors_rgba[:, :3] * 255).astype(np.uint32)
+		rgb_packed = (colors_uint8[:, 0] << 16) | (colors_uint8[:, 1] << 8) | colors_uint8[:, 2]
+
+		cloud_data = np.empty(len(grid_points), dtype=[
+			('x', np.float32), ('y', np.float32), ('z', np.float32), 
+			('rgb', np.uint32)
+		])
+
+		cloud_data['x'] = grid_points[:, 0].astype(np.float32)
+		cloud_data['y'] = grid_points[:, 1].astype(np.float32)
+		cloud_data['z'] = grid_points[:, 2].astype(np.float32)
+		cloud_data['rgb'] = rgb_packed
+
+		# 5. Assemble PointCloud2 Message
+		cloud_msg = PointCloud2()
+		cloud_msg.header.stamp = self.get_clock().now().to_msg()
+		cloud_msg.header.frame_id = self.map_frame
+
+		cloud_msg.fields = [
+			pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
+			pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
+			pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1),
+			pc2.PointField(name='rgb', offset=12, datatype=pc2.PointField.UINT32, count=1)
+		]
+
+		cloud_msg.point_step = 16
+		cloud_msg.width = len(grid_points)
+		cloud_msg.height = 1
+		cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width
+		cloud_msg.is_dense = True
+		cloud_msg.data = cloud_data.tobytes()
+		return cloud_msg
 	
 	def _start_gp_computation_thread(self):
 		"""Start the GP computation thread."""
@@ -1462,67 +1321,42 @@ class SemanticDepthOctoMapNode(Node):
 			traceback.print_exc()
 	
 
-	# ============================================================
-	# ROBOT-CENTRIC 3D GRID GP PREDICTION METHODS
-	# ============================================================
-	
 	def _create_robot_centric_3d_grid(self):
 		"""
-		Create a 3D grid around the robot position for GP prediction.
-		
-		Grid size: 10m × 10m (XY) × 4m (Z)
-		Resolution: 0.2m
-		
-		Returns:
-			grid_points: (N, 3) numpy array of grid points in world coordinates
-			grid_shape: (D, H, W) tuple of grid dimensions
+		Optimized 3D grid generation using flattened coordinate arrays.
+		Grid size: 10m × 10m (XY) × 4m (Z) centered on the robot.
 		"""
 		try:
 			if self.robot_position is None:
 				self.get_logger().warn("Robot position not available for grid generation")
-				return np.array([]), (0, 0, 0)
-			
-			# Extract robot position
-			robot_x, robot_y, robot_z = self.robot_position
-			
-			# Define grid bounds centered around robot
-			half_size_xy = self.robot_grid_size_xy / 2.0  # 5m in each direction
-			half_size_z = self.robot_grid_size_z / 2.0    # 2m in each direction
-			
-			# Create 1D coordinate arrays
-			x_min = robot_x - half_size_xy
-			x_max = robot_x + half_size_xy
-			y_min = robot_y - half_size_xy
-			y_max = robot_y + half_size_xy
-			z_min = robot_z - half_size_z
-			z_max = robot_z + half_size_z
-			
-			# Generate grid coordinates
-			x_coords = np.arange(x_min, x_max, self.robot_grid_resolution)
-			y_coords = np.arange(y_min, y_max, self.robot_grid_resolution)
-			z_coords = np.arange(z_min, z_max, self.robot_grid_resolution)
-			
-			# Create meshgrid
-			X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
-			
-			# Flatten to (N, 3) array
-			grid_points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1).astype(np.float32)
-			
-			# Grid shape for tensor reshaping (Depth, Height, Width)
-			grid_shape = (len(x_coords), len(y_coords), len(z_coords))
-			
-			self.get_logger().info(
-				f"Created robot-centric 3D grid: {grid_points.shape[0]} points, "
-				f"shape={grid_shape}, resolution={self.robot_grid_resolution}m"
-			)
-			
+				return np.array([], dtype=np.float32), (0, 0, 0)
+	
+			# 1. Define bounds
+			rx, ry, rz = self.robot_position
+			h_xy = self.robot_grid_size_xy / 2.0
+			h_z = self.robot_grid_size_z / 2.0
+			res = self.robot_grid_resolution
+	
+			# 2. Use linspace for stability or arange for exact resolution
+			# np.arange can sometimes have 'off-by-one' errors with floating points
+			x_c = np.arange(rx - h_xy, rx + h_xy, res, dtype=np.float32)
+			y_c = np.arange(ry - h_xy, ry + h_xy, res, dtype=np.float32)
+			z_c = np.arange(rz - h_z, rz + h_z, res, dtype=np.float32)
+	
+			# 3. Memory Efficient Meshgrid
+			# Using indexing='ij' is correct for (D, H, W) mapping
+			X, Y, Z = np.meshgrid(x_c, y_c, z_c, indexing='ij')
+	
+			# 4. Ravel is faster than flatten() as it returns a view when possible
+			grid_points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+	
+			grid_shape = (len(x_c), len(y_c), len(z_c))
+	
 			return grid_points, grid_shape
-			
+	
 		except Exception as e:
 			self.get_logger().error(f"Error creating robot-centric 3D grid: {e}")
-			import traceback
-			traceback.print_exc()
-			return np.array([]), (0, 0, 0)
+			return np.array([], dtype=np.float32), (0, 0, 0)
 	
 	def _update_gp_gpu_tensor(self, gp_mean, uncertainty_std, grid_shape):
 		"""
@@ -1619,8 +1453,6 @@ class SemanticDepthOctoMapNode(Node):
 			
 		except Exception as e:
 			self.get_logger().error(f"Error publishing raw GP grid: {e}")
-	
-	
 	
 	
 	def _create_fast_adaptive_gp_grid(self, semantic_points: np.ndarray, radius: float) -> np.ndarray:
@@ -1941,68 +1773,6 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error creating costmap point cloud: {e}")
 			return None
 	
-	def _create_tight_semantic_gp_grid(self, semantic_points: np.ndarray, grid_size: float = 0.8, resolution: float = 0.15) -> np.ndarray:
-		"""Create tight, smaller grids around semantic voxel clusters with REDUCED resolution for efficiency."""
-		try:
-			if len(semantic_points) == 0:
-				return np.array([])
-			
-			# Find bounding box of all semantic voxels
-			min_coords = np.min(semantic_points, axis=0)
-			max_coords = np.max(semantic_points, axis=0)
-			
-			# Use smaller extension for tighter grid
-			extent = np.max(max_coords - min_coords) + grid_size
-			half_extent = extent / 2.0
-			center = (min_coords + max_coords) / 2.0
-			
-			# Create REDUCED resolution grid (0.15m instead of 0.08m)
-			x_range = np.arange(center[0] - half_extent, center[0] + half_extent, resolution)
-			y_range = np.arange(center[1] - half_extent, center[1] + half_extent, resolution)
-			z_range = np.arange(center[2] - half_extent, center[2] + half_extent, resolution)
-			
-			# Create meshgrid
-			X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
-			grid_points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1)
-			
-			# Filter grid points to keep only those close to semantic voxels (within 1.0m)
-			filtered_grid_points = self._filter_grid_points_near_voxels(grid_points, semantic_points, max_distance=1.0)
-			
-			self.get_logger().info(f"Created TIGHT semantic GP grid: {len(filtered_grid_points)} points around {len(semantic_points)} semantic voxels (grid_size={grid_size}m, resolution={resolution}m)")
-			return filtered_grid_points
-			
-		except Exception as e:
-			self.get_logger().error(f"Error creating tight semantic GP grid: {e}")
-			return np.array([])
-	
-	def _filter_grid_points_near_voxels(self, grid_points: np.ndarray, voxel_positions: np.ndarray, max_distance: float = 1.0) -> np.ndarray:
-		"""Filter grid points to keep only those within max_distance of any semantic voxel."""
-		try:
-			if len(grid_points) == 0 or len(voxel_positions) == 0:
-				return grid_points
-			
-			# For each grid point, find minimum distance to any voxel
-			filtered_points = []
-			
-			for grid_point in grid_points:
-				# Calculate distances to all voxels
-				distances = np.linalg.norm(voxel_positions - grid_point, axis=1)
-				min_distance = np.min(distances)
-				
-				# Keep point if it's within max_distance of any voxel
-				if min_distance <= max_distance:
-					filtered_points.append(grid_point)
-			
-			filtered_points = np.array(filtered_points)
-			
-			self.get_logger().info(f"Filtered grid points: {len(grid_points)} -> {len(filtered_points)} (kept points within {max_distance}m of semantic voxels)")
-			
-			return filtered_points
-			
-		except Exception as e:
-			self.get_logger().error(f"Error filtering grid points: {e}")
-			return grid_points
-	
 	def _get_all_semantic_voxels(self) -> List[np.ndarray]:
 		"""Return stored semantic voxel positions without further processing."""
 		try:
@@ -2221,9 +1991,8 @@ class SemanticDepthOctoMapNode(Node):
 				return
 			
 			depth_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-			with self.sync_lock:
-				self.depth_buffer.append((depth_time, depth_m))
-				self._prune_sync_buffers()
+			self.depth_buffer_data.append(msg)
+			self.depth_buffer_ts.append(depth_time)
 			
 			# Regular VDB occupancy mapping: run in separate thread to avoid blocking
 			if self.latest_pose is not None:
@@ -2317,48 +2086,6 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception as e:
 			self.get_logger().warn(f"Semantic voxel update error: {e}")
 
-
-	def _create_cloud_xyz(self, points: np.ndarray) -> Optional[PointCloud2]:
-		try:
-			if points is None or len(points) == 0:
-				return None
-			pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-			header = Header()
-			header.stamp = self.get_clock().now().to_msg()
-			header.frame_id = self.map_frame
-			cloud_data = np.empty(pts.shape[0], dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32)])
-			cloud_data['x'] = pts[:, 0]
-			cloud_data['y'] = pts[:, 1]
-			cloud_data['z'] = pts[:, 2]
-			msg = PointCloud2()
-			msg.header = header
-			msg.fields = [
-				pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='y', offset=4, datatype=pc2.PointField.FLOAT32, count=1),
-				pc2.PointField(name='z', offset=8, datatype=pc2.PointField.FLOAT32, count=1)
-			]
-			msg.point_step = 12
-			msg.width = pts.shape[0]
-			msg.height = 1
-			msg.row_step = msg.point_step * msg.width
-			msg.is_dense = True
-			msg.data = cloud_data.tobytes()
-			return msg
-		except Exception:
-			return None
-
-	def _prune_sync_buffers(self):
-		"""Keep only recent entries within sync window."""
-		cutoff = time.time() - self.sync_buffer_duration
-		# Depth/mask/pose buffers capped by length (heuristic) to bound memory
-		max_entries = 50
-		if len(self.depth_buffer) > max_entries:
-			self.depth_buffer = self.depth_buffer[-max_entries:]
-		if len(self.pose_buffer) > max_entries:
-			self.pose_buffer = self.pose_buffer[-max_entries:]
-		if len(self.mask_buffer) > max_entries:
-			self.mask_buffer = self.mask_buffer[-max_entries:]
-
 	def _depth_to_meters(self, depth, encoding: str):
 		try:
 			enc = (encoding or '').lower()
@@ -2371,41 +2098,6 @@ class SemanticDepthOctoMapNode(Node):
 		except Exception:
 			return None
 	
-	def _depth_to_world_points(self, depth_m: np.ndarray, intrinsics, pose: PoseStamped):
-		# BOTTLENECK FUNCTION: This entire function is inefficient for sparse depth images
-		# Creates meshgrid for entire image (H x W), then filters - should process only valid pixels
-		try:
-			fx, fy, cx, cy = intrinsics
-			h, w = depth_m.shape
-			# BOTTLENECK: np.meshgrid() creates full H x W coordinate arrays even for sparse depth
-			# For 640x480 image, creates 307,200 coordinate pairs, most of which are discarded
-			u, v = np.meshgrid(np.arange(w), np.arange(h))
-			z = depth_m
-			# BOTTLENECK: Valid mask computation on full image
-			valid = np.isfinite(z) & (z > 0.0)
-			if not np.any(valid):
-				return None, None, None
-
-			# BOTTLENECK: Indexing full arrays to extract valid pixels (memory intensive)
-			u, v, z = u[valid], v[valid], z[valid]
-			x = (u - cx) * z / fx
-			y = (v - cy) * z / fy
-			pts_cam = np.stack([x, y, z], axis=1)
-
-			# Transform to base if needed
-			# BOTTLENECK: Matrix multiplication for all points (even if most are zeros)
-			if bool(self.pose_is_base_link):
-				pts_cam = pts_cam @ (self.R_opt_to_base.T if bool(self.apply_optical_frame_rotation) else np.eye(3, dtype=np.float32))
-				pts_cam = pts_cam @ self.R_cam_to_base_extra.T + self.t_cam_to_base_extra
-
-			# World transform
-			# BOTTLENECK: Another matrix multiplication for all points
-			R_world = self._quat_to_rot(self._pose_quat(pose))
-			p_world = self._pose_position(pose)
-			pts_world = pts_cam @ R_world.T + p_world
-			return pts_world, u, v
-		except Exception:
-			return None, None, None
 
 	def _depth_to_world_points_sparse(self, u: np.ndarray, v: np.ndarray, z: np.ndarray, intrinsics, pose: PoseStamped):
 		"""Optimized version that only processes sparse hotspot pixels (no meshgrid)."""
@@ -2617,108 +2309,7 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().warn(f"Error getting voxel center for key {voxel_key}: {e}")
 			return None
 	
-	def _create_vdb_markers(self, max_markers: int) -> Optional[MarkerArray]:
-		"""Create visualization markers from VDB occupancy data."""
-		try:
-			if self.vdb_mapper.is_empty():
-				return None
-			
-			# Get occupancy data from VDB
-			pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.vdb_mapper.occ_map_vdb)
-			
-			# Convert to numpy if it's a torch tensor
-			if torch.is_tensor(pc_xyz_occ_size):
-				pc_xyz_occ_size = pc_xyz_occ_size.cpu().numpy()
-			
-			# Filter occupied voxels
-			occupied_mask = pc_xyz_occ_size[:, -2] > 0
-			occupied_points = pc_xyz_occ_size[occupied_mask]
-			
-			if len(occupied_points) == 0:
-				return None
-			
-			# Limit number of markers
-			if len(occupied_points) > max_markers:
-				indices = np.random.choice(len(occupied_points), max_markers, replace=False)
-				occupied_points = occupied_points[indices]
-			
-			# Create marker array
-			marker_array = MarkerArray()
-			
-			if bool(self.use_cube_list_markers):
-				# Create single CUBE_LIST marker for all voxels
-				marker = Marker()
-				marker.header.frame_id = self.map_frame
-				marker.header.stamp = self.get_clock().now().to_msg()
-				marker.ns = "vdb_occupancy"
-				marker.id = 0
-				marker.type = Marker.CUBE_LIST
-				marker.action = Marker.ADD
-				marker.scale.x = float(self.voxel_resolution)
-				marker.scale.y = float(self.voxel_resolution)
-				marker.scale.z = float(self.voxel_resolution)
-				
-				for point_data in occupied_points:
-					p = Point()
-					p.x, p.y, p.z = float(point_data[0]), float(point_data[1]), float(point_data[2])
-					marker.points.append(p)
-					
-					# Check if semantic voxel
-					voxel_key = self._get_voxel_key_from_point(point_data[:3])
-					with self.semantic_voxels_lock:
-						if voxel_key in self.semantic_voxels:
-							# Semantic voxel - use VLM answer color
-							semantic_info = self.semantic_voxels[voxel_key]
-							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
-							color_rgb = self._get_vlm_answer_color(vlm_answer)
-							color = ColorRGBA()
-							color.r, color.g, color.b, color.a = color_rgb[0]/255.0, color_rgb[1]/255.0, color_rgb[2]/255.0, 1.0
-						else:
-							# Regular voxel - gray
-							color = ColorRGBA()
-							color.r, color.g, color.b, color.a = 0.5, 0.5, 0.5, 0.8
-					marker.colors.append(color)
-				
-				marker_array.markers.append(marker)
-			else:
-				# Create individual cube markers
-				for i, point_data in enumerate(occupied_points):
-					marker = Marker()
-					marker.header.frame_id = self.map_frame
-					marker.header.stamp = self.get_clock().now().to_msg()
-					marker.ns = "vdb_occupancy"
-					marker.id = i
-					marker.type = Marker.CUBE
-					marker.action = Marker.ADD
-					marker.pose.position.x = float(point_data[0])
-					marker.pose.position.y = float(point_data[1])
-					marker.pose.position.z = float(point_data[2])
-					marker.pose.orientation.w = 1.0
-					marker.scale.x = float(self.voxel_resolution)
-					marker.scale.y = float(self.voxel_resolution)
-					marker.scale.z = float(self.voxel_resolution)
-					
-					# Check if semantic voxel
-					voxel_key = self._get_voxel_key_from_point(point_data[:3])
-					with self.semantic_voxels_lock:
-						if voxel_key in self.semantic_voxels:
-							# Semantic voxel - use VLM answer color
-							semantic_info = self.semantic_voxels[voxel_key]
-							vlm_answer = semantic_info.get('vlm_answer', 'unknown')
-							color_rgb = self._get_vlm_answer_color(vlm_answer)
-							marker.color.r, marker.color.g, marker.color.b, marker.color.a = color_rgb[0]/255.0, color_rgb[1]/255.0, color_rgb[2]/255.0, 1.0
-						else:
-							# Regular voxel - gray
-							marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.5, 0.5, 0.5, 0.8
-					
-					marker_array.markers.append(marker)
-			
-			return marker_array
-			
-		except Exception as e:
-			self.get_logger().error(f"Error creating VDB markers: {e}")
-			return None
-	
+
 	def _create_semantic_only_cloud(self) -> Optional[PointCloud2]:
 		"""Create a point cloud containing all accumulated semantic voxels."""
 		try:
@@ -2784,20 +2375,6 @@ class SemanticDepthOctoMapNode(Node):
 	
 	def _periodic_publishing(self):
 		now = time.time()
-		
-		# if self.marker_pub and (now - self.last_marker_pub) >= float(self.marker_publish_rate):
-		# 	markers = self._create_vdb_markers(int(self.max_markers))
-			
-		# 	if markers is not None:
-		# 		# Fix timestamps for all markers
-		# 		current_time = self.get_clock().now().to_msg()
-		# 		for marker in markers.markers:
-		# 			marker.header.stamp = current_time
-				
-		# 		self.marker_pub.publish(markers)
-		# 		marker_count = len(markers.markers) if hasattr(markers, 'markers') else 0
-		# 		self.get_logger().info(f"Published {marker_count} VDB voxel markers")
-		# 	self.last_marker_pub = now
 		
 		if self.cloud_pub:
 			try:
@@ -2928,12 +2505,7 @@ class SemanticDepthOctoMapNode(Node):
 		try:
 			if self.vdb_mapper is None:
 				return
-			# Mask frontiers
-			if self.vdb_mapper.frontiers is not None and self.vdb_mapper.frontiers.shape[0] > 0:
-				frontiers_np = self.vdb_mapper.frontiers.detach().cpu().numpy()
-				cloud = self._create_cloud_xyz(frontiers_np)
-				if cloud is not None:
-					self.mask_frontiers_pub.publish(cloud)
+
 			# Rays as arrows
 			def _offset_origin(base: np.ndarray, direction: np.ndarray, idx: int) -> np.ndarray:
 				offset_dir = np.cross(direction, np.array([0.0, 0.0, 1.0], dtype=np.float32))

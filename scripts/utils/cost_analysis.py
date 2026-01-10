@@ -37,7 +37,7 @@ import json
 
 # Import from sample_gp.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sample_gp import (
+from scripts.utils.sample_gp import (
     DisturbanceFieldHelper,
     load_pcd,
     gp_field,
