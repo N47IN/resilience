@@ -999,50 +999,34 @@ class ResilienceNode(Node):
                     time.sleep(0.01)
                     continue
                 
-                try:
-                    # SPEED OPTIMIZATION: Skip visualization to focus on similarity maps
-                    feat_map_np, naradio_vis = self.naradio_processor.process_features_optimized(
-                        rgb_image, 
-                        need_visualization=False,  # Disabled for speed
-                        reuse_features=True
-                    )
+                
+                # SPEED OPTIMIZATION: Skip visualization to focus on similarity maps
+                feat_map_np, naradio_vis = self.naradio_processor.process_features_optimized(
+                    rgb_image, 
+                    need_visualization=False,  # Disabled for speed
+                    reuse_features=True
+                )
+                
+                # OLD WORKING LOGIC: Process similarity for ALL VLM objects continuously
+                if (self.enable_combined_segmentation and 
+                    self.naradio_processor.is_segmentation_ready() and
+                    self.naradio_processor.dynamic_objects and
+                    feat_map_np is not None):
                     
-                    # OLD WORKING LOGIC: Process similarity for ALL VLM objects continuously
-                    if (self.enable_combined_segmentation and 
-                        self.naradio_processor.is_segmentation_ready() and
-                        self.naradio_processor.dynamic_objects and
-                        feat_map_np is not None):
+                
+                        vlm_answers = self.naradio_processor.dynamic_objects
+                        vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers, feat_map_np=feat_map_np)
                         
-                        try:
-                            # Continuous predictive similarity: Create merged hotspot masks for all VLM answers
-                            # This handles ongoing monitoring using enhanced embeddings (when available)
-                            # Note: Narration masks are published separately with vec_id tracking to prevent duplicates
-                            vlm_answers = self.naradio_processor.dynamic_objects
-                            # CRITICAL FIX #1: Pass pre-computed features to avoid redundant extraction
-                            vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers, feat_map_np=feat_map_np)
+                        if vlm_hotspots and len(vlm_hotspots) > 0:
+                            rgb_timestamp = self._get_ros_timestamp(rgb_msg)
+                            self.semantic_bridge.publish_merged_hotspots(
+                                vlm_hotspots=vlm_hotspots,
+                                timestamp=rgb_timestamp,
+                                original_image=rgb_image
+                            )           
                             
-                            if vlm_hotspots and len(vlm_hotspots) > 0:
-                                # Get RGB timestamp for this image
-                                rgb_timestamp = self._get_ros_timestamp(rgb_msg)
-                                
-                                # Publish merged hotspots with color-based association (narration=False)
-                                self.semantic_bridge.publish_merged_hotspots(
-                                    vlm_hotspots=vlm_hotspots,
-                                    timestamp=rgb_timestamp,
-                                    original_image=rgb_image
-                                )
-                        
-                        except Exception as seg_e:
-                            pass  # SPEED OPTIMIZATION: Silent error handling
-                        
-                except Exception as e:
-                    time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced sleep on error
-                    continue
-                
-                time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced from 0.15s
-                
             except Exception as e:
-                time.sleep(0.05)  # SPEED OPTIMIZATION: Reduced sleep on error
+                time.sleep(0.05)  
     
     def camera_info_callback(self, msg):
         """Handle camera info to get intrinsics."""

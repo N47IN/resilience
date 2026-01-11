@@ -822,32 +822,6 @@ class DisturbanceFieldHelper:
 	# High-level pipeline
 	# ----------------------------
 
-	def _sum_of_anisotropic_rbf_fast(self, grid_points: np.ndarray, centers: np.ndarray, lxy: float, lz: float) -> np.ndarray:
-		"""OPTIMIZED anisotropic RBF computation for speed."""
-		try:
-			if centers.size == 0:
-				return np.zeros(grid_points.shape[0], dtype=float)
-			
-			# Precompute inverse squared length scales
-			inv_lxy2 = 1.0 / (lxy * lxy + 1e-12)
-			inv_lz2 = 1.0 / (lz * lz + 1e-12)
-			
-			# Vectorized computation - much faster than chunked approach
-			dx = grid_points[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
-			dy = grid_points[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
-			dz = grid_points[:, np.newaxis, 2] - centers[np.newaxis, :, 2]
-			
-			# Compute anisotropic distance squared
-			d2 = (dx * dx + dy * dy) * inv_lxy2 + (dz * dz) * inv_lz2
-			
-			# Compute RBF contributions and sum over all centers
-			phi = np.sum(np.exp(-0.5 * d2), axis=1)
-			
-			return phi
-			
-		except Exception as e:
-			self.get_logger().error(f"Error in fast anisotropic RBF: {e}")
-			return np.zeros(grid_points.shape[0], dtype=float)
 		  
 	def fit_from_pointcloud_and_buffer(self, pointcloud_xyz: np.ndarray, buffer_dir: str, nominal_path: Optional[str] = None, nominal_xyz: Optional[np.ndarray] = None, clip_plane: str = 'xy', objective: str = "nll") -> Dict[str, Any]:
 		"""
@@ -977,6 +951,32 @@ class DisturbanceFieldHelper:
 def load_buffer_xyz_drift(buffer_dir: str):
 	return DisturbanceFieldHelper.load_buffer_xyz_drift(buffer_dir)
 
+def _sum_of_anisotropic_rbf_fast(grid_points: np.ndarray, centers: np.ndarray, lxy: float, lz: float) -> np.ndarray:
+		"""OPTIMIZED anisotropic RBF computation for speed."""
+		try:
+			if centers.size == 0:
+				return np.zeros(grid_points.shape[0], dtype=float)
+			
+			# Precompute inverse squared length scales
+			inv_lxy2 = 1.0 / (lxy * lxy + 1e-12)
+			inv_lz2 = 1.0 / (lz * lz + 1e-12)
+			
+			# Vectorized computation - much faster than chunked approach
+			dx = grid_points[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
+			dy = grid_points[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
+			dz = grid_points[:, np.newaxis, 2] - centers[np.newaxis, :, 2]
+			
+			# Compute anisotropic distance squared
+			d2 = (dx * dx + dy * dy) * inv_lxy2 + (dz * dz) * inv_lz2
+			
+			# Compute RBF contributions and sum over all centers
+			phi = np.sum(np.exp(-0.5 * d2), axis=1)
+			
+			return phi
+			
+		except Exception as e:
+			return np.zeros(grid_points.shape[0], dtype=float)
+		
 def load_nominal_xyz(nominal_path: str):
 	return DisturbanceFieldHelper.load_nominal_xyz(nominal_path)
 

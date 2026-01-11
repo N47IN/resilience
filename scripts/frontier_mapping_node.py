@@ -36,6 +36,7 @@ import math
 from typing import Optional, List, Dict
 import sensor_msgs_py.point_cloud2 as pc2
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import os
 import bisect
@@ -53,6 +54,8 @@ except ImportError as e:
 	VDB_AVAILABLE = False
 
 # Optional GP helper
+from resilience.voxel_gp_helper import _sum_of_anisotropic_rbf_fast
+
 try:
 	from resilience.voxel_gp_helper import DisturbanceFieldHelper
 	GP_HELPER_AVAILABLE = True
@@ -187,6 +190,9 @@ class SemanticDepthOctoMapNode(Node):
 		self.mask_buffer = []
 		self.sync_buffer_duration = float(self.sync_buffer_seconds)
 		self.sync_lock = threading.Lock()
+		
+		# Thread pool for processing semantic hotspots
+		self.hotspot_executor = ThreadPoolExecutor(max_workers=3)
 		
 		# Cache for latest buffer subfolder (avoid repeated file system calls)
 		self._cached_latest_subfolder = None
@@ -431,7 +437,7 @@ class SemanticDepthOctoMapNode(Node):
 				ray_accum_phase=0,
 				angle_bin_size=30.0,
 				ray_erosion=1,
-				ray_tracing=True,
+				ray_tracing=False,
 				global_encoding=True,
 				zero_depth_mode=False,
 				infer_direction=False,
@@ -495,14 +501,13 @@ class SemanticDepthOctoMapNode(Node):
 
 
 	def semantic_hotspot_callback(self, msg: String):
-		"""Process incoming semantic hotspot metadata directly in callback."""
+		"""Process incoming semantic hotspot metadata using an efficient thread pool."""
 		if not self.enable_semantic_mapping or not self.enable_voxel_mapping:
 			return
-		threading.Thread(
-			target=self._process_single_bridge_message,
-			args=(msg.data,),
-			daemon=True
-		).start()
+
+		# Submit the task to the pool instead of spawning a new thread
+		self.hotspot_executor.submit(self._process_single_bridge_message, msg.data)
+		
 		self.last_data_time = time.time()
 
 	def _process_single_bridge_message(self, msg_data: str) -> bool:
@@ -728,7 +733,7 @@ class SemanticDepthOctoMapNode(Node):
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
 					voxelized_points = self._voxelize_pointcloud(points_world_near, float(self.voxel_resolution), max_points=200)
 					self._check_and_start_gp_fit(buffer_dir, voxelized_points, vlm_answer)
-
+ 				
 			# Build depth image with only hotspot pixels (same as tmp.py) - prepare for threading
 			h, w = mask.shape
 			depth_hot = np.zeros((h, w), dtype=np.float32)
@@ -1542,7 +1547,7 @@ class SemanticDepthOctoMapNode(Node):
 			b = fit_params.get('b', 0.0)
 			
 			# Use OPTIMIZED anisotropic RBF computation
-			phi = self._sum_of_anisotropic_rbf_fast(grid_points, cause_points, lxy, lz)
+			phi = _sum_of_anisotropic_rbf_fast(grid_points, cause_points, lxy, lz)
 			
 			# Apply the learned parameters: disturbance = A * phi + b
 			predictions = A * phi + b
@@ -1553,32 +1558,6 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error in fast GP prediction: {e}")
 			return np.zeros(len(grid_points))
 	
-	def _sum_of_anisotropic_rbf_fast(self, grid_points: np.ndarray, centers: np.ndarray, lxy: float, lz: float) -> np.ndarray:
-		"""OPTIMIZED anisotropic RBF computation for speed."""
-		try:
-			if centers.size == 0:
-				return np.zeros(grid_points.shape[0], dtype=float)
-			
-			# Precompute inverse squared length scales
-			inv_lxy2 = 1.0 / (lxy * lxy + 1e-12)
-			inv_lz2 = 1.0 / (lz * lz + 1e-12)
-			
-			# Vectorized computation - much faster than chunked approach
-			dx = grid_points[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
-			dy = grid_points[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
-			dz = grid_points[:, np.newaxis, 2] - centers[np.newaxis, :, 2]
-			
-			# Compute anisotropic distance squared
-			d2 = (dx * dx + dy * dy) * inv_lxy2 + (dz * dz) * inv_lz2
-			
-			# Compute RBF contributions and sum over all centers
-			phi = np.sum(np.exp(-0.5 * d2), axis=1)
-			
-			return phi
-			
-		except Exception as e:
-			self.get_logger().error(f"Error in fast anisotropic RBF: {e}")
-			return np.zeros(grid_points.shape[0], dtype=float)
 	
 	def _compute_epistemic_uncertainty(self, grid_points: np.ndarray, cause_points: np.ndarray, 
 									   fit_params: dict, nominal_points: np.ndarray, 
@@ -1615,7 +1594,7 @@ class SemanticDepthOctoMapNode(Node):
 				return None
 			
 			# 1. Compute training feature matrix X
-			phi_train = self._sum_of_anisotropic_rbf_fast(nominal_points, cause_points, lxy, lz)
+			phi_train = _sum_of_anisotropic_rbf_fast(nominal_points, cause_points, lxy, lz)
 			X_train = np.column_stack([phi_train, np.ones(len(phi_train))])  # (K, 2)
 			
 			# 2. Compute parameter covariance: Cov(A, b) = sigma² * (X^T X)^-1
@@ -1631,7 +1610,7 @@ class SemanticDepthOctoMapNode(Node):
 				return np.full(len(grid_points), np.sqrt(sigma2_noise))
 			
 			# 3. Compute phi at query points
-			phi_query = self._sum_of_anisotropic_rbf_fast(grid_points, cause_points, lxy, lz)
+			phi_query = _sum_of_anisotropic_rbf_fast(grid_points, cause_points, lxy, lz)
 			
 			# 4. Epistemic variance: v^T * Cov * v where v = [phi, 1]
 			epistemic_var = (Cov_params[0, 0] * phi_query**2 + 
@@ -2614,9 +2593,6 @@ class SemanticDepthOctoMapNode(Node):
 					traceback.print_exc()
 		except Exception as e:
 			self.get_logger().warn(f"Publishing mask rays/frontiers failed: {e}")
-
-
-
 
 
 def main():
