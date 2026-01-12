@@ -21,11 +21,11 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   scripts/main.py
-  scripts/narration_display_node.py
+  scripts/vlm_node.py
   scripts/frontier_mapping_node.py
   scripts/publish_plan.py
-  scripts/control_node.py
-  scripts/primitive_planner.py
+  scripts/drone_mppi_node.py
+  scripts/primitive_planner_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

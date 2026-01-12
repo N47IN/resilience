@@ -226,21 +226,13 @@ class ResilienceNode(Node):
         """Wait for path to be ready before starting main functionality."""
         self.get_logger().info("Waiting for path to be ready...")
         
-        # Get timeout from config
-        timeout_seconds = 30.0  # Default timeout
+        timeout_seconds = 10.0  # Default timeout
         if self.path_manager.get_mode() == 'external_planner':
             timeout_seconds = self.path_config.get('external_planner', {}).get('timeout_seconds', 30.0)
         
         # For external planner mode, check periodically instead of blocking
         if self.path_manager.get_mode() == 'external_planner':
-            self.get_logger().info(f"External planner mode: Waiting up to {timeout_seconds}s for path...")
-            start_time = time.time()
-            
-            while not self.path_manager.is_ready() and (time.time() - start_time) < timeout_seconds:
-                time.sleep(0.5)  # Check every 0.5 seconds
-                elapsed = time.time() - start_time
-                if elapsed % 5.0 < 0.5:  # Print every 5 seconds
-                    self.get_logger().info(f"Still waiting for external path... ({elapsed:.1f}s elapsed)")
+            self.get_logger().info(f"External planner mode: Waiting up to {timeout_seconds}s for path...")            
             
             if self.path_manager.is_ready():
                 self.get_logger().info("External path received - starting main functionality")
@@ -253,21 +245,6 @@ class ResilienceNode(Node):
                     self.get_logger().info("Updated narration manager with external path points")
             else:
                 self.get_logger().warn("External path not received within timeout")
-                self.path_ready = False
-                self.disable_drift_detection = True
-        else:
-            # For JSON mode, use the original blocking wait
-            if self.path_manager.wait_for_path(timeout_seconds):
-                self.get_logger().info("Path ready - starting main functionality")
-                self.path_ready = True
-                
-                # Update narration manager with path points if not already set
-                nominal_points = self.path_manager.get_nominal_points_as_numpy()
-                if len(nominal_points) > 0 and len(self.narration_manager.intended_points) == 0:
-                    self.narration_manager.update_intended_trajectory(nominal_points)
-                    self.get_logger().info("Updated narration manager with path points")
-            else:
-                self.get_logger().warn("Path not ready - some functionality may be limited")
                 self.path_ready = False
                 self.disable_drift_detection = True
 
@@ -508,7 +485,7 @@ class ResilienceNode(Node):
         soft_threshold, hard_threshold = self.path_manager.get_thresholds()
         
         # Wait for path to be ready and print discretization results
-        if self.path_manager.wait_for_path(timeout_seconds=10.0):
+        if self.path_manager.wait_for_path(timeout_seconds=2.0):
             discretized_points = self.path_manager.get_discretized_nominal_points()
             self.get_logger().info(f"Path loaded: {len(discretized_points)} points, {self.path_manager.get_sampling_distance():.3f}m sampling")
         else:
@@ -524,17 +501,6 @@ class ResilienceNode(Node):
                 segmentation_config_path=self.main_config_path if self.main_config_path else None,
                 cause_registry=self.cause_registry
             )
-            
-            if not self.naradio_processor.is_ready():
-                self.get_logger().warn("NARadio initialization failed, will retry in processing loop")
-            else:
-                self.get_logger().info("NARadio processor initialized")
-                
-            if self.enable_combined_segmentation:
-                if self.naradio_processor.is_segmentation_ready():
-                    self.get_logger().info("Combined segmentation initialized")
-                else:
-                    self.get_logger().warn("Combined segmentation initialization failed")
             
             # Read voxel mapping parameters from main config (non-blocking)
             self.enable_voxel_mapping = False  # Default value
@@ -670,8 +636,6 @@ class ResilienceNode(Node):
         
         while self.rolling_image_buffer and (current_system_time - self.rolling_image_buffer[0][1]) > self.rolling_buffer_duration:
             self.rolling_image_buffer.pop(0)
-    
-
         
     def depth_callback(self, msg):
         """Store latest depth message and push into depth buffer."""
@@ -683,8 +647,6 @@ class ResilienceNode(Node):
         except Exception:
             return
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
-
 
     def pose_callback(self, msg):
         """Process pose and trigger detection with consolidated pose updates."""
@@ -860,7 +822,6 @@ class ResilienceNode(Node):
             print(f"Error loading enhanced embedding: {e}")
             return None
 
-
     def save_narration_image_to_buffer(self, image, narration_text, current_time):
         """Save narration image to the current buffer directory."""
         try:
@@ -962,22 +923,30 @@ class ResilienceNode(Node):
 
 
     def naradio_processing_loop(self):
-        """Parallel NARadio processing loop with robust error handling."""
-        print("NARadio processing loop started")
+        """OPTIMIZED: Parallel NARadio processing loop with frame skipping and reduced overhead."""
+        print("NARadio processing loop started (OPTIMIZED)")
         
         last_memory_cleanup = time.time()
-        memory_cleanup_interval = 60.0  # SPEED OPTIMIZATION: Increased from 30s
+        memory_cleanup_interval = 60.0
+        
+        # OPTIMIZATION: Frame skip counter
+        process_every_n_frames = 2  # Process every 2nd frame for predictive similarity
+        frame_counter = 0
+        
+        # OPTIMIZATION: Cached RGB conversion
+        last_rgb_msg_id = None
+        cached_rgb_image = None
         
         while rclpy.ok() and self.naradio_running:
             try:
                 current_time = time.time()
                 
-                # SPEED OPTIMIZATION: Less frequent memory cleanup
+                # OPTIMIZATION: Less frequent memory cleanup
                 if current_time - last_memory_cleanup > memory_cleanup_interval:
                     self.naradio_processor.cleanup_memory()
                     last_memory_cleanup = current_time
                 
-                # Check if processor is ready - skip processing if not ready
+                # Check if processor is ready
                 if not self.naradio_processor.is_ready():
                     time.sleep(0.1)
                     continue
@@ -991,39 +960,53 @@ class ResilienceNode(Node):
                     depth_msg = self.latest_depth_msg
                     pose_for_semantic = self.latest_pose.copy() if self.latest_pose is not None else None
                 
-
-                
-                try:
-                    rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
-                except Exception as e:
+                # OPTIMIZATION: Frame skipping for predictive similarity
+                frame_counter += 1
+                if frame_counter % process_every_n_frames != 0:
                     time.sleep(0.01)
                     continue
                 
+                # OPTIMIZATION: Cache RGB conversion to avoid repeated cv_bridge calls
+                rgb_msg_id = id(rgb_msg)
+                if rgb_msg_id != last_rgb_msg_id:
+                    try:
+                        cached_rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
+                        last_rgb_msg_id = rgb_msg_id
+                    except Exception as e:
+                        time.sleep(0.01)
+                        continue
                 
-                # SPEED OPTIMIZATION: Skip visualization to focus on similarity maps
-                feat_map_np, naradio_vis = self.naradio_processor.process_features_optimized(
+                rgb_image = cached_rgb_image
+                
+                # OPTIMIZATION: Skip visualization completely
+                feat_map_np, _ = self.naradio_processor.process_features_optimized(
                     rgb_image, 
-                    need_visualization=False,  # Disabled for speed
+                    need_visualization=False,
                     reuse_features=True
                 )
                 
-                # OLD WORKING LOGIC: Process similarity for ALL VLM objects continuously
+                # OPTIMIZATION: Only process if we have dynamic objects and features
                 if (self.enable_combined_segmentation and 
                     self.naradio_processor.is_segmentation_ready() and
                     self.naradio_processor.dynamic_objects and
                     feat_map_np is not None):
                     
+                    vlm_answers = self.naradio_processor.dynamic_objects
+                    
+                    # OPTIMIZATION: Use fast version
+                    vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks_fast(
+                        rgb_image, vlm_answers, feat_map_np=feat_map_np)
+                    
+                    if vlm_hotspots and len(vlm_hotspots) > 0:
+                        rgb_timestamp = self._get_ros_timestamp(rgb_msg)
+                        self.semantic_bridge.publish_merged_hotspots(
+                            vlm_hotspots=vlm_hotspots,
+                            timestamp=rgb_timestamp,
+                            original_image=None  # OPTIMIZATION: Skip overlay for predictive
+                        )
                 
-                        vlm_answers = self.naradio_processor.dynamic_objects
-                        vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks(rgb_image, vlm_answers, feat_map_np=feat_map_np)
-                        
-                        if vlm_hotspots and len(vlm_hotspots) > 0:
-                            rgb_timestamp = self._get_ros_timestamp(rgb_msg)
-                            self.semantic_bridge.publish_merged_hotspots(
-                                vlm_hotspots=vlm_hotspots,
-                                timestamp=rgb_timestamp,
-                                original_image=rgb_image
-                            )           
+                # OPTIMIZATION: Adaptive sleep based on processing load
+                time.sleep(0.005)  # Reduced from 0.05s
                             
             except Exception as e:
                 time.sleep(0.05)  

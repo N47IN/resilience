@@ -3,8 +3,7 @@
 Path Manager Module
 
 Handles unified path planning interface supporting two modes:
-1. JSON file mode: Load nominal path from JSON and publish to global path topic
-2. External planner mode: Listen to external planner's global path topic
+External planner mode: Listen to external planner's global path topic
 
 Provides a consistent interface for drift detection regardless of path source.
 """
@@ -136,95 +135,10 @@ class PathManager:
         self.global_path_topic = config.get('global_path_topic', '/global_path')
         self.json_config = config.get('json_file', {})
         self.external_config = config.get('external_planner', {})
-        
-        # Publishers and subscribers
         self.path_publisher = None
         self.path_subscriber = None
-        
-        # Initialize based on mode
-        if self.mode == 'json_file':
-            self._init_json_mode()
-        elif self.mode == 'external_planner':
-            self._init_external_mode()
-        else:
-            raise ValueError(f"Invalid path mode: {self.mode}")
-    
-    def _init_json_mode(self):
-        """Initialize JSON file mode - load path and publish to topic."""
-        try:
-            # Load nominal path from JSON file
-            nominal_path_file = self.json_config.get('nominal_path_file', 'adjusted_nominal_spline.json')
-            
-            # Try to find the file in assets directory
-            from ament_index_python.packages import get_package_share_directory
-            package_dir = get_package_share_directory('resilience')
-            json_path = os.path.join(package_dir, 'assets', nominal_path_file)
-            
-            if not os.path.exists(json_path):
-                raise FileNotFoundError(f"Nominal path file not found: {json_path}")
-            
-            # Load the JSON file
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-            
-            self.nominal_points = data['points']
-            
-            # Use thresholds from JSON if available, otherwise use config defaults
-            if 'calibration' in data:
-                self.soft_threshold = data['calibration'].get('soft_threshold', self.default_soft_threshold)
-                self.hard_threshold = data['calibration'].get('hard_threshold', 0.5)
-            else:
-                self.soft_threshold = self.default_soft_threshold
-                self.hard_threshold = 0.5
-            
-            # Discretize the trajectory
-            self.discretized_nominal = self.discretizer.discretize_trajectory(self.nominal_points)
-            
-            # Convert discretized points to numpy array for efficient computation
-            if self.discretized_nominal:
-                self.nominal_np = np.array([point.position for point in self.discretized_nominal])
-                self.initial_pose = self.nominal_np[0]
-            else:
-                self.nominal_np = np.array([])
-                self.initial_pose = np.array([0.0, 0.0, 0.0])
-            
-            self.path_ready = True
-            self.node.get_logger().info(f"Loaded nominal path from {json_path} with {len(self.nominal_points)} points")
-            self.node.get_logger().info(f"Discretized to {len(self.discretized_nominal)} points with {self.sampling_distance}m sampling")
-            
-            # Print detailed discretization status
-            print("=" * 60)
-            print("JSON PATH DISCRETIZATION STATUS")
-            print("=" * 60)
-            print(f"JSON file: {json_path}")
-            print(f"Original path points: {len(self.nominal_points)}")
-            print(f"Discretized points: {len(self.discretized_nominal)}")
-            print(f"Sampling distance: {self.sampling_distance:.3f}m")
-            print(f"Lookback window: {self.lookback_window_size} points")
-            print(f"Soft threshold: {self.soft_threshold:.3f}m")
-            print(f"Hard threshold: {self.hard_threshold:.3f}m")
-            print("=" * 60)
-            
-            # Create publisher for global path topic
-            self.path_publisher = self.node.create_publisher(
-                Path, 
-                self.global_path_topic, 
-                10
-            )
-            
-            # Start publishing the nominal path
-            self._publish_nominal_path()
-            
-            # Set up timer for periodic publishing
-            publish_rate = self.json_config.get('publish_rate', 1.0)
-            self.publish_timer = self.node.create_timer(
-                1.0 / publish_rate, 
-                self._publish_nominal_path
-            )
-            
-        except Exception as e:
-            self.node.get_logger().error(f"Failed to initialize JSON mode: {e}")
-            raise
+        self._init_external_mode()
+
     
     def _init_external_mode(self):
         """Initialize external planner mode - simple one-time listener for a path message."""
@@ -247,31 +161,6 @@ class PathManager:
         except Exception as e:
             self.node.get_logger().error(f"Failed to initialize external mode: {e}")
             raise
-    
-    def _publish_nominal_path(self):
-        """Publish nominal path to global path topic."""
-        if not self.path_ready or self.path_publisher is None:
-            return
-        
-        try:
-            path_msg = Path()
-            path_msg.header = Header()
-            path_msg.header.stamp = self.node.get_clock().now().to_msg()
-            path_msg.header.frame_id = "map"
-            
-            for point in self.nominal_points:
-                pose = PoseStamped()
-                pose.header = path_msg.header
-                pose.pose.position.x = point['position']['x']
-                pose.pose.position.y = point['position']['y']
-                pose.pose.position.z = point['position']['z']
-                pose.pose.orientation.w = 1.0  # Default orientation
-                path_msg.poses.append(pose)
-            
-            self.path_publisher.publish(path_msg)
-            
-        except Exception as e:
-            self.node.get_logger().error(f"Error publishing nominal path: {e}")
     
     def _external_path_callback(self, path_msg: Path):
         """Handle external path message (one-time store and trigger)."""

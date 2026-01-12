@@ -5,7 +5,7 @@ VDB Semantic Mapping System Launch File
 Launches the VDB-based semantic mapping system with three main components:
 1. Main resilience node (main.py) - handles drift detection, NARadio processing, and semantic mapping
 2. VDB semantic mapping node (vdb_semantic_mapping_node.py) - creates VDB-based semantic voxel maps
-3. Narration display node (narration_display_node.py) - displays narration and queries VLM
+3. Narration display node (vlm_node.py) - displays narration and queries VLM
 
 This launch file provides a complete system for resilience monitoring with efficient VDB-based semantic mapping.
 """
@@ -244,10 +244,10 @@ def generate_launch_description():
     )
     
     # Narration Display Node
-    narration_display_node = Node(
+    vlm_node = Node(
         package='resilience',
-        executable='narration_display_node.py',
-        name='narration_display_node',
+        executable='vlm_node.py',
+        name='vlm_node',
         output='screen',
         parameters=[{
             'vlm_api_key': LaunchConfiguration('vlm_api_key'),
@@ -264,7 +264,7 @@ def generate_launch_description():
 
     mppi_control_node = Node(
         package='resilience',  # Replace with your actual package name
-        executable='primitive_planner.py',  # Or entry point name if set in setup.py
+        executable='primitive_planner_node.py',  # Or entry point name if set in setup.py
         name='mppi_control_node',
         output='screen',
         emulate_tty=True,  # Better color output in terminal
@@ -319,6 +319,6 @@ def generate_launch_description():
         # Launch all nodes
         main_resilience_node,
         vdb_semantic_mapping_node,
-        narration_display_node,
+        vlm_node,
         mppi_control_node
     ])

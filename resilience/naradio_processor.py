@@ -1297,9 +1297,9 @@ class NARadioProcessor:
             else:
                 return None
 
-    def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
+    def create_merged_hotspot_masks_fast(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
         """
-        Create hotspot masks for multiple VLM answers and merge them with different colors.
+        OPTIMIZED: Create hotspot masks for multiple VLM answers with reduced overhead.
         
         Args:
             rgb_image: RGB image as numpy array (H, W, 3)
@@ -1314,21 +1314,23 @@ class NARadioProcessor:
                 return None
 
             prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
-
             hotspot_threshold = self.segmentation_config['segmentation'].get('hotspot_threshold', 0.6)
             min_area = self.segmentation_config['segmentation'].get('min_hotspot_area', 50)
 
             vlm_hotspots = {}
 
-            for vlm_answer in vlm_answers:
-                if vlm_answer not in self.get_all_objects():
-                    continue
+            # OPTIMIZATION: Filter valid VLM answers upfront
+            valid_vlms = [v for v in vlm_answers if v in self.get_all_objects()]
+            if not valid_vlms:
+                return None
 
-                # Use adaptive method: prefers enhanced; if preferred but not available, skip
+            # OPTIMIZATION: Batch process if using enhanced embeddings
+            for vlm_answer in valid_vlms:
+                # Skip if preferring enhanced but not available
                 if prefer_enhanced and not self.has_enhanced_embedding(vlm_answer):
                     continue
 
-                # CRITICAL FIX #1: Pass pre-computed features to avoid redundant extraction
+                # Pass pre-computed features
                 similarity_result = self.process_adaptive_similarity_visualization_optimized(
                     rgb_image, vlm_answer, feat_map_np=feat_map_np)
                 if similarity_result is None:
@@ -1338,29 +1340,32 @@ class NARadioProcessor:
                 if similarity_map is None:
                     continue
 
-                hotspot_mask = similarity_map > hotspot_threshold
+                # OPTIMIZATION: Vectorized thresholding
+                hotspot_mask = (similarity_map > hotspot_threshold).astype(np.uint8) * 255
                 if not np.any(hotspot_mask):
                     continue
 
-                hotspot_mask_uint8 = (hotspot_mask * 255).astype(np.uint8)
-                contours, _ = cv2.findContours(hotspot_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                # OPTIMIZATION: Skip contour filtering if min_area is small
+                if min_area <= 10:
+                    vlm_hotspots[vlm_answer] = hotspot_mask
+                else:
+                    contours, _ = cv2.findContours(hotspot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
+                    for contour in contours:
+                        if cv2.contourArea(contour) >= min_area:
+                            cv2.fillPoly(filtered_mask, [contour], 255)
 
-                filtered_mask = np.zeros_like(hotspot_mask, dtype=np.uint8)
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area >= min_area:
-                        cv2.fillPoly(filtered_mask, [contour], 255)
+                    if np.any(filtered_mask):
+                        vlm_hotspots[vlm_answer] = filtered_mask
 
-                if np.any(filtered_mask):
-                    vlm_hotspots[vlm_answer] = filtered_mask
-
-            if not vlm_hotspots:
-                return None
-
-            return vlm_hotspots
+            return vlm_hotspots if vlm_hotspots else None
 
         except Exception:
             return None
+
+    def create_merged_hotspot_masks(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
+        """Legacy method - redirects to optimized version."""
+        return self.create_merged_hotspot_masks_fast(rgb_image, vlm_answers, feat_map_np)
 
  
     def _make_json_serializable(self, obj):

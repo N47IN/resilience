@@ -33,7 +33,7 @@ from openai import OpenAI
 
 class NarrationDisplayNode(Node):
     def __init__(self):
-        super().__init__('narration_display_node')
+        super().__init__('vlm_node')
         
         # Professional startup message
         self.get_logger().info("=" * 60)
