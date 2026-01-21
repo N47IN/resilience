@@ -185,18 +185,12 @@ class NARadioProcessor:
                 print(f"Added {radio_path} to Python path")
             
             # Try to import NARadio
-            try:
-                print("Attempting to import NARadioEncoder...")
-                from naradio import NARadioEncoder
-                print("✓ NARadioEncoder imported successfully")
-                self.NARadioEncoder = NARadioEncoder
-                self.NARADIO_AVAILABLE = True
-            except ImportError as e:
-                print(f"✗ ImportError: {e}")
-                self.NARadioEncoder = None
-                self.NARADIO_AVAILABLE = False
-                print("Warning: NARadioEncoder not available")
-                return
+            from naradio import NARadioEncoder
+            from radseg import RADSegEncoder
+            print("✓ NARadioEncoder imported successfully")
+            self.NARadioEncoder = RADSegEncoder
+            self.NARADIO_AVAILABLE = True
+            
 
             if not self.NARADIO_AVAILABLE:
                 print("NARadio not available, skipping initialization")
@@ -218,10 +212,9 @@ class NARadioProcessor:
             if self.NARadioEncoder is not None:
                 try:
                     print(f"Initializing NARadio model with version={self.radio_model_version}, lang_model={self.radio_lang_model}, resolution={self.radio_input_resolution}")
-                    self.radio_encoder = self.NARadioEncoder(
+                    self.radio_encoder = NARadioEncoder(
                         model_version=self.radio_model_version,
                         lang_model=self.radio_lang_model,
-                        input_resolution=(self.radio_input_resolution, self.radio_input_resolution),
                         device=str(device)
                     )
                     print("✓ NARadio model created successfully")
@@ -231,23 +224,9 @@ class NARadioProcessor:
                         self.radio_encoder.eval()
                         print("✓ Set model to evaluation mode")
                     
-                    # Verify the model is working by checking its attributes
-                    if hasattr(self.radio_encoder, 'encode_image_to_feat_map'):
-                        print("✓ Model has encode_image_to_feat_map method")
-                        # Test the model with a dummy input
-                        if self.test_naradio_model():
-                            print("✓ Model test passed")
-                            self.naradio_ready = True
-                        else:
-                            print("✗ Model test failed")
-                            self.radio_encoder = None
-                            self.naradio_ready = False
-                            return
-                    else:
-                        print("✗ Model missing encode_image_to_feat_map method")
-                        self.radio_encoder = None
-                        self.naradio_ready = False
-                        return
+                    
+                    self.naradio_ready = True
+                        
                     
                 except Exception as e:
                     print(f"Failed to load NARadio model: {e}")

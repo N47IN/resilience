@@ -777,7 +777,7 @@ class SemanticDepthOctoMapNode(Node):
 				# Use original depth_m if available, otherwise use depth_hot
 				# For rays, we want pixels beyond max_range or missing depth
 				masked_depth_vals = depth_hot[masked]
-				threshold = float(self.max_range)
+				threshold = 5.0
 				beyond_or_missing = (masked_depth_vals <= 0.0) | (masked_depth_vals > threshold)
 				dr = np.zeros_like(masked_depth_vals, dtype=np.float32)
 				dr[beyond_or_missing] = np.inf
@@ -837,13 +837,6 @@ class SemanticDepthOctoMapNode(Node):
 				# self.vdb_mapper.process_posed_rgbd(rgb_dummy, depth_masked_t, pose_4x4_rf, conf_map=conf_map_t, feat_img=None)
 				# Publish mask-specific frontiers and rays immediately (same as tmp.py)
 				self._publish_mask_frontiers_and_rays()
-			
-			threading.Thread(
-				target=self._update_semantic_vdb_mapping,
-				args=(mask_copy, depth_hot_copy, pose_copy),
-				daemon=True
-			).start()
-
 			# Semantic label application - run in separate thread to avoid blocking
 			if points_world_near.size > 0:
 				points_copy = points_world_near.copy()
@@ -2025,36 +2018,6 @@ class SemanticDepthOctoMapNode(Node):
 			)
 		except Exception as e:
 			self.get_logger().warn(f"VDB mapping error: {e}")
-
-	def _update_semantic_vdb_mapping(self, mask: np.ndarray, depth_hot: np.ndarray, pose: PoseStamped):
-		"""Update VDB map with semantic hotspot using masked depth in a separate thread (optimized)."""
-		try:
-			device = self.vdb_mapper.device
-			h, w = mask.shape
-			
-			# Ensure minimum image size
-			if h < 1 or w < 1:
-				return
-			
-			# Create tensors with batch size 1 (critical for indexing)
-			depth_tensor = torch.from_numpy(depth_hot).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
-			rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
-			pose_4x4 = self._pose_to_4x4_matrix(pose)
-			
-			# Ensure pose_4x4 has correct batch dimension (1x4x4)
-			if pose_4x4.dim() == 2:
-				pose_4x4 = pose_4x4.unsqueeze(0)
-			elif pose_4x4.shape[0] != 1:
-				pose_4x4 = pose_4x4[:1]
-			
-			# Process with VDB mapper for semantic occupancy
-			update_info = self.vdb_mapper.process_posed_rgbd(
-				rgb_img=rgb_tensor,
-				depth_img=depth_tensor,
-				pose_4x4=pose_4x4
-			)
-		except Exception as e:
-			self.get_logger().warn(f"VDB semantic mapping error: {e}")
 
 	def _update_semantic_voxels(self, points_world: np.ndarray, vlm_answer: str, threshold: float, 
 								 stats: dict, is_narration: bool):

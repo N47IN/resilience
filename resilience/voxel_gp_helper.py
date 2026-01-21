@@ -853,12 +853,7 @@ class DisturbanceFieldHelper:
 				- 'cause_xyz': Cause location (if available)
 		"""
 		# Load actual trajectory and cause metadata
-		actual_xyz, cause, cause_xyz = self.load_buffer_xyz_drift(buffer_dir)
-		
-		# Load nominal trajectory (from file or direct input)
-		if nominal_xyz is None and nominal_path:
-			nominal_xyz = self.load_nominal_xyz(nominal_path)
-		
+		actual_xyz, cause, cause_xyz = self.load_buffer_xyz_drift(buffer_dir)	
 		# Clip nominal trajectory to match actual trajectory segment
 		clipped_nominal = None
 		if nominal_xyz is not None:
