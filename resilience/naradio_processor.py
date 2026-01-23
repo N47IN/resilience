@@ -49,7 +49,7 @@ import warnings
 import yaml
 import os
 import json
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Union
 from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
@@ -84,7 +84,7 @@ class NARadioProcessor:
     def __init__(self, 
                  radio_model_version: str = 'radio_v2.5-b',
                  radio_lang_model: str = 'siglip',
-                 radio_input_resolution: int = 512,
+                 radio_input_resolution: int = 224,
                  enable_visualization: bool = True,
                  enable_combined_segmentation: bool = False,
                  segmentation_config_path: str = None,
@@ -92,7 +92,7 @@ class NARadioProcessor:
         """Initialize NARadio processor."""
         self.radio_model_version = radio_model_version
         self.radio_lang_model = radio_lang_model
-        self.radio_input_resolution = radio_input_resolution
+        self.radio_input_resolution = 512
         self.enable_visualization = enable_visualization
         self.enable_combined_segmentation = enable_combined_segmentation
         
@@ -188,7 +188,7 @@ class NARadioProcessor:
             from naradio import NARadioEncoder
             from radseg import RADSegEncoder
             print("✓ NARadioEncoder imported successfully")
-            self.NARadioEncoder = RADSegEncoder
+            self.NARadioEncoder = NARadioEncoder
             self.NARADIO_AVAILABLE = True
             
 
@@ -212,11 +212,11 @@ class NARadioProcessor:
             if self.NARadioEncoder is not None:
                 try:
                     print(f"Initializing NARadio model with version={self.radio_model_version}, lang_model={self.radio_lang_model}, resolution={self.radio_input_resolution}")
-                    self.radio_encoder = NARadioEncoder(
+                    self.radio_encoder = self.NARadioEncoder(
                         model_version=self.radio_model_version,
                         lang_model=self.radio_lang_model,
-                        device=str(device)
-                    )
+                        input_resolution=(self.radio_input_resolution, self.radio_input_resolution),
+                        device=str(device))
                     print("✓ NARadio model created successfully")
                     
                     # Set NARadio to evaluation mode if it has eval method
@@ -303,7 +303,7 @@ class NARadioProcessor:
         
         return image_tensor, image_hash
 
-    def extract_features_cached(self, rgb_image: np.ndarray) -> Optional[np.ndarray]:
+    def extract_features_cached(self, rgb_image: np.ndarray, return_tensor: bool = False) -> Optional[Union[np.ndarray, torch.Tensor]]:
         """Extract NARadio features from RGB image with caching."""
         try:
             if not self.is_ready():
@@ -311,17 +311,23 @@ class NARadioProcessor:
             
             # SPEED OPTIMIZATION: Compute hash only when cache is likely to be useful
             image_hash = None
-            cached_result = None
             
-            # Only use cache if we have reasonable cache size
+            # Check cache first
             if len(self.feature_cache) > 0:
                 image_hash = self._compute_image_hash(rgb_image)
                 
-                # Check cache first
                 if image_hash in self.feature_cache:
                     cache_entry = self.feature_cache[image_hash]
                     if self._is_cache_valid(cache_entry):
-                        return cache_entry['feat_map']
+                        feat_map = cache_entry['feat_map']
+                        if return_tensor:
+                            if isinstance(feat_map, np.ndarray):
+                                return torch.from_numpy(feat_map).to(self.device)
+                            return feat_map
+                        else:
+                            if isinstance(feat_map, torch.Tensor):
+                                return feat_map.cpu().numpy()
+                            return feat_map
             
             # Ensure device consistency (less frequent check)
             if not self.ensure_device_consistency():
@@ -336,40 +342,36 @@ class NARadioProcessor:
             with torch.no_grad():
                 feat_map = self.radio_encoder.encode_image_to_feat_map(image_tensor)
                 
-                # Convert to numpy
-                if isinstance(feat_map, torch.Tensor):
-                    feat_map_np = feat_map.cpu().numpy()
-                else:
-                    feat_map_np = feat_map
-                
-                # SPEED OPTIMIZATION: Cache only if hash was computed and cache isn't full
+                # Cache the result (prefer numpy for storage to save VRAM)
                 if image_hash is None:
                     image_hash = computed_hash
                     
                 if len(self.feature_cache) < self.max_cache_size:
                     self.feature_cache[image_hash] = {
-                        'feat_map': feat_map_np,
+                        'feat_map': feat_map.cpu().numpy() if isinstance(feat_map, torch.Tensor) else feat_map,
                         'timestamp': time.time()
                     }
                 
-                # SPEED OPTIMIZATION: Cleanup only occasionally
+                # Cleanup occasionally
                 current_time = time.time()
                 if (current_time - self.last_cleanup_time > self.cleanup_interval and 
                     len(self.feature_cache) > self.max_cache_size * 0.8):
                     self._cleanup_cache()
                     self.last_cleanup_time = current_time
                 
-                return feat_map_np
+                if return_tensor:
+                    return feat_map
+                return feat_map.cpu().numpy() if isinstance(feat_map, torch.Tensor) else feat_map
                 
         except torch.cuda.OutOfMemoryError:
             self.handle_cuda_out_of_memory()
             return None
-        except Exception as e:
+        except Exception:
             return None
 
-    def extract_features(self, rgb_image: np.ndarray) -> Optional[np.ndarray]:
+    def extract_features(self, rgb_image: np.ndarray, return_tensor: bool = False) -> Optional[Union[np.ndarray, torch.Tensor]]:
         """Legacy method - redirects to cached version."""
-        return self.extract_features_cached(rgb_image)
+        return self.extract_features_cached(rgb_image, return_tensor=return_tensor)
 
     def create_visualization(self, feat_map_np: np.ndarray) -> Optional[np.ndarray]:
         """Create visualization of NARadio features."""
@@ -403,8 +405,11 @@ class NARadioProcessor:
             # Reshape back to image dimensions
             feat_vis = feat_3d.reshape(h, w, 3)
             
-            # Resize to original image size for better visualization
-            feat_vis = cv2.resize(feat_vis, (512, 512))
+            # Resize to configured model input resolution for visualization
+            feat_vis = cv2.resize(
+                feat_vis,
+                (self.radio_input_resolution, self.radio_input_resolution)
+            )
             
             return feat_vis
             
@@ -414,7 +419,8 @@ class NARadioProcessor:
 
     def process_features_optimized(self, rgb_image: np.ndarray, 
                                  need_visualization: bool = True,
-                                 reuse_features: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                                 reuse_features: bool = True,
+                                 return_tensor: bool = False) -> Tuple[Optional[Union[np.ndarray, torch.Tensor]], Optional[np.ndarray]]:
         """
         OPTIMIZED: Process NARadio features with optional visualization and feature reuse.
         
@@ -422,17 +428,19 @@ class NARadioProcessor:
             rgb_image: Input RGB image
             need_visualization: Whether to compute visualization (expensive)
             reuse_features: Whether to use cached features if available
+            return_tensor: Whether to return features as GPU tensor
         """
         try:
-            
-            feat_map_np = self.extract_features(rgb_image)
+            feat_map = self.extract_features(rgb_image, return_tensor=return_tensor)
             
             # Create visualization only if needed
             naradio_vis = None
-            if feat_map_np is not None and need_visualization:
+            if feat_map is not None and need_visualization:
+                # If we have a tensor, convert to numpy for visualization
+                feat_map_np = feat_map.cpu().numpy() if isinstance(feat_map, torch.Tensor) else feat_map
                 naradio_vis = self.create_visualization(feat_map_np)
             
-            return feat_map_np, naradio_vis
+            return feat_map, naradio_vis
             
         except Exception as e:
             print(f"Error processing NARadio features: {e}")
@@ -906,11 +914,11 @@ class NARadioProcessor:
                 else:
                     feat_map_tensor = feat_map_np
             else:
-                # Set model resolution
+                # Set model resolution based on configured input size
                 resolution = (self.radio_input_resolution, self.radio_input_resolution)
                 if hasattr(self.radio_encoder, "input_resolution"):
                     self.radio_encoder.input_resolution = resolution
-                
+ 
                 # Convert image to tensor
                 tensor_image = torch.from_numpy(rgb_image).permute(2, 0, 1)
                 tensor_image = tensor_image.to(device).float() / 255.0
@@ -921,7 +929,7 @@ class NARadioProcessor:
                 feat_map_tensor = self.radio_encoder.encode_image_to_feat_map(tensor_image)
                 
                 # SPEED OPTIMIZATION: Reduce tensor cleanup overhead
-                del tensor_image
+                # del tensor_image
             
             # Align features with language
             feat_map_aligned = self.radio_encoder.align_spatial_features_with_language(feat_map_tensor)
@@ -937,7 +945,7 @@ class NARadioProcessor:
             feat_map_flat = feat_map_aligned.reshape(-1, C)  # H*W x C
             
             # SPEED OPTIMIZATION: Reduce intermediate memory management
-            del feat_map_aligned
+            # del feat_map_aligned
             
             # SPEED OPTIMIZATION: Use larger chunks and stay on GPU longer
             num_chunks = max(1, int(np.ceil(feat_map_flat.shape[0] / chunk_size)))
@@ -950,7 +958,7 @@ class NARadioProcessor:
                 chunk_sim = self.compute_cos_sim(all_features, chunk_features, softmax=use_softmax)
                 cos_sim_chunks.append(chunk_sim)
                 
-                del chunk_features
+                # del chunk_features
             
             # SPEED OPTIMIZATION: Concatenate on GPU first, then extract only what we need
             cos_sim = torch.cat(cos_sim_chunks, dim=0)  # H*W x N
@@ -1136,7 +1144,7 @@ class NARadioProcessor:
             
             # ENHANCED FIX: Only consider pixels with high similarity to avoid garbage features
             similarity_threshold = self.segmentation_config['segmentation'].get('enhanced_similarity_threshold', 0.5)
-            high_sim_mask = weights > similarity_threshold
+            high_sim_mask = weights > 0.98
             
             # Zero out low-similarity pixels to focus only on the actual cause/hotspots
             weights = weights * high_sim_mask.float()
@@ -1276,14 +1284,17 @@ class NARadioProcessor:
             else:
                 return None
 
-    def create_merged_hotspot_masks_fast(self, rgb_image: np.ndarray, vlm_answers: List[str], feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
+    def create_merged_hotspot_masks_fast(self, rgb_image: np.ndarray, vlm_answers: List[str], 
+                                     feat_map_tensor: Optional[Union[np.ndarray, torch.Tensor]] = None,
+                                     feat_map_np: Optional[np.ndarray] = None) -> Optional[Dict[str, np.ndarray]]:
         """
         OPTIMIZED: Create hotspot masks for multiple VLM answers with reduced overhead.
         
         Args:
             rgb_image: RGB image as numpy array (H, W, 3)
             vlm_answers: List of VLM answers to process
-            feat_map_np: Pre-computed feature map (optional, avoids redundant feature extraction)
+            feat_map_tensor: Pre-computed feature map (optional, avoids redundant feature extraction)
+            feat_map_np: Alias for feat_map_tensor (backward compatibility)
             
         Returns:
             Dict mapping vlm_answer -> hotspot_mask (binary) or None if failed
@@ -1291,6 +1302,10 @@ class NARadioProcessor:
         try:
             if not self.is_segmentation_ready():
                 return None
+
+            # Handle alias
+            if feat_map_tensor is None and feat_map_np is not None:
+                feat_map_tensor = feat_map_np
 
             prefer_enhanced = self.segmentation_config['segmentation'].get('prefer_enhanced_embeddings', True)
             hotspot_threshold = self.segmentation_config['segmentation'].get('hotspot_threshold', 0.6)
@@ -1309,17 +1324,21 @@ class NARadioProcessor:
                 if prefer_enhanced and not self.has_enhanced_embedding(vlm_answer):
                     continue
 
-                # Pass pre-computed features
-                similarity_result = self.process_adaptive_similarity_visualization_optimized(
-                    rgb_image, vlm_answer, feat_map_np=feat_map_np)
-                if similarity_result is None:
-                    continue
-
-                similarity_map = similarity_result.get('similarity_map')
+                # Pass pre-computed features directly to similarity map computation
+                # This avoids the overhead of process_adaptive_similarity_visualization_optimized
+                # which creates visualizations we don't need here.
+                similarity_map = self.compute_vlm_similarity_map_optimized(
+                    rgb_image, vlm_answer, feat_map_np=feat_map_tensor, use_softmax=True, chunk_size=4000)
+                
                 if similarity_map is None:
                     continue
 
-                # OPTIMIZATION: Vectorized thresholding
+                # Resize to original image dimensions if needed
+                h, w = rgb_image.shape[:2]
+                if similarity_map.shape != (h, w):
+                    similarity_map = cv2.resize(similarity_map, (w, h), interpolation=cv2.INTER_LINEAR)
+
+                # OPTIMIZATION: Vectorized thresholding using configured threshold
                 hotspot_mask = (similarity_map > hotspot_threshold).astype(np.uint8) * 255
                 if not np.any(hotspot_mask):
                     continue

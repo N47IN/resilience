@@ -283,8 +283,9 @@ class ResilienceNode(Node):
             (self.rgb_topic, Image, self.rgb_callback, 1),
             (self.depth_topic, Image, self.depth_callback, 1),
             (self.pose_topic, PoseStamped, self.pose_callback, 10),
-            (self.camera_info_topic, CameraInfo, self.camera_info_callback, 1),
-            (self.vlm_answer_topic, String, self.vlm_answer_callback, 10)
+            (self.camera_info_topic, CameraInfo, self.camera_info_callback, 1)
+            # ,
+            # (self.vlm_answer_topic, String, self.vlm_answer_callback, 10)
         ]
         
         for topic, msg_type, callback, qos in subscriptions:
@@ -733,7 +734,8 @@ class ResilienceNode(Node):
             narration = self.narration_manager.check_for_narration(pose_time, self.breach_idx)
             if narration:
                 self.publish_narration_with_image(narration)
-                self.narration_pub.publish(String(data=narration))
+                # self.narration_pub.publish(String(data=narration))
+            self.vlm_answer_callback()
 
     def publish_narration_with_image(self, narration_text):
         """Publish both narration text and accompanying image together"""
@@ -785,13 +787,13 @@ class ResilienceNode(Node):
                 image_msg = self.bridge.cv2_to_imgmsg(closest_image, encoding='rgb8')
                 image_msg.header.stamp = closest_msg.header.stamp
                 image_msg.header.frame_id = closest_msg.header.frame_id
-                self.narration_image_pub.publish(image_msg)
+                # self.narration_image_pub.publish(image_msg)
                 
-                self.narration_text_pub.publish(String(data=narration_text))
-            else:
-                self.narration_text_pub.publish(String(data=narration_text))
-        else:
-            self.narration_text_pub.publish(String(data=narration_text))
+                # self.narration_text_pub.publish(String(data=narration_text))
+        #     else:
+        #         self.narration_text_pub.publish(String(data=narration_text))
+        # else:
+        #     self.narration_text_pub.publish(String(data=narration_text))
 
     def load_enhanced_embedding_from_buffer(self, buffer_dir: str, vlm_answer: str) -> Optional[np.ndarray]:
         """Load enhanced embedding from buffer directory."""
@@ -929,9 +931,10 @@ class ResilienceNode(Node):
         last_memory_cleanup = time.time()
         memory_cleanup_interval = 60.0
         
-        # OPTIMIZATION: Frame skip counter
-        process_every_n_frames = 2  # Process every 2nd frame for predictive similarity
-        frame_counter = 0
+        # Target loop rate (was effectively self-throttled by frame skipping + sleeps)
+        # Keep this conservative to avoid starving ROS callbacks while still achieving ~8Hz.
+        target_hz = 8.0
+        target_period_s = 1.0 / max(target_hz, 1e-6)
         
         # OPTIMIZATION: Cached RGB conversion
         last_rgb_msg_id = None
@@ -939,6 +942,7 @@ class ResilienceNode(Node):
         
         while rclpy.ok() and self.naradio_running:
             try:
+                loop_start = time.time()
                 current_time = time.time()
                 
                 # OPTIMIZATION: Less frequent memory cleanup
@@ -948,7 +952,7 @@ class ResilienceNode(Node):
                 
                 # Check if processor is ready
                 if not self.naradio_processor.is_ready():
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     continue
                 
                 with self.processing_lock:
@@ -959,11 +963,16 @@ class ResilienceNode(Node):
                     rgb_msg = self.latest_rgb_msg
                     depth_msg = self.latest_depth_msg
                     pose_for_semantic = self.latest_pose.copy() if self.latest_pose is not None else None
-                
-                # OPTIMIZATION: Frame skipping for predictive similarity
-                frame_counter += 1
-                if frame_counter % process_every_n_frames != 0:
-                    time.sleep(0.01)
+
+                # If nothing to segment, don't burn compute — just rate-limit
+                if not (self.enable_combined_segmentation and self.naradio_processor.is_segmentation_ready()):
+                    # Maintain a gentle loop cadence
+                    elapsed = time.time() - loop_start
+                    time.sleep(max(0.01, target_period_s - elapsed))
+                    continue
+                if not self.naradio_processor.dynamic_objects:
+                    elapsed = time.time() - loop_start
+                    time.sleep(max(0.01, target_period_s - elapsed))
                     continue
                 
                 # OPTIMIZATION: Cache RGB conversion to avoid repeated cv_bridge calls
@@ -986,14 +995,12 @@ class ResilienceNode(Node):
                 )
                 
                 # OPTIMIZATION: Only process if we have dynamic objects and features
-                if (self.enable_combined_segmentation and 
-                    self.naradio_processor.is_segmentation_ready() and
-                    self.naradio_processor.dynamic_objects and
-                    feat_map_np is not None):
+                if feat_map_np is not None:
                     
-                    vlm_answers = self.naradio_processor.dynamic_objects
+                    # Copy to avoid concurrent modification by callbacks
+                    vlm_answers = list(self.naradio_processor.dynamic_objects)
                     
-                    # OPTIMIZATION: Use fast version
+                    # OPTIMIZATION: Use batched similarity (fast version computes all masks in one pass)
                     vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks_fast(
                         rgb_image, vlm_answers, feat_map_np=feat_map_np)
                     
@@ -1005,8 +1012,9 @@ class ResilienceNode(Node):
                             original_image=None  # OPTIMIZATION: Skip overlay for predictive
                         )
                 
-                # OPTIMIZATION: Adaptive sleep based on processing load
-                time.sleep(0.005)  # Reduced from 0.05s
+                # Rate-limit to target_hz (don't add extra sleeps beyond what's needed)
+                elapsed = time.time() - loop_start
+                time.sleep(max(0.0, target_period_s - elapsed))
                             
             except Exception as e:
                 time.sleep(0.05)  
@@ -1018,83 +1026,63 @@ class ResilienceNode(Node):
                 self.camera_intrinsics = [msg.k[0], msg.k[4], msg.k[2], msg.k[5]]
                 self.camera_info_received = True
 
-    def vlm_answer_callback(self, msg):
+    #NOTE demo code, replace with proper function later, also enable narration publishing whish
+    #has been commented out for now
+    def vlm_answer_callback(self):
         """Handle VLM answers for cause analysis and buffer association."""
         try:
-            data = msg.data.strip()
-            if not data or "VLM Error" in data or "VLM not available" in data:
-                return
-            
-            # Parse JSON list: [{"name": str, "score": float}, ...]
-            try:
-                top_objects = json.loads(data)
-                if not isinstance(top_objects, list):
-                    top_objects = []  # Fallback for old format
-            except json.JSONDecodeError:
-                # Fallback: treat as old format "answer|score"
-                parts = data.split('|')
-                if len(parts) == 2:
-                    top_objects = [{"name": parts[0], "score": float(parts[1])}]
-                else:
-                    top_objects = [{"name": data, "score": 1.0}]
-            
-            if not top_objects:
-                return
-            
-            obj_list_str = ', '.join([f"{obj['name']} ({obj['score']:.4f})" for obj in top_objects])
-            self.get_logger().info(f"VLM TOP OBJECTS RECEIVED: {obj_list_str}")
-            
-            # Process all top 4 objects: store in registry with confidence=score, only add high-score ones to processor
             primary_cause = None
-            for obj_data in top_objects:
-                vlm_answer = obj_data['name']
-                score = float(obj_data.get('score', 0.0))
+            # for obj_data in top_objects:
+            #     vlm_answer = obj_data['name']
+            #     score = float(obj_data.get('score', 0.0))
                 
-                # Track as recent
-                self.recent_vlm_answers[vlm_answer] = time.time()
+            #     # Track as recent
+            #     self.recent_vlm_answers[vlm_answer] = time.time()
                 
-                # Store all in registry with confidence=score
-                # Only add to processor (dynamic_objects) for predictive similarity if score > 0.8
-                if hasattr(self, 'naradio_processor') and self.naradio_processor.is_ready():
-                    if score > 0.8:
-                        # Add to processor for predictive similarity (also adds to registry)
-                        success = self.naradio_processor.add_vlm_object(vlm_answer)
-                        if success:
-                            self.cause_registry.record_detection(vlm_answer, score)
-                            # Verify it's in dynamic_objects
-                            if vlm_answer in self.naradio_processor.dynamic_objects:
-                                self.get_logger().info(f"✓ '{vlm_answer}' added for predictive similarity (score: {score:.4f} > 0.8)")
-                            else:
-                                self.get_logger().warn(f"✗ '{vlm_answer}' not in dynamic_objects after add_vlm_object")
-                        else:
-                            self.get_logger().warn(f"Failed to add '{vlm_answer}' to processor")
+            #     # Store all in registry with confidence=score
+            #     # Only add to processor (dynamic_objects) for predictive similarity if score > 0.8
+                
+            #     if score > 0.8:
+            #         # Add to processor for predictive similarity (also adds to registry)
+            #         success = self.naradio_processor.add_vlm_object(vlm_answer)
+            #         if success:
+            #             self.cause_registry.record_detection(vlm_answer, score)
+            #             # Verify it's in dynamic_objects
+            #             if vlm_answer in self.naradio_processor.dynamic_objects:
+            #                 self.get_logger().info(f"✓ '{vlm_answer}' added for predictive similarity (score: {score:.4f} > 0.8)")
+            #             else:
+            #                 self.get_logger().warn(f"✗ '{vlm_answer}' not in dynamic_objects after add_vlm_object")
+            #         else:
+            #             self.get_logger().warn(f"Failed to add '{vlm_answer}' to processor")
+            
+            vlm_answer = "fan"
+            score = 1.0
+            
+            # Track as recent
+            self.recent_vlm_answers[vlm_answer] = time.time()
+            
+            # Store all in registry with confidence=score
+            # Only add to processor (dynamic_objects) for predictive similarity if score > 0.8
+            
+            if score > 0.8:
+                # Add to processor for predictive similarity (also adds to registry)
+                success = self.naradio_processor.add_vlm_object(vlm_answer)
+                if success:
+                    self.cause_registry.record_detection(vlm_answer, score)
+                    # Verify it's in dynamic_objects
+                    if vlm_answer in self.naradio_processor.dynamic_objects:
+                        self.get_logger().info(f"✓ '{vlm_answer}' added for predictive similarity (score: {score:.4f} > 0.8)")
                     else:
-                        # For score <= 0.8: add to registry only, NOT to processor dynamic_objects
-                        entry = self.cause_registry.get_entry_by_name(vlm_answer)
-                        if entry is None:
-                            # Encode and add to registry only (skip dynamic_objects)
-                            try:
-                                import torch
-                                with torch.no_grad():
-                                    if hasattr(self.naradio_processor, 'radio_encoder') and self.naradio_processor.radio_encoder:
-                                        embedding = self.naradio_processor.radio_encoder.encode_labels([vlm_answer])
-                                        embedding_np = embedding.detach().cpu().numpy().reshape(-1)
-                                        self.cause_registry.upsert_cause(
-                                            vlm_answer, embedding_np, source="vlm", type_="dynamic"
-                                        )
-                            except Exception as e:
-                                self.get_logger().warn(f"Failed to add '{vlm_answer}' to registry: {e}")
-                        self.cause_registry.record_detection(vlm_answer, score)
-                        # Don't add to dynamic_objects - objects with score <= 0.8 won't get predictive similarity
-                        self.get_logger().debug(f"'{vlm_answer}' stored in registry only (score: {score:.4f} <= 0.8, no predictive similarity)")
-                
-                # Use first (highest score) as primary cause for buffer association
-                if primary_cause is None:
-                    primary_cause = vlm_answer
+                        self.get_logger().warn(f"✗ '{vlm_answer}' not in dynamic_objects after add_vlm_object")
+                else:
+                    self.get_logger().warn(f"Failed to add '{vlm_answer}' to processor")
+            # Use first (highest score) as primary cause for buffer association
+            if primary_cause is None:
+                primary_cause = vlm_answer
             
             self.save_cause_registry_snapshot()
             
-            # Associate primary cause with buffer and process narration
+            primary_cause = "fan"
             if primary_cause:
                 self.associate_vlm_answer_with_buffer(primary_cause)
                 narration_success = self.process_narration_chain_for_vlm_answer(primary_cause)
@@ -1135,6 +1123,7 @@ class ResilienceNode(Node):
                     for buffer in reversed(self.risk_buffer_manager.active_buffers):
                         if buffer.cause == vlm_answer:
                             target_buffer = buffer
+                            
                             break
             
             if not target_buffer:
@@ -1188,8 +1177,8 @@ class ResilienceNode(Node):
 
             # Get threshold from config
             threshold = 0.9
-            if hasattr(self.naradio_processor, 'segmentation_config'):
-                threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
+            # if hasattr(self.naradio_processor, 'segmentation_config'):
+            #     threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
             
             # CRITICAL FIX #2: Use the similarity map already computed (no redundant computation)
             # The similarity_map computed above is already text-based, which is what we want
@@ -1303,9 +1292,10 @@ class ResilienceNode(Node):
         success = self.risk_buffer_manager.assign_cause(vlm_answer)
         
         if success:
-            print(f"Associated '{vlm_answer}' with risk buffer")
+            self.get_logger().warn(f"Associated '{vlm_answer}' with risk buffer")
         else:
-            print(f"No suitable buffer found for '{vlm_answer}'")
+            self.get_logger().warn(f"No suitable buffer found for '{vlm_answer}'")
+            # print()
                     
 
 

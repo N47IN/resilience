@@ -49,9 +49,11 @@ try:
 	from rayfronts import geometry3d as g3d
 	import rayfronts_cpp
 	VDB_AVAILABLE = True
+	RAYFRONTS_G3D_AVAILABLE = True
 except ImportError as e:
 	print(f"RayFronts VDB not available: {e}")
 	VDB_AVAILABLE = False
+	RAYFRONTS_G3D_AVAILABLE = False
 
 # Optional GP helper
 from resilience.voxel_gp_helper import _sum_of_anisotropic_rbf_fast
@@ -270,6 +272,12 @@ class SemanticDepthOctoMapNode(Node):
 		self.semantic_voxels = {}  # voxel_key -> {'vlm_answer': str, 'similarity': float, 'timestamp': float, 'position': np.array, 'confidence': float}
 		self.semantic_voxels_lock = threading.Lock()
 		
+		# SPATIAL INDEX: KD-tree for fast neighbor queries (O(log N) instead of O(N))
+		# Rebuilt whenever semantic voxels change significantly
+		self.semantic_spatial_index = None  # scipy.spatial.cKDTree
+		self.semantic_voxel_keys_indexed = []  # List of voxel keys aligned with spatial index
+		self.spatial_index_dirty = True  # Flag to rebuild index when voxels change
+		
 		# Temporal confirmation: track observations for each voxel
 		self.semantic_voxel_observations = {}  # voxel_key -> [{'vlm_answer': str, 'timestamp': float, 'frame_id': int}, ...]
 		self.narration_confirmation_threshold = 1  # Narration: instant confirmation (1 frame)
@@ -415,28 +423,28 @@ class SemanticDepthOctoMapNode(Node):
 				interp_mode="bilinear",
 				max_pts_per_frame=2000,  # Increased for better coverage
 				vox_size=float(self.voxel_resolution),
-				vox_accum_period=2,  # Accumulate over 2 frames for smoother updates
+				vox_accum_period=3,  # Accumulate over 2 frames for smoother updates
 				max_empty_pts_per_frame=2000,  # Increased for better free space clearing
 				max_rays_per_frame=2000,
 				max_depth_sensing=2.5,  # 1.5m for voxelization and frontiers
 				max_empty_cnt=8,  # Increased: require more evidence before removing voxels (reduces flicker)
 				max_occ_cnt=7,  # Increased: require more confirmation before marking occupied (reduces noise)
 				occ_observ_weight=3,  # Reduced: less aggressive updates per observation (smoother)
-				occ_thickness=3,  # Increased: thicker occupied surface (more robust)
-				occ_pruning_tolerance=5,  # Increased: more forgiving pruning (keeps stable voxels)
+				occ_thickness=1,  # Increased: thicker occupied surface (more robust)
+				occ_pruning_tolerance=2,  # Increased: more forgiving pruning (keeps stable voxels)
 				occ_pruning_period=3,  # Increased: prune less frequently (more stable map)
 				sem_pruning_thresh=0,
 				sem_pruning_period=1,
 				fronti_neighborhood_r=1,
-				fronti_min_unobserved=4,
-				fronti_min_empty=2,
+				fronti_min_unobserved=9,
+				fronti_min_empty=4,
 				fronti_min_occupied=0,
 				fronti_subsampling=4,
-				fronti_subsampling_min_fronti=10,
+				fronti_subsampling_min_fronti=5,
 				ray_accum_period=1,
 				ray_accum_phase=0,
 				angle_bin_size=30.0,
-				ray_erosion=1,
+				ray_erosion=0,
 				ray_tracing=False,
 				global_encoding=True,
 				zero_depth_mode=False,
@@ -1212,17 +1220,26 @@ class SemanticDepthOctoMapNode(Node):
 				self.gp_thread_running = False
 	
 	def _gp_computation_worker(self):
-		"""Background worker thread for GP computation and visualization."""
+		"""Background worker thread for GP computation, visualization, and semantic pruning."""
+		semantic_prune_interval = 2.0  # Prune every 2 seconds
+		last_prune_time = 0.0
+		
 		try:
 			while self.gp_thread_running:
 				current_time = time.time()
 				
-				# Check if it's time to update GP visualization
+				# GP visualization update
 				if (current_time - self.last_gp_update_time) >= self.gp_update_interval:
 					self._update_semantic_gp_visualization()
 					self.last_gp_update_time = current_time
 				
-				# Sleep for a short time to avoid busy waiting
+				# Periodic semantic voxel pruning (sync with VDB occupancy)
+				# if (current_time - last_prune_time) >= semantic_prune_interval:
+				# 	pruned = self._prune_stale_semantic_voxels()
+				# 	if pruned > 0:
+				# 		self.get_logger().debug(f"Pruned {pruned} stale semantic voxels")
+				# 	last_prune_time = current_time
+				
 				time.sleep(0.1)
 				
 		except Exception as e:
@@ -1759,13 +1776,131 @@ class SemanticDepthOctoMapNode(Node):
 			self.get_logger().error(f"Error getting semantic voxels: {e}")
 			return []
 	
+	def _rebuild_semantic_spatial_index(self):
+		"""Rebuild KD-tree spatial index for fast neighbor queries.
+		
+		Called when semantic voxels change significantly (batch updates).
+		Uses lazy rebuilding (only when spatial_index_dirty flag is set).
+		"""
+		try:
+			with self.semantic_voxels_lock:
+				if not self.semantic_voxels:
+					self.semantic_spatial_index = None
+					self.semantic_voxel_keys_indexed = []
+					self.spatial_index_dirty = False
+					return
+				
+				# Build arrays of positions and keys
+				positions = []
+				keys = []
+				for voxel_key, semantic_info in self.semantic_voxels.items():
+					pos = semantic_info.get('position')
+					if pos is not None:
+						positions.append(pos)
+						keys.append(voxel_key)
+				
+				if not positions:
+					self.semantic_spatial_index = None
+					self.semantic_voxel_keys_indexed = []
+					self.spatial_index_dirty = False
+					return
+				
+				# Build KD-tree for O(log N) spatial queries
+				try:
+					from scipy.spatial import cKDTree
+					positions_array = np.array(positions)
+					self.semantic_spatial_index = cKDTree(positions_array)
+					self.semantic_voxel_keys_indexed = keys
+					self.spatial_index_dirty = False
+					self.get_logger().debug(f"Rebuilt semantic spatial index with {len(keys)} voxels")
+				except ImportError:
+					self.get_logger().warn("scipy not available, spatial index disabled")
+					self.semantic_spatial_index = None
+					self.spatial_index_dirty = False
+					
+		except Exception as e:
+			self.get_logger().error(f"Error rebuilding spatial index: {e}")
+			self.spatial_index_dirty = False
+	
+	def _get_semantic_neighbors_spatial(self, center: np.ndarray, radius: float, vlm_answer: str = None) -> List[tuple]:
+		"""Fast neighbor query using KD-tree spatial index.
+		
+		Args:
+			center: Center position (world coordinates)
+			radius: Search radius in meters
+			vlm_answer: Optional filter by VLM answer
+			
+		Returns:
+			List of voxel keys within radius
+		"""
+		try:
+			# Rebuild index if needed (lazy)
+			if self.spatial_index_dirty or self.semantic_spatial_index is None:
+				self._rebuild_semantic_spatial_index()
+			
+			if self.semantic_spatial_index is None:
+				return []
+			
+			# Query KD-tree for neighbors (O(log N))
+			indices = self.semantic_spatial_index.query_ball_point(center, radius)
+			
+			if not indices:
+				return []
+			
+			# Get voxel keys from indices
+			neighbor_keys = [self.semantic_voxel_keys_indexed[i] for i in indices]
+			
+			# Filter by VLM answer if specified
+			if vlm_answer is not None:
+				with self.semantic_voxels_lock:
+					neighbor_keys = [
+						key for key in neighbor_keys
+						if key in self.semantic_voxels and 
+						   self.semantic_voxels[key].get('vlm_answer') == vlm_answer
+					]
+			
+			return neighbor_keys
+			
+		except Exception as e:
+			self.get_logger().error(f"Error in spatial neighbor query: {e}")
+			return []
+
+	def _query_semantic_region(self, center: np.ndarray, radius: float) -> dict:
+		"""Query all semantic voxels in a region and return their metadata.
+		
+		Args:
+			center: Center position (world coordinates)
+			radius: Search radius in meters
+			
+		Returns:
+			Dict mapping voxel_key -> semantic_info for voxels in region
+		"""
+		try:
+			neighbor_keys = self._get_semantic_neighbors_spatial(center, radius)
+			
+			if not neighbor_keys:
+				return {}
+			
+			# Get metadata for all neighbors
+			region_info = {}
+			with self.semantic_voxels_lock:
+				for key in neighbor_keys:
+					if key in self.semantic_voxels:
+						region_info[key] = self.semantic_voxels[key]
+			
+			return region_info
+			
+		except Exception as e:
+			self.get_logger().error(f"Error querying semantic region: {e}")
+			return {}
+		
 	def _get_neighboring_voxel_keys(self, voxel_key: tuple) -> List[tuple]:
 		"""Get voxel key and its 26 neighbors (3x3x3 cube)."""
 		vx, vy, vz = voxel_key
 		neighbors = []
-		for dx in [-1, 0, 1]:
-			for dy in [-1, 0, 1]:
-				for dz in [-1, 0, 1]:
+		for dx in [-1/2, 0, 1/2]:
+			for dy in [-1/2, 0, 1/2]:
+				for dz in [-1/2, 0, 1/2]:
 					neighbors.append((vx + dx, vy + dy, vz + dz))
 		return neighbors
 	
@@ -1839,103 +1974,154 @@ class SemanticDepthOctoMapNode(Node):
 			return 0
 		
 		return len(entry['unique_frames'])
+
+	def _prune_stale_semantic_voxels(self) -> int:
+		"""Remove semantic voxels no longer occupied in VDB (syncs with occupancy map).
+		
+		Returns:
+			Number of voxels pruned.
+		"""
+		if not self.semantic_voxels or self.vdb_mapper is None or self.vdb_mapper.is_empty():
+			return 0
+		
+		try:
+			with self.semantic_voxels_lock:
+				if not self.semantic_voxels:
+					return 0
+				
+				# Batch query: collect all positions
+				keys = list(self.semantic_voxels.keys())
+				positions = np.array([self.semantic_voxels[k]['position'] for k in keys], dtype=np.float32)
+				
+				# Query VDB occupancy in batch (CPU operation)
+				positions_tensor = torch.from_numpy(positions).float()
+				occ_values = rayfronts_cpp.query_occ(self.vdb_mapper.occ_map_vdb, positions_tensor)
+				
+				# Identify voxels to remove (occupancy <= 0 means free/unknown)
+				occ_np = occ_values.numpy().squeeze()
+				keys_to_remove = [k for k, occ in zip(keys, occ_np) if occ <= 0]
+				
+				# Remove stale voxels
+				for k in keys_to_remove:
+					del self.semantic_voxels[k]
+					# Also clean up observation tracking
+					if k in self.semantic_voxel_observations:
+						del self.semantic_voxel_observations[k]
+				
+				if keys_to_remove:
+					self.spatial_index_dirty = True
+				
+				return len(keys_to_remove)
+				
+		except Exception as e:
+			self.get_logger().warn(f"Semantic voxel pruning failed: {e}")
+			return 0
+
+	def _voxelize_points_fast(self, points_world: np.ndarray) -> np.ndarray:
+		"""Voxelize points using RayFronts utilities (GPU-accelerated).
+		
+		Returns:
+			Numpy array of unique voxel centers (Nx3, float32).
+		"""
+		if len(points_world) == 0:
+			return np.array([], dtype=np.float32).reshape(0, 3)
+		
+		if RAYFRONTS_G3D_AVAILABLE:
+			points_tensor = torch.from_numpy(points_world.astype(np.float32)).to(self.device)
+			vox_xyz = g3d.pointcloud_to_sparse_voxels(points_tensor, vox_size=float(self.voxel_resolution))
+			return vox_xyz.cpu().numpy()
+		
+		# Fallback to numpy (still efficient)
+		voxel_coords = np.floor(points_world / self.voxel_resolution).astype(np.int32)
+		unique_coords = np.unique(voxel_coords, axis=0)
+		return (unique_coords.astype(np.float32) * self.voxel_resolution)
 	
 	def _apply_semantic_labels_to_voxels(self, points_world: np.ndarray, vlm_answer: str,
 									 threshold: float, stats: dict, is_narration: bool = False):
-		"""Apply semantic labels with temporal+spatial confirmation."""
+		"""Apply semantic labels with temporal+spatial confirmation.
+		
+		Uses RayFronts voxelization for efficiency and maintains observation counts
+		for multi-frame confirmation (noise rejection).
+		"""
 		try:
 			current_time = time.time()
-			
-			# Increment frame counter for operational hotspots
 			if not is_narration:
 				self.frame_counter += 1
-			
-			# Vectorized voxel key computation (much faster than loop)
-			voxel_coords = np.floor(points_world / self.voxel_resolution).astype(np.int32)
-			voxel_keys = set(tuple(coord) for coord in voxel_coords)
-			
-			# Add observations (cleanup only when list gets too long to avoid per-voxel overhead)
 			frame_id = 0 if is_narration else self.frame_counter
-			obs_data = {
-				'vlm_answer': vlm_answer,
-				'timestamp': current_time,
-				'frame_id': frame_id,
-				'similarity': stats.get('avg_similarity', threshold + 0.1)
-			}
+			similarity_score = stats.get('avg_similarity', threshold + 0.1)
+			confirmation_threshold = self.narration_confirmation_threshold if is_narration else self.operational_confirmation_threshold
 			
-			# OPTIMIZED: Incrementally update spatial observation counts for all voxels
-			# This pre-computes counts so threshold checks are O(1) instead of O(neighbors * observations)
-			for voxel_key in voxel_keys:
+			# Use RayFronts voxelization (GPU-accelerated when available)
+			vox_xyz_np = self._voxelize_points_fast(points_world)
+			if len(vox_xyz_np) == 0:
+				return
+			
+			# Convert to voxel keys efficiently
+			voxel_keys = [tuple(np.round(xyz / self.voxel_resolution).astype(np.int32)) for xyz in vox_xyz_np]
+			
+			# Batch update observations and spatial counts
+			confirmed_count = 0
+			new_voxels_added = False
+			
+			for i, voxel_key in enumerate(voxel_keys):
+				# Update observation tracking
 				if voxel_key not in self.semantic_voxel_observations:
 					self.semantic_voxel_observations[voxel_key] = []
 				
-				self.semantic_voxel_observations[voxel_key].append(obs_data)
+				self.semantic_voxel_observations[voxel_key].append({
+					'vlm_answer': vlm_answer, 'timestamp': current_time,
+					'frame_id': frame_id, 'similarity': similarity_score
+				})
 				
-				# Incrementally update spatial counts for all 27 neighbors (including self)
-				# This makes threshold checks O(1) instead of scanning all neighbors
+				# Incremental spatial counts update (O(1) threshold checks)
 				self._increment_spatial_observation_counts(
 					voxel_key, vlm_answer, 
-					frame_id if not is_narration else None,  # Only track frames for operational
+					frame_id if not is_narration else None,
 					current_time
 				)
 				
-				# Only cleanup if list is getting long (reduces overhead)
-				if len(self.semantic_voxel_observations[voxel_key]) > 20:
+				# Lazy cleanup (only when list grows large)
+				obs_list = self.semantic_voxel_observations[voxel_key]
+				if len(obs_list) > 20:
 					self.semantic_voxel_observations[voxel_key] = [
-						obs for obs in self.semantic_voxel_observations[voxel_key]
-						if (current_time - obs['timestamp']) <= self.semantic_observation_max_age
+						o for o in obs_list if (current_time - o['timestamp']) <= self.semantic_observation_max_age
 					]
-			
-			# Periodic cleanup of old spatial counts (only if dict is large)
-			self._cleanup_old_spatial_counts(current_time)
-			
-			# Apply different confirmation logic based on hotspot type
-			confirmation_threshold = self.narration_confirmation_threshold if is_narration else self.operational_confirmation_threshold
-			
-			# NON-BLOCKING MULTI-FRAME CONFIRMATION:
-			# - Observations are added immediately (non-blocking)
-			# - Frame counts are tracked incrementally as new frames arrive
-			# - Voxels are confirmed automatically when threshold is reached (no waiting/blocking)
-			# - This provides noise rejection while maintaining low latency
-			with self.semantic_voxels_lock:
-				confirmed_count = 0
-				for voxel_key in voxel_keys:
-					if is_narration:
-						# FAST: O(1) lookup instead of scanning 27 neighbors
-						observation_count = self._get_observation_count_fast(voxel_key, vlm_answer)
-						meets_threshold = observation_count >= confirmation_threshold
-						confidence = observation_count
-					else:
-						# FAST: O(1) lookup - checks unique frames seen so far (incremental, non-blocking)
-						unique_frames = self._get_unique_frames_count_fast(voxel_key, vlm_answer)
-						meets_threshold = unique_frames >= confirmation_threshold
-						confidence = unique_frames
-					
-					if meets_threshold:
-						similarity_score = stats.get('avg_similarity', threshold + 0.1)
-						
-						semantic_info = {
+				
+				# Check confirmation threshold (O(1) lookup)
+				if is_narration:
+					meets_threshold = self._get_observation_count_fast(voxel_key, vlm_answer) >= confirmation_threshold
+					confidence = self._get_observation_count_fast(voxel_key, vlm_answer)
+				else:
+					meets_threshold = self._get_unique_frames_count_fast(voxel_key, vlm_answer) >= confirmation_threshold
+					confidence = self._get_unique_frames_count_fast(voxel_key, vlm_answer)
+				
+				if meets_threshold:
+					with self.semantic_voxels_lock:
+						self.semantic_voxels[voxel_key] = {
 							'vlm_answer': vlm_answer,
 							'similarity': similarity_score,
 							'threshold_used': threshold,
-							'detection_method': 'binary_threshold_hotspot',
-							'depth_used': True,
 							'timestamp': current_time,
-							'position': self._get_voxel_center_from_key(voxel_key),
+							'position': vox_xyz_np[i].astype(np.float32),
 							'confidence': confidence,
 							'is_narration': is_narration
 						}
-						self.semantic_voxels[voxel_key] = semantic_info
-						confirmed_count += 1
+					confirmed_count += 1
+					new_voxels_added = True
+			
+			# Periodic cleanup
+			self._cleanup_old_spatial_counts(current_time)
+			
+			if new_voxels_added:
+				self.spatial_index_dirty = True
 			
 			hotspot_type = "narration" if is_narration else "operational"
 			self.get_logger().info(
-				f"Semantic observation ({hotspot_type}): {len(voxel_keys)} voxels for '{vlm_answer}', "
-				f"{confirmed_count} newly confirmed (threshold: {confirmation_threshold})"
+				f"Semantic ({hotspot_type}): {len(voxel_keys)} voxels, {confirmed_count} confirmed for '{vlm_answer}'"
 			)
 			
 		except Exception as e:
-			self.get_logger().error(f"Error applying semantic labels to voxels: {e}")
+			self.get_logger().error(f"Error applying semantic labels: {e}")
 	
 	def _get_voxel_key_from_point(self, point) -> tuple:
 		"""Convert world point to voxel key. Handles both numpy arrays and torch tensors."""
@@ -1999,23 +2185,25 @@ class SemanticDepthOctoMapNode(Node):
 	def _update_regular_mapping(self, depth_m: np.ndarray, pose: PoseStamped):
 		"""Update regular VDB occupancy mapping in a separate thread."""
 		try:
-			# Convert to torch tensors
-			device = self.vdb_mapper.device
-			depth_tensor = torch.from_numpy(depth_m).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
-			
-			# Create dummy RGB (VDB needs it but we're focusing on occupancy)
-			h, w = depth_m.shape
-			rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
-			
-			# Convert pose to 4x4 matrix
-			pose_4x4 = self._pose_to_4x4_matrix(pose)
-			
-			# Process with VDB mapper for regular occupancy
-			update_info = self.vdb_mapper.process_posed_rgbd(
-				rgb_img=rgb_tensor,
-				depth_img=depth_tensor,
-				pose_4x4=pose_4x4
-			)
+			# CRITICAL: Use no_grad to prevent gradient accumulation
+			with torch.no_grad():
+				# Convert to torch tensors
+				device = self.vdb_mapper.device
+				depth_tensor = torch.from_numpy(depth_m).float().unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
+				
+				# Create dummy RGB (VDB needs it but we're focusing on occupancy)
+				h, w = depth_m.shape
+				rgb_tensor = torch.zeros(1, 3, h, w, dtype=torch.float32).to(device)
+				
+				# Convert pose to 4x4 matrix
+				pose_4x4 = self._pose_to_4x4_matrix(pose)
+				
+				# Process with VDB mapper for regular occupancy
+				update_info = self.vdb_mapper.process_posed_rgbd(
+					rgb_img=rgb_tensor,
+					depth_img=depth_tensor,
+					pose_4x4=pose_4x4
+				)
 		except Exception as e:
 			self.get_logger().warn(f"VDB mapping error: {e}")
 
