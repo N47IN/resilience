@@ -40,11 +40,16 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import os
 import bisect
+import base64
 
 # Import RayFronts VDB mapping
 try:
 	import sys
-	sys.path.append('/home/navin/ros2_ws/src/resilience/RayFronts')
+	import os
+	# Add RayFronts to path relative to this script's location
+	rayfronts_path = "/home/navin/ros2_ws/src/resilience/RayFronts"
+	if rayfronts_path not in sys.path:
+		sys.path.append(rayfronts_path)
 	from rayfronts.mapping.semantic_ray_frontiers_map import SemanticRayFrontiersMap
 	from rayfronts import geometry3d as g3d
 	import rayfronts_cpp
@@ -131,13 +136,13 @@ class SemanticDepthOctoMapNode(Node):
 			('embedding_dim', 1152),
 			('enable_semantic_mapping', True),
 			('semantic_similarity_threshold', 0.6),
-			('buffers_directory', '/home/navin/ros2_ws/src/buffers'),
+			('buffers_directory', os.path.expanduser('~/ros2_ws/src/buffers')),
 			('enable_voxel_mapping', True),
 			('sync_buffer_seconds', 2.0),
 			('inactivity_threshold_seconds', 2.5),
-			('semantic_export_directory', '/home/navin/ros2_ws/src/buffers'),
+			('semantic_export_directory', os.path.expanduser('~/ros2_ws/src/buffers')),
 			('mapping_config_path', ''),
-			('nominal_path', '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json'),
+			('nominal_path', ''),  # Will be set from package share directory if not provided
 			('main_config_path', '')
 		])
 
@@ -165,6 +170,16 @@ class SemanticDepthOctoMapNode(Node):
 		# Read nominal path separately (optional for GP)
 		self.nominal_path = self.get_parameter('nominal_path').value
 		self.main_config_path = self.get_parameter('main_config_path').value
+		
+		# If nominal_path is empty, use the default from package share directory
+		if not self.nominal_path:
+			try:
+				from ament_index_python.packages import get_package_share_directory
+				package_share = get_package_share_directory('resilience')
+				self.nominal_path = os.path.join(package_share, 'assets', 'adjusted_nominal_spline.json')
+			except Exception as e:
+				self.get_logger().warn(f"Could not locate package share directory: {e}")
+		
 		from collections import deque
 
 		
@@ -557,8 +572,24 @@ class SemanticDepthOctoMapNode(Node):
 		
 		return color_to_indices
 	
+	def _decode_hotspot_mask_png(self, mask_b64: str) -> Optional[np.ndarray]:
+		"""Decode a binary hotspot mask from a base64-encoded PNG string."""
+		try:
+			if not mask_b64:
+				return None
+			mask_bytes = base64.b64decode(mask_b64.encode('ascii'))
+			mask_array = np.frombuffer(mask_bytes, dtype=np.uint8)
+			mask_img = cv2.imdecode(mask_array, cv2.IMREAD_GRAYSCALE)
+			if mask_img is None:
+				return None
+			# Return a binary mask (0/1 as uint8)
+			return (mask_img > 0).astype(np.uint8)
+		except Exception:
+			self.get_logger().warn("Failed to decode hotspot mask PNG from metadata")
+			return None
+	
 	def _process_merged_hotspot_message(self, data: dict) -> bool:
-		"""Process merged hotspot metadata; fetch mask image by timestamp and apply."""
+		"""Process merged hotspot metadata; prefer embedded masks, fall back to image-based decode."""
 		try:
 			is_narration = data.get('is_narration')
 			vlm_info = data.get('vlm_info', {})
@@ -568,9 +599,69 @@ class SemanticDepthOctoMapNode(Node):
 			if rgb_timestamp <= 0.0:
 				self.get_logger().warn(f"Incomplete hotspot data (no timestamp)")
 				return False
+			
+			# Check if embedded masks are available in the metadata (preferred path)
+			embedded_masks_available = any(
+				isinstance(info, dict) and info.get('mask_png') is not None
+				for info in vlm_info.values()
+			)
+			
 			start = time.time()
 			
-			# Lookup merged mask image by timestamp
+			# Lookup closest depth frame and pose by timestamp (needed for both paths)
+			depth_msg, pose_msg = self._lookup_depth_and_pose(rgb_timestamp)
+			depth_lookup_time = time.time() - start
+			self.get_logger().warn(f"Time taken to lookup depth: {depth_lookup_time}")
+			if depth_msg is None or pose_msg is None:
+				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
+				return False
+			
+			try:
+				# Convert ROS Image message to numpy array (float32 for depth)
+				depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
+			except Exception as e:
+				self.get_logger().error(f"Failed to convert depth message: {e}")
+				return False
+			
+			processed_count = 0
+			
+			if embedded_masks_available:
+				# Directly decode and use per-answer masks from metadata (no image-based color decoding)
+				for vlm_answer, info in vlm_info.items():
+					mask_b64 = None
+					if isinstance(info, dict):
+						mask_b64 = info.get('mask_png')
+					if not mask_b64:
+						continue
+					
+					vlm_mask = self._decode_hotspot_mask_png(mask_b64)
+					if vlm_mask is None or not np.any(vlm_mask):
+						continue
+					
+					vlm_mask_time = time.time() - start - depth_lookup_time
+					self.get_logger().debug(f"Time taken to decode vlm mask: {vlm_mask_time:.4f}s (embedded)")
+					used_ts = 1.0
+					success = self._process_hotspot_with_depth(
+						vlm_mask, pose_msg, depth_image, vlm_answer,
+						info.get('hotspot_threshold', 0.6) if isinstance(info, dict) else 0.6,
+						{'hotspot_pixels': (info.get('hotspot_pixels', 0) if isinstance(info, dict) else 0)},
+						rgb_timestamp, used_ts, is_narration, buffer_id
+					)
+					hotspot_processing_time = time.time() - start - depth_lookup_time - vlm_mask_time
+					self.get_logger().debug(f"Time taken to process hotspot: {hotspot_processing_time:.4f}s (embedded)")
+					if success:
+						processed_count += 1
+						if len(vlm_info) == 1 and isinstance(info, dict):
+							self.get_logger().info(
+								f"NARRATION HOTSPOT PROCESSED (embedded): '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels"
+							)
+				
+				self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from embedded hotspot masks")
+				total_time = time.time() - start
+				self.get_logger().warn(f"Total time taken to process merged hotspot (embedded masks): {total_time}")
+				return processed_count > 0
+			
+			# Legacy fallback: Lookup merged mask image by timestamp and split by color
 			merged_mask = self._lookup_mask(rgb_timestamp)
 			mask_lookup_time = time.time() - start
 			self.get_logger().warn(f"Time taken to lookup mask: {mask_lookup_time}")
@@ -578,26 +669,10 @@ class SemanticDepthOctoMapNode(Node):
 				self.get_logger().warn(f"No matching hotspot mask found for timestamp {rgb_timestamp:.6f}")
 				return False
 			
-			# Lookup closest depth frame and pose by timestamp
-			depth_image, pose_msg = self._lookup_depth_and_pose(rgb_timestamp)
-			depth_lookup_time = time.time() - start - mask_lookup_time
-			self.get_logger().warn(f"Time taken to lookup depth: {depth_lookup_time}")
-			if depth_image is None or pose_msg is None:
-				self.get_logger().warn(f"No matching depth/pose found for timestamp {rgb_timestamp:.6f}")
-				return False
-			
-			try:
-				# Convert ROS Image message to numpy array (float32 for depth)
-				depth_image = self.bridge.imgmsg_to_cv2(depth_image, desired_encoding='32FC1')
-			except Exception as e:
-				self.get_logger().error(f"Failed to convert depth message: {e}")
-				return False
-			
 			# OPTIMIZATION: Pre-compute color indices once (fixes bottleneck #1)
 			color_to_indices = self._precompute_color_indices(merged_mask, vlm_info)
 			
 			# Process each VLM answer using pre-computed indices
-			processed_count = 0
 			for vlm_answer, info in vlm_info.items():
 				if vlm_answer not in color_to_indices:
 					continue
@@ -612,23 +687,25 @@ class SemanticDepthOctoMapNode(Node):
 				vlm_mask[v_coords, u_coords] = True
 				
 				vlm_mask_time = time.time() - start - mask_lookup_time - depth_lookup_time
-				self.get_logger().debug(f"Time taken to create vlm mask: {vlm_mask_time:.4f}s (optimized)")
+				self.get_logger().debug(f"Time taken to create vlm mask: {vlm_mask_time:.4f}s (optimized, legacy)")
 				used_ts = 1.0
 				success = self._process_hotspot_with_depth(
 					vlm_mask, pose_msg, depth_image, vlm_answer, 
-					info.get('hotspot_threshold', 0.6), 
-					{'hotspot_pixels': info.get('hotspot_pixels', 0)}, 
+					info.get('hotspot_threshold', 0.6) if isinstance(info, dict) else 0.6, 
+					{'hotspot_pixels': (info.get('hotspot_pixels', 0) if isinstance(info, dict) else 0)}, 
 					rgb_timestamp, used_ts, is_narration, buffer_id
 				)
 				hotspot_processing_time = time.time() - start - mask_lookup_time - depth_lookup_time - vlm_mask_time
-				self.get_logger().debug(f"Time taken to process hotspot: {hotspot_processing_time:.4f}s")
+				self.get_logger().debug(f"Time taken to process hotspot: {hotspot_processing_time:.4f}s (legacy)")
 				if success:
 					processed_count += 1
-					if len(vlm_info) == 1:
-						self.get_logger().info(f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels")
-			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots")
+					if len(vlm_info) == 1 and isinstance(info, dict):
+						self.get_logger().info(
+							f"NARRATION HOTSPOT PROCESSED: '{vlm_answer}' with {info.get('hotspot_pixels', 0)} pixels"
+						)
+			self.get_logger().info(f"Processed {processed_count}/{len(vlm_info)} VLM answers from merged hotspots (legacy)")
 			total_time = time.time() - start
-			self.get_logger().warn(f"Total time taken to process merged hotspot: {total_time}")
+			self.get_logger().warn(f"Total time taken to process merged hotspot (legacy): {total_time}")
 			return processed_count > 0
 			
 		except Exception as e:
@@ -737,7 +814,7 @@ class SemanticDepthOctoMapNode(Node):
 			
 			# GP fitting for narration hotspots (background thread)
 			if is_narration and points_world_near.size > 0:
-				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder("/home/navin/ros2_ws/src/buffers", points_world_near)
+				buffer_dir, pcd_path = self.save_points_to_latest_nested_subfolder(self.buffers_directory, points_world_near)
 				if buffer_dir is not None and GP_HELPER_AVAILABLE:
 					voxelized_points = self._voxelize_pointcloud(points_world_near, float(self.voxel_resolution), max_points=200)
 					self._check_and_start_gp_fit(buffer_dir, voxelized_points, vlm_answer)
@@ -1323,11 +1400,16 @@ class SemanticDepthOctoMapNode(Node):
 			# Publish raw grid for control node
 			self._publish_raw_gp_grid(gp_mean, uncertainty_std, grid_shape, grid_points)
 
+			# Log with safe handling of None uncertainty
+			uncertainty_str = (
+				f"[{uncertainty_std.min():.3f}, {uncertainty_std.max():.3f}]"
+				if uncertainty_std is not None else "N/A"
+			)
 			self.get_logger().info(
 				f"Published robot-centric GP fields: {len(grid_points)} points, "
 				f"grid_shape={grid_shape}, robot_pos=[{self.robot_position[0]:.2f}, {self.robot_position[1]:.2f}, {self.robot_position[2]:.2f}], "
 				f"mean_range=[{gp_mean.min():.3f}, {gp_mean.max():.3f}], "
-				f"uncertainty_range=[{uncertainty_std.min():.3f}, {uncertainty_std.max():.3f}]"
+				f"uncertainty_range={uncertainty_str}"
 			)
 			
 		except Exception as e:
@@ -1383,36 +1465,56 @@ class SemanticDepthOctoMapNode(Node):
 		
 		Args:
 			gp_mean: (N,) GP mean predictions
-			uncertainty_std: (N,) Epistemic uncertainty predictions
+			uncertainty_std: (N,) Epistemic uncertainty predictions or None
 			grid_shape: (D, H, W) grid dimensions
 		"""
 		try:
 			if not self.TORCH_AVAILABLE:
-				# Skip GPU tensor update if PyTorch not available
 				return
 			
 			import torch
 			
-			# Reshape flattened arrays to 3D grid
 			D, H, W = grid_shape
+			expected_size = D * H * W
+			
+			# Validate gp_mean
+			if gp_mean is None or len(gp_mean) != expected_size:
+				self.get_logger().warn(f"Invalid gp_mean size: {len(gp_mean) if gp_mean is not None else 0} != {expected_size}")
+				return
+			
+			# Handle uncertainty_std (can be None)
+			if uncertainty_std is None or len(uncertainty_std) != expected_size:
+				uncertainty_std = np.zeros_like(gp_mean)
+			
+			# Sanitize NaN/Inf values before GPU operations (critical for CUDA)
+			gp_mean = np.nan_to_num(gp_mean, nan=0.0, posinf=0.0, neginf=0.0)
+			uncertainty_std = np.nan_to_num(uncertainty_std, nan=0.0, posinf=0.0, neginf=0.0)
+			
+			# Reshape to 3D grids
 			mean_grid = gp_mean.reshape(D, H, W).astype(np.float32)
 			uncertainty_grid = uncertainty_std.reshape(D, H, W).astype(np.float32)
 			
 			# Stack into (2, D, H, W) tensor
-			# Channel 0 = Mean, Channel 1 = Uncertainty
 			combined_grid = np.stack([mean_grid, uncertainty_grid], axis=0)
 			
-			# Convert to PyTorch tensor and move to GPU
-			self.gp_grid_tensor = torch.from_numpy(combined_grid).to(self.device)
+			# Convert to PyTorch tensor and move to device.
+			# If CUDA fails, skip this update rather than silently falling back to CPU.
+			try:
+				tensor = torch.from_numpy(combined_grid).to(self.device)
+				self.gp_grid_tensor = tensor
+			except RuntimeError as cuda_err:
+				self.get_logger().error(f"CUDA error updating GP tensor, skipping this frame: {cuda_err}")
+				return
 			
 			self.get_logger().info(
-				f"Updated GPU tensor: shape={self.gp_grid_tensor.shape}, "
-				f"device={self.device}, "
-				f"mean_range=[{mean_grid.min():.3f}, {mean_grid.max():.3f}], "
-				f"uncertainty_range=[{uncertainty_grid.min():.3f}, {uncertainty_grid.max():.3f}]"
+				f"Updated GP tensor: shape={self.gp_grid_tensor.shape}, "
+				f"device={self.gp_grid_tensor.device}, "
+				f"mean=[{mean_grid.min():.3f}, {mean_grid.max():.3f}], "
+				f"uncertainty=[{uncertainty_grid.min():.3f}, {uncertainty_grid.max():.3f}]"
 			)
 			
 		except Exception as e:
+			self.get_logger().error(f"Error updating GP GPU tensor: {e}")
 			import traceback
 			traceback.print_exc()
 
@@ -1445,6 +1547,10 @@ class SemanticDepthOctoMapNode(Node):
 				self.robot_grid_resolution, 
 				float(grid_shape[0]), float(grid_shape[1]), float(grid_shape[2])
 			]
+			
+			# Handle None uncertainty (fallback to zeros)
+			if uncertainty_std is None:
+				uncertainty_std = np.zeros_like(gp_mean)
 			
 			# Concatenate: Metadata + Mean + Uncertainty
 			# Note: gp_mean and uncertainty_std are flattened
@@ -1562,6 +1668,9 @@ class SemanticDepthOctoMapNode(Node):
 			# Apply the learned parameters: disturbance = A * phi + b
 			predictions = A * phi + b
 			
+			# Sanitize NaN/Inf values (critical for downstream GPU operations)
+			predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+			
 			return predictions
 			
 		except Exception as e:
@@ -1630,8 +1739,10 @@ class SemanticDepthOctoMapNode(Node):
 			# 5. Total variance = epistemic + aleatoric
 			total_variance = epistemic_var + sigma2_noise
 			
-			# Return standard deviation
-			return np.sqrt(np.maximum(total_variance, 0.0))
+			# Return standard deviation with NaN sanitization (critical for GPU operations)
+			uncertainty = np.sqrt(np.maximum(total_variance, 0.0))
+			uncertainty = np.nan_to_num(uncertainty, nan=0.0, posinf=0.0, neginf=0.0)
+			return uncertainty
 			
 		except Exception as e:
 			self.get_logger().error(f"Error computing epistemic uncertainty: {e}")

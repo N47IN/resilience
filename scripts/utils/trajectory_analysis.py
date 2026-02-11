@@ -20,9 +20,13 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import sys
 
-# Add the resilience package to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from resilience.simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
+# Import from the resilience package (installed via ament)
+try:
+    from resilience.simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
+except ImportError:
+    # Fallback: add parent directory to path (for development)
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+    from resilience.simple_descriptive_narration import XYSpatialDescriptor, TrajectoryPoint
 
 @dataclass
 class DiscretizedPoint:

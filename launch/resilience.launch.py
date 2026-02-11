@@ -107,7 +107,7 @@ def generate_launch_description():
     
     declare_buffers_directory = DeclareLaunchArgument(
         'buffers_directory',
-        default_value='/home/navin/ros2_ws/src/buffers',
+        default_value=os.path.expanduser('~/ros2_ws/src/buffers'),
         description='Directory containing saved buffer data with VLM embeddings'
     )
     
@@ -231,7 +231,7 @@ def generate_launch_description():
             'inactivity_threshold_seconds': 2.5,
             'semantic_export_directory': LaunchConfiguration('buffers_directory'),
             'mapping_config_path': '',
-            'nominal_path': '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json',
+            'nominal_path': PathJoinSubstitution([FindPackageShare('resilience'), 'assets', 'adjusted_nominal_spline.json']),
             'main_config_path': ''
         }],
         remappings=[

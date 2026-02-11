@@ -23,17 +23,8 @@ import argparse
 from pathlib import Path
 
 # Import fitting helper from offline_gp_fit_and_viz
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# (commented out - not used currently)
 # from offline_gp_fit_and_viz import DisturbanceFieldHelper
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import argparse
-import json
-import os
-from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 # Optional deps (mirroring voxel_gp_helper)
 try:
@@ -913,11 +904,11 @@ def visualize_uncertainty_3d(cause_points, lxy, lz, A, b, sigma2_noise,
 def main():
     parser = argparse.ArgumentParser(description="Fit GP with NLL and visualize uncertainty")
     parser.add_argument("--buffer-dir", type=str, 
-                        default="/home/navin/ros2_ws/src/buffers/run_20251221_144638_231_738a9b22/buffer1",
+                        default=os.path.expanduser("~/ros2_ws/src/buffers"),
                         help="Buffer directory with poses.npy and points.pcd")
     parser.add_argument("--nominal-path", type=str,
-                        default="/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json",
-                        help="Path to nominal trajectory JSON")
+                        default="",
+                        help="Path to nominal trajectory JSON (optional)")
     args = parser.parse_args()
     
     buffer_dir = Path(args.buffer_dir)

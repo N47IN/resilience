@@ -28,9 +28,9 @@ from typing_extensions import override, List, Tuple
 import torch
 import numpy as np
 
-from radesg_base import ImageSemSegEncoder
+from resilience.radesg_base import ImageSemSegEncoder
 from segment_anything import sam_model_registry, SamPredictor
-from sam_utils import sam_refinement
+from resilience.sam_utils import sam_refinement
 
 import torch
 import torch.nn as nn

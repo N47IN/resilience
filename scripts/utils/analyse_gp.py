@@ -2,7 +2,7 @@
 """
 Analyze Latest GP Fits: Sequential 3D Visualization per Buffer
 
-- Finds the latest run_* directory under /home/navin/ros2_ws/src/buffers
+- Finds the latest run_* directory under ~/ros2_ws/src/buffers (default)
 - For each buffer (buffer1, buffer2, ...), loads:
   * poses.npy (actual trajectory)
   * points.pcd (cause points saved by depth_octomap_node for narration)
@@ -15,7 +15,7 @@ Usage:
     python3 resilience/scripts/analyze_latest_gps.py
 
 Optional args:
-  --buffers-root <path>  (default: /home/navin/ros2_ws/src/buffers)
+  --buffers-root <path>  (default: ~/ros2_ws/src/buffers)
   --res-xy <float>       (default: 0.06)
   --res-z <float>        (default: 0.06)
   --matplotlib           (force Matplotlib even if PyVista is available)
@@ -147,7 +147,7 @@ def visualize_buffer(buffer_dir: Path, res_xy: float, res_z: float, force_matplo
 
 def main():
 	parser = argparse.ArgumentParser(description='Analyze and visualize latest GP fits per buffer')
-	parser.add_argument('--buffers-root', type=str, default='/home/navin/ros2_ws/src/buffers')
+	parser.add_argument('--buffers-root', type=str, default=os.path.expanduser('~/ros2_ws/src/buffers'))
 	parser.add_argument('--res-xy', type=float, default=0.06)
 	parser.add_argument('--res-z', type=float, default=0.06)
 	parser.add_argument('--matplotlib', action='store_true', help='Force Matplotlib renderer')

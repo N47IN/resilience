@@ -17,14 +17,17 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import argparse
 
-# Add the resilience package to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-
 # Import only the specific modules we need, avoiding YOLO dependencies
 import importlib.util
-spec = importlib.util.spec_from_file_location("simple_descriptive_narration", 
-                                            os.path.join(os.path.dirname(__file__), '..', 'resilience', 'simple_descriptive_narration.py'))
-narration_module = importlib.util.module_from_spec(spec)
+
+# Try to import from installed package first
+try:
+    from resilience import simple_descriptive_narration as narration_module
+except ImportError:
+    # Fallback: load from file for development
+    spec = importlib.util.spec_from_file_location("simple_descriptive_narration", 
+                                                os.path.join(os.path.dirname(__file__), '..', '..', 'resilience', 'simple_descriptive_narration.py'))
+    narration_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(narration_module)
 XYSpatialDescriptor = narration_module.XYSpatialDescriptor
 TrajectoryPoint = narration_module.TrajectoryPoint

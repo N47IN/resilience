@@ -284,7 +284,6 @@ class ResilienceNode(Node):
             (self.depth_topic, Image, self.depth_callback, 1),
             (self.pose_topic, PoseStamped, self.pose_callback, 10),
             (self.camera_info_topic, CameraInfo, self.camera_info_callback, 1)
-            # ,
             # (self.vlm_answer_topic, String, self.vlm_answer_callback, 10)
         ]
         
@@ -564,7 +563,7 @@ class ResilienceNode(Node):
         try:
             run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             unique_id = str(uuid.uuid4())[:8]
-            self.risk_buffer_save_dir = '/home/navin/ros2_ws/src/buffers'
+            self.risk_buffer_save_dir = os.path.expanduser('~/ros2_ws/src/buffers')
             os.makedirs(self.risk_buffer_save_dir, exist_ok=True)
             
             self.current_run_dir = os.path.join(self.risk_buffer_save_dir, f"run_{run_timestamp}_{unique_id}")
@@ -735,7 +734,7 @@ class ResilienceNode(Node):
             if narration:
                 self.publish_narration_with_image(narration)
                 # self.narration_pub.publish(String(data=narration))
-            self.vlm_answer_callback()
+                self.vlm_answer_callback()
 
     def publish_narration_with_image(self, narration_text):
         """Publish both narration text and accompanying image together"""
@@ -787,13 +786,13 @@ class ResilienceNode(Node):
                 image_msg = self.bridge.cv2_to_imgmsg(closest_image, encoding='rgb8')
                 image_msg.header.stamp = closest_msg.header.stamp
                 image_msg.header.frame_id = closest_msg.header.frame_id
-                # self.narration_image_pub.publish(image_msg)
+                self.narration_image_pub.publish(image_msg)
                 
-                # self.narration_text_pub.publish(String(data=narration_text))
-        #     else:
-        #         self.narration_text_pub.publish(String(data=narration_text))
-        # else:
-        #     self.narration_text_pub.publish(String(data=narration_text))
+                self.narration_text_pub.publish(String(data=narration_text))
+            else:
+                self.narration_text_pub.publish(String(data=narration_text))
+        else:
+            self.narration_text_pub.publish(String(data=narration_text))
 
     def load_enhanced_embedding_from_buffer(self, buffer_dir: str, vlm_answer: str) -> Optional[np.ndarray]:
         """Load enhanced embedding from buffer directory."""
@@ -930,19 +929,22 @@ class ResilienceNode(Node):
         
         last_memory_cleanup = time.time()
         memory_cleanup_interval = 60.0
+        # Moving average timing for performance monitoring
+        iteration_count = 0
+        ema_iteration_time = None
+        ema_alpha = 0.1  # Exponential moving average factor
         
-        # Target loop rate (was effectively self-throttled by frame skipping + sleeps)
-        # Keep this conservative to avoid starving ROS callbacks while still achieving ~8Hz.
-        target_hz = 8.0
-        target_period_s = 1.0 / max(target_hz, 1e-6)
+        # OPTIMIZATION: Frame skip counter
+        process_every_n_frames = 1  # Process every 2nd frame for predictive similarity
+        frame_counter = 0
         
         # OPTIMIZATION: Cached RGB conversion
         last_rgb_msg_id = None
         cached_rgb_image = None
         
         while rclpy.ok() and self.naradio_running:
+            iteration_start = time.time()
             try:
-                loop_start = time.time()
                 current_time = time.time()
                 
                 # OPTIMIZATION: Less frequent memory cleanup
@@ -952,7 +954,7 @@ class ResilienceNode(Node):
                 
                 # Check if processor is ready
                 if not self.naradio_processor.is_ready():
-                    time.sleep(0.05)
+                    time.sleep(0.1)
                     continue
                 
                 with self.processing_lock:
@@ -961,19 +963,10 @@ class ResilienceNode(Node):
                         continue
                     
                     rgb_msg = self.latest_rgb_msg
-                    depth_msg = self.latest_depth_msg
-                    pose_for_semantic = self.latest_pose.copy() if self.latest_pose is not None else None
-
-                # If nothing to segment, don't burn compute — just rate-limit
-                if not (self.enable_combined_segmentation and self.naradio_processor.is_segmentation_ready()):
-                    # Maintain a gentle loop cadence
-                    elapsed = time.time() - loop_start
-                    time.sleep(max(0.01, target_period_s - elapsed))
-                    continue
-                if not self.naradio_processor.dynamic_objects:
-                    elapsed = time.time() - loop_start
-                    time.sleep(max(0.01, target_period_s - elapsed))
-                    continue
+                  
+                
+                # OPTIMIZATION: Frame skipping for predictive similarity
+                frame_counter += 1
                 
                 # OPTIMIZATION: Cache RGB conversion to avoid repeated cv_bridge calls
                 rgb_msg_id = id(rgb_msg)
@@ -995,12 +988,14 @@ class ResilienceNode(Node):
                 )
                 
                 # OPTIMIZATION: Only process if we have dynamic objects and features
-                if feat_map_np is not None:
+                if (self.naradio_processor.dynamic_objects and
+                    feat_map_np is not None):
+
+
                     
-                    # Copy to avoid concurrent modification by callbacks
-                    vlm_answers = list(self.naradio_processor.dynamic_objects)
+                    vlm_answers = self.naradio_processor.dynamic_objects
                     
-                    # OPTIMIZATION: Use batched similarity (fast version computes all masks in one pass)
+                    # OPTIMIZATION: Use fast version
                     vlm_hotspots = self.naradio_processor.create_merged_hotspot_masks_fast(
                         rgb_image, vlm_answers, feat_map_np=feat_map_np)
                     
@@ -1009,15 +1004,29 @@ class ResilienceNode(Node):
                         self.semantic_bridge.publish_merged_hotspots(
                             vlm_hotspots=vlm_hotspots,
                             timestamp=rgb_timestamp,
-                            original_image=None  # OPTIMIZATION: Skip overlay for predictive
+                            original_image=None 
                         )
-                
-                # Rate-limit to target_hz (don't add extra sleeps beyond what's needed)
-                elapsed = time.time() - loop_start
-                time.sleep(max(0.0, target_period_s - elapsed))
+
+                        iteration_time = time.time() - iteration_start
+                        iteration_count += 1
+                        if ema_iteration_time is None:
+                            ema_iteration_time = iteration_time
+                        else:
+                            ema_iteration_time = ema_alpha * iteration_time + (1.0 - ema_alpha) * ema_iteration_time
+                        
+                        # Log per-iteration timing with moving average
+                        try:
+                            self.get_logger().info(
+                                f"NARadio loop iteration {iteration_count}: "
+                                f"time={iteration_time:.4f}s, ema_time={ema_iteration_time:.4f}s"
+                            )
+                        except Exception:
+                            # Logging should never break the loop
+                            pass
                             
             except Exception as e:
                 time.sleep(0.05)  
+             
     
     def camera_info_callback(self, msg):
         """Handle camera info to get intrinsics."""
@@ -1026,8 +1035,6 @@ class ResilienceNode(Node):
                 self.camera_intrinsics = [msg.k[0], msg.k[4], msg.k[2], msg.k[5]]
                 self.camera_info_received = True
 
-    #NOTE demo code, replace with proper function later, also enable narration publishing whish
-    #has been commented out for now
     def vlm_answer_callback(self):
         """Handle VLM answers for cause analysis and buffer association."""
         try:
@@ -1055,7 +1062,7 @@ class ResilienceNode(Node):
             #         else:
             #             self.get_logger().warn(f"Failed to add '{vlm_answer}' to processor")
             
-            vlm_answer = "fan"
+            vlm_answer = "white fan"
             score = 1.0
             
             # Track as recent
@@ -1082,7 +1089,6 @@ class ResilienceNode(Node):
             
             self.save_cause_registry_snapshot()
             
-            primary_cause = "fan"
             if primary_cause:
                 self.associate_vlm_answer_with_buffer(primary_cause)
                 narration_success = self.process_narration_chain_for_vlm_answer(primary_cause)
@@ -1093,6 +1099,7 @@ class ResilienceNode(Node):
             print(f"Error processing VLM answer: {e}")
             import traceback
             traceback.print_exc()
+
 
     def process_narration_chain_for_vlm_answer(self, vlm_answer: str) -> bool:
         try:
@@ -1123,7 +1130,6 @@ class ResilienceNode(Node):
                     for buffer in reversed(self.risk_buffer_manager.active_buffers):
                         if buffer.cause == vlm_answer:
                             target_buffer = buffer
-                            
                             break
             
             if not target_buffer:
@@ -1169,7 +1175,7 @@ class ResilienceNode(Node):
 
             # OPTIMIZATION 3: Compute similarity map ONCE using pre-computed features
             similarity_map = self.naradio_processor.compute_vlm_similarity_map_optimized(
-                narration_image, vlm_answer, feat_map_np=feat_map_np, use_softmax=True, chunk_size=4000
+                narration_image, vlm_answer, feat_map_np=feat_map_np, use_softmax=True, chunk_size=10000
             )
             if similarity_map is None:
                 print(f"Failed to compute similarity for narration image")
@@ -1177,8 +1183,8 @@ class ResilienceNode(Node):
 
             # Get threshold from config
             threshold = 0.9
-            # if hasattr(self.naradio_processor, 'segmentation_config'):
-            #     threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
+            if hasattr(self.naradio_processor, 'segmentation_config'):
+                threshold = self.naradio_processor.segmentation_config.get('segmentation', {}).get('hotspot_threshold', 0.6)
             
             # CRITICAL FIX #2: Use the similarity map already computed (no redundant computation)
             # The similarity_map computed above is already text-based, which is what we want
@@ -1252,6 +1258,18 @@ class ResilienceNode(Node):
             except Exception as e:
                 self.get_logger().debug(f"Enhanced embedding computation failed (non-critical): {e}")
             
+            try:
+                scene_embedding = self.naradio_processor.extract_scene_embedding(
+                    narration_image, return_tensor=False
+                )
+                if scene_embedding is not None:
+                    self._save_scene_embedding(buffer_dir, scene_embedding, original_image_timestamp, vlm_answer)
+                    self.get_logger().info(f"Scene embedding extracted and saved (shape: {scene_embedding.shape})")
+                else:
+                    self.get_logger().warn(f"Failed to extract scene embedding for narration image")
+            except Exception as e:
+                self.get_logger().debug(f"Scene embedding extraction failed (non-critical): {e}")
+
             return True
             
         except Exception as e:
@@ -1259,6 +1277,51 @@ class ResilienceNode(Node):
             import traceback
             traceback.print_exc()
             return False
+
+    def _save_scene_embedding(self, buffer_dir: str, scene_embedding: np.ndarray, 
+                             timestamp: float, vlm_answer: str):
+        """Save scene embedding (global image embedding) to buffer directory."""
+        try:
+            # Create scene_embeddings directory
+            scene_embeddings_dir = os.path.join(buffer_dir, 'scene_embeddings')
+            os.makedirs(scene_embeddings_dir, exist_ok=True)
+            
+            # Create safe filename
+            safe_vlm_name = vlm_answer.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            timestamp_str = f"{timestamp:.6f}"
+            
+            # Save scene embedding as numpy array
+            embedding_filename = f"scene_embedding_{safe_vlm_name}_{timestamp_str}.npy"
+            embedding_path = os.path.join(scene_embeddings_dir, embedding_filename)
+            np.save(embedding_path, scene_embedding)
+            
+            # Save metadata
+            metadata = {
+                'vlm_answer': vlm_answer,
+                'embedding_filename': embedding_filename,
+                'embedding_shape': list(scene_embedding.shape),
+                'embedding_norm': float(np.linalg.norm(scene_embedding)),
+                'embedding_dtype': str(scene_embedding.dtype),
+                'timestamp': timestamp,
+                'datetime': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'description': 'Global scene embedding for the whole narration image (not dense/spatial features)',
+                'computation_method': 'encode_image_to_vector',
+                'embedding_type': 'scene_embedding'
+            }
+            
+            metadata_filename = f"scene_embedding_{safe_vlm_name}_{timestamp_str}_metadata.json"
+            metadata_path = os.path.join(scene_embeddings_dir, metadata_filename)
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.get_logger().info(f"Saved scene embedding: {embedding_path}")
+            self.get_logger().info(f"  Shape: {scene_embedding.shape}, Norm: {np.linalg.norm(scene_embedding):.4f}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Error saving scene embedding: {e}")
+            import traceback
+            traceback.print_exc()
+
 
     def save_cause_registry_snapshot(self, force: bool = False):
         """
@@ -1292,10 +1355,9 @@ class ResilienceNode(Node):
         success = self.risk_buffer_manager.assign_cause(vlm_answer)
         
         if success:
-            self.get_logger().warn(f"Associated '{vlm_answer}' with risk buffer")
+            print(f"Associated '{vlm_answer}' with risk buffer")
         else:
-            self.get_logger().warn(f"No suitable buffer found for '{vlm_answer}'")
-            # print()
+            print(f"No suitable buffer found for '{vlm_answer}'")
                     
 
 

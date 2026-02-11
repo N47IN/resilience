@@ -23,7 +23,9 @@ import json
 import time
 
 # Add pytorch_mppi to path
-sys.path.insert(0, '/home/navin/ros2_ws/src/resilience/pytorch_mppi/src')
+pytorch_mppi_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'pytorch_mppi', 'src')
+if os.path.exists(pytorch_mppi_path) and pytorch_mppi_path not in sys.path:
+    sys.path.insert(0, pytorch_mppi_path)
 try:
     from pytorch_mppi import MPPI
 except ImportError:
@@ -186,7 +188,14 @@ class MPPIControlNode(Node):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"SOTA MPPI Node on {self.device}")
         
-        self.nominal_path_file = '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json'
+        # Get nominal path from package share directory
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            package_share = get_package_share_directory('resilience')
+            self.nominal_path_file = os.path.join(package_share, 'assets', 'adjusted_nominal_spline.json')
+        except Exception as e:
+            self.get_logger().warn(f"Could not locate package share directory: {e}")
+            self.nominal_path_file = ''
         self.gp_model = GridDisturbanceGP(device=self.device)
         self.robot_pose = None
         self.nominal_path_points = None

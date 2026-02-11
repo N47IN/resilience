@@ -153,7 +153,15 @@ class MotionPrimitivePlannerNode(Node):
         self.obstacle_grid_tensor = None
         # ADD THIS LINE:
         self.prev_best_idx = None
-        self.nominal_path_file = '/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json'
+        
+        # Get nominal path from package share directory
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            package_share = get_package_share_directory('resilience')
+            self.nominal_path_file = os.path.join(package_share, 'assets', 'adjusted_nominal_spline.json')
+        except Exception as e:
+            self.get_logger().warn(f"Could not locate package share directory: {e}")
+            self.nominal_path_file = ''
         
         self.gp_model = GridDisturbanceGP(device=self.device)
         self.primitive_lib = MotionPrimitiveLibrary(device=self.device)

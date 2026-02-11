@@ -30,6 +30,10 @@ import math
 import string
 from PIL import Image as PILImage
 from openai import OpenAI
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None
 
 class NarrationDisplayNode(Node):
     def __init__(self):
@@ -60,9 +64,23 @@ class NarrationDisplayNode(Node):
         self.output_dir = os.path.expanduser("~/narration_output")
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # VLM API settings
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-4o-mini"
+        # VLM API settings - default to Claude
+        self.provider = os.getenv("VLM_PROVIDER", "claude").lower()  # "claude" or "openai"
+        self.claude_api_key = ""
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        # Model settings
+        # Valid Claude models: claude-3-5-sonnet-20240620, claude-3-opus-20240229, claude-3-sonnet-20240229, claude-3-haiku-20240307
+        self.claude_model = os.getenv("CLAUDE_MODEL", "claude-haiku-4.5-20250514")
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        
+        # Determine which API key to use based on provider
+        if self.provider == "claude":
+            self.api_key = self.claude_api_key
+            self.model = self.claude_model
+        else:
+            self.api_key = self.openai_api_key
+            self.model = self.openai_model
         
         # Subscribers
         self.image_sub = self.create_subscription(
@@ -94,10 +112,18 @@ class NarrationDisplayNode(Node):
         self.get_logger().info(f"Publishing to: /vlm_answer")
         self.get_logger().info(f"Sync tolerance: {self.sync_tolerance}s")
         
-        if self.api_key:
-            self.get_logger().info("VLM API key found - VLM integration enabled")
+        # Log provider and API key status
+        self.get_logger().info(f"VLM Provider: {self.provider.upper()}")
+        if self.provider == "claude":
+            if self.claude_api_key:
+                self.get_logger().info("Claude API key found - VLM integration enabled")
+            else:
+                self.get_logger().warn("No ANTHROPIC_API_KEY found - VLM integration disabled")
         else:
-            self.get_logger().warn("No OPENAI_API_KEY found - VLM integration disabled")
+            if self.openai_api_key:
+                self.get_logger().info("OpenAI API key found - VLM integration enabled")
+            else:
+                self.get_logger().warn("No OPENAI_API_KEY found - VLM integration disabled")
 
     def image_callback(self, msg):
         """Handle incoming image messages"""
@@ -192,29 +218,68 @@ class NarrationDisplayNode(Node):
             return []
         
         try:
-            client = OpenAI(api_key=self.api_key)
             image_base64 = self.encode_image_for_api(image)
+            
+            if self.provider == "claude":
+                return self._query_claude(image_base64, narration_text)
+            else:
+                return self._query_openai(image_base64, narration_text)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error querying VLM: {e}")
+            return []
+    
+    def _query_claude(self, image_base64, narration_text):
+        """Query Claude API with double prompt mechanism"""
+        if Anthropic is None:
+            self.get_logger().error("Anthropic SDK not installed. Install with: pip install anthropic")
+            return []
+        
+        try:
+            client = Anthropic(api_key=self.api_key)
+            
+            # STEP 1: Get 5 distinct objects from the image
+            objects = self._get_object_list_claude(client, image_base64)
+            if not objects or len(objects) == 0:
+                return []
+            
+            # STEP 2: Score objects, get top 4
+            base_prompt = "I am a drone, after 1s"
+            full_narration = f"{base_prompt} {narration_text}"
+            top_objects = self._score_objects_claude(client, image_base64, objects, full_narration)
+            
+            self.get_logger().info(f"VLM top objects: {[(obj, f'{score:.4f}') for obj, score in top_objects]}")
+            return top_objects
+            
+        except Exception as e:
+            self.get_logger().error(f"Error querying Claude: {e}")
+            return []
+    
+    def _query_openai(self, image_base64, narration_text):
+        """Query OpenAI API with double prompt mechanism"""
+        try:
+            client = OpenAI(api_key=self.api_key)
             data_url = f"data:image/png;base64,{image_base64}"
             
-            # STEP 1: Get 15 distinct objects from the image    
-            objects = self._get_object_list(client, data_url)
+            # STEP 1: Get 5 distinct objects from the image
+            objects = self._get_object_list_openai(client, data_url)
             if not objects or len(objects) == 0:
                 return []
             
             # STEP 2: Score objects using logprobs, get top 4
             base_prompt = "I am a drone, after 1s"
             full_narration = f"{base_prompt} {narration_text}"
-            top_objects = self._score_objects_with_logprobs(client, data_url, objects, full_narration)
+            top_objects = self._score_objects_with_logprobs_openai(client, data_url, objects, full_narration)
             
             self.get_logger().info(f"VLM top objects: {[(obj, f'{score:.4f}') for obj, score in top_objects]}")
             return top_objects
             
         except Exception as e:
-            self.get_logger().error(f"Error querying VLM: {e}")
+            self.get_logger().error(f"Error querying OpenAI: {e}")
             return []
     
-    def _get_object_list(self, client, data_url, retries=3):
-        """Get 15 distinct objects from image"""
+    def _get_object_list_claude(self, client, image_base64, retries=3):
+        """Get 5 distinct objects from image using Claude API"""
         prompt = """You must output EXACTLY 5 distinct object types from the image.
 
 RESPONSE FORMAT RULES:
@@ -226,38 +291,215 @@ RESPONSE FORMAT RULES:
 - No extra objects."""
         
         for attempt in range(retries):
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Follow the rules exactly."},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    },
-                ],
-                max_tokens=300,
-            )
-            
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = raw.strip("`").replace("json", "", 1).strip()
-            
             try:
-                object_list = json.loads(raw)
-                if isinstance(object_list, list) and len(object_list) >=5:
-                    return object_list[:5]
-                elif isinstance(object_list, list) and len(object_list) > 0:
-                    return object_list  # Return what we have
-            except json.JSONDecodeError:
+                response = client.messages.create(
+                    model=self.model,
+                    max_tokens=300,
+                    system="Follow the rules exactly.",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_base64}},
+                                {"type": "text", "text": prompt}
+                            ]
+                        }
+                    ]
+                )
+                
+                raw = response.content[0].text.strip()
+                if raw.startswith("```"):
+                    raw = raw.strip("`").replace("json", "", 1).strip()
+                
+                try:
+                    object_list = json.loads(raw)
+                    if isinstance(object_list, list) and len(object_list) >= 5:
+                        return object_list[:5]
+                    elif isinstance(object_list, list) and len(object_list) > 0:
+                        return object_list  # Return what we have
+                except json.JSONDecodeError:
+                    continue
+            except Exception as e:
+                self.get_logger().debug(f"Claude object list attempt {attempt + 1} failed: {e}")
+                if attempt == retries - 1:
+                    raise
                 continue
         
         return []
     
-    def _score_objects_with_logprobs(self, client, data_url, objects, narration):
-        """Score objects using logprobs and return top 4 with scores
+    def _get_object_list_openai(self, client, data_url, retries=3):
+        """Get 5 distinct objects from image using OpenAI API"""
+        prompt = """You must output EXACTLY 5 distinct object types from the image.
+
+RESPONSE FORMAT RULES:
+- Output MUST be ONLY a JSON array.
+- EXACTLY 5 strings.
+- No markdown.
+- No backticks.
+- No explanation.
+- No extra objects."""
+        
+        for attempt in range(retries):
+            try:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "Follow the rules exactly."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": data_url}},
+                            ],
+                        },
+                    ],
+                    max_tokens=300,
+                )
+                
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = raw.strip("`").replace("json", "", 1).strip()
+                
+                try:
+                    object_list = json.loads(raw)
+                    if isinstance(object_list, list) and len(object_list) >= 5:
+                        return object_list[:5]
+                    elif isinstance(object_list, list) and len(object_list) > 0:
+                        return object_list  # Return what we have
+                except json.JSONDecodeError:
+                    continue
+            except Exception as e:
+                self.get_logger().debug(f"OpenAI object list attempt {attempt + 1} failed: {e}")
+                if attempt == retries - 1:
+                    raise
+                continue
+        
+        return []
+    
+    def _score_objects_claude(self, client, image_base64, objects, narration):
+        """Score objects using Claude API and return top 4 with scores
+        
+        Since Claude doesn't support logprobs, we use structured output to get
+        scores for all objects.
+        
+        Returns:
+            list: [(object_name, score), ...] sorted by score descending, max 4 items
+        """
+        letters = string.ascii_uppercase[:len(objects)]
+        options = {letter: obj for letter, obj in zip(letters, objects)}
+        options_text = "\n".join([f"{letter}. {obj}" for letter, obj in options.items()])
+        
+        prompt = f"""{narration}
+
+Looking at this image, which objects most likely caused the drift? Rank all objects by likelihood.
+
+ANSWER OPTIONS:
+{options_text}
+
+Provide a JSON object with scores (0.0 to 1.0) for each letter, where higher scores indicate higher likelihood of causing drift.
+
+Format: {{"A": 0.95, "B": 0.75, "C": 0.50, ...}}
+Output ONLY the JSON object, no markdown, no explanation."""
+        
+        try:
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                system="You are a drone flight dynamics expert. Analyze the image and provide probability scores for each object.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_base64}},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
+                ]
+            )
+            
+            raw = response.content[0].text.strip()
+            # Clean up markdown if present
+            if raw.startswith("```"):
+                raw = raw.strip("`").replace("json", "", 1).strip()
+            
+            # Parse JSON scores
+            scores_dict = json.loads(raw)
+            
+            # Extract scores for valid options
+            raw_scores = {}
+            for letter in letters:
+                if letter in scores_dict:
+                    raw_scores[letter] = float(scores_dict[letter])
+            
+            # Return top 4 objects with scores, sorted by score descending
+            if raw_scores:
+                scored_objects = [(options[letter], float(score)) for letter, score in raw_scores.items()]
+                scored_objects.sort(key=lambda x: x[1], reverse=True)
+                return scored_objects[:4]
+            
+            # Fallback: if parsing failed, make individual calls for each option
+            return self._score_objects_claude_fallback(client, image_base64, objects, narration, letters, options)
+            
+        except Exception as e:
+            self.get_logger().debug(f"Claude structured scoring failed: {e}, trying fallback")
+            return self._score_objects_claude_fallback(client, image_base64, objects, narration, letters, options)
+    
+    def _score_objects_claude_fallback(self, client, image_base64, objects, narration, letters, options):
+        """Fallback scoring method: ask Claude to rank objects and parse the response"""
+        options_text = "\n".join([f"{letter}. {obj}" for letter, obj in options.items()])
+        
+        prompt = f"""{narration}
+
+Looking at this image, which object most likely caused the drift?
+
+ANSWER OPTIONS:
+{options_text}
+
+Output the Letter corresponding to the cause.
+
+Formatting rules:
+- Respond with EXACTLY one uppercase letter from A to {letters[-1]}.
+- No spaces, punctuation, or newlines."""
+        
+        try:
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=1,
+                temperature=2.0,
+                system="You are a drone flight dynamics expert. Analyze the image and choose the object that likely caused drift.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_base64}},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
+                ]
+            )
+            
+            answer = response.content[0].text.strip().upper()
+            # Find matching letter
+            for letter in letters:
+                if letter in answer:
+                    # Return with a default high score for the selected option
+                    # and lower scores for others
+                    scored = [(options[letter], 1.0)]
+                    for other_letter in letters:
+                        if other_letter != letter:
+                            scored.append((options[other_letter], 0.5))
+                    scored.sort(key=lambda x: x[1], reverse=True)
+                    return scored[:4]
+            
+            # If no match, return first object with default score
+            return [(objects[0], 1.0)]
+            
+        except Exception as e:
+            self.get_logger().error(f"Claude fallback scoring failed: {e}")
+            return [(objects[0], 1.0)] if objects else []
+    
+    def _score_objects_with_logprobs_openai(self, client, data_url, objects, narration):
+        """Score objects using OpenAI logprobs and return top 4 with scores
         
         Returns:
             list: [(object_name, score), ...] sorted by score descending, max 4 items

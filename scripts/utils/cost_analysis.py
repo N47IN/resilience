@@ -35,9 +35,8 @@ import argparse
 from pathlib import Path
 import json
 
-# Import from sample_gp.py
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scripts.utils.sample_gp import (
+# Import from sample_gp.py (same directory)
+from sample_gp import (
     DisturbanceFieldHelper,
     load_pcd,
     gp_field,
@@ -691,11 +690,11 @@ def visualize_cost_2d_slice(cause_points, lxy, lz, A, b, sigma2_noise,
 def main():
     parser = argparse.ArgumentParser(description="Analyze 2D GP slice and visualize cost function")
     parser.add_argument("--buffer-dir", type=str, 
-                        default="/home/navin/ros2_ws/src/buffers/run_20251221_144638_231_738a9b22/buffer1",
+                        default=os.path.expanduser("~/ros2_ws/src/buffers"),
                         help="Buffer directory with poses.npy and points.pcd")
     parser.add_argument("--nominal-path", type=str,
-                        default="/home/navin/ros2_ws/src/resilience/assets/adjusted_nominal_spline.json",
-                        help="Path to nominal trajectory JSON")
+                        default="",
+                        help="Path to nominal trajectory JSON (optional)")
     parser.add_argument("--z-slice", type=float, default=None,
                         help="Z coordinate for 2D slice (default: mean of cause points)")
     parser.add_argument("--w-gp", type=float, default=1.0,

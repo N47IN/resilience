@@ -2,7 +2,7 @@ import abc
 from typing_extensions import Tuple, List, override
 import torch
 
-from prompt_templates import openai_imagenet_template
+from resilience.prompt_templates import openai_imagenet_template
 
 class ImageEncoder(abc.ABC):
   """Interface for all image encoders"""

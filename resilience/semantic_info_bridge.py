@@ -10,6 +10,7 @@ import numpy as np
 import json
 import time
 import cv2
+import base64
 from typing import Dict, List, Optional, Any, Tuple
 from std_msgs.msg import String
 from sensor_msgs.msg import Image
@@ -116,16 +117,33 @@ class SemanticHotspotPublisher:
                 # Get unique color for this VLM answer
                 color = self._get_color_for_vlm_answer(vlm_answer)
                 
-                # Apply color to hotspot regions
-                merged_mask[hotspot_mask > 0] = color
+                # Ensure binary mask (0/1) for encoding
+                hotspot_binary = (hotspot_mask > 0).astype(np.uint8)
+                
+                # Apply color to hotspot regions for visualization
+                merged_mask[hotspot_binary > 0] = color
                 
                 # Count hotspots for this VLM answer
-                hotspot_count = int(np.sum(hotspot_mask > 0))
-                vlm_info[vlm_answer] = {
+                hotspot_count = int(np.sum(hotspot_binary))
+                
+                # Encode binary mask as base64 PNG so consumers can reconstruct it
+                mask_b64 = None
+                try:
+                    success, buf = cv2.imencode('.png', hotspot_binary * 255)
+                    if success:
+                        mask_b64 = base64.b64encode(buf).decode('ascii')
+                except Exception:
+                    mask_b64 = None
+                
+                info = {
                     'color': color,
                     'hotspot_pixels': hotspot_count,
                     'hotspot_threshold': float(self.hotspot_threshold)
                 }
+                if mask_b64 is not None:
+                    info['mask_png'] = mask_b64
+                
+                vlm_info[vlm_answer] = info
             
             if not np.any(merged_mask):
                 return False  # No hotspots
